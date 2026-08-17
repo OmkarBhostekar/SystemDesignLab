@@ -1,0 +1,516 @@
+---
+type: lesson
+id: 00-03-estimation
+slug: estimation
+title: Back-of-the-Envelope Estimation
+description: Turn product usage assumptions into workload, capacity, storage, bandwidth, and concurrency estimates.
+module: interview-method
+order: 3
+difficulty: core
+estimatedMinutes: 30
+prerequisites:
+  - 00-02-requirements
+tags:
+  - capacity-estimation
+  - workload-modeling
+  - qps
+  - bandwidth
+  - storage
+  - concurrency
+  - cache-sizing
+objectives:
+  - Translate MAU, DAU, user actions, and peak behavior into average and peak QPS.
+  - Estimate read/write load, ingress and egress bandwidth, retained storage, and replication overhead with explicit units.
+  - Use Little's Law to reason about in-flight work and long-lived connections.
+  - Approximate cache size and service capacity, then identify the assumptions that deserve sensitivity analysis.
+  - Communicate a checked, order-of-magnitude estimate and its operational trade-offs in an interview.
+relatedLessons:
+  - 00-04-interview-framework
+---
+
+# Back-of-the-Envelope Estimation
+
+> A useful estimate is a transparent chain of assumptions that is directionally right, unit-consistent, and easy to revise when a requirement changes.
+
+## Why This Exists
+
+“Design a feed for millions of users” is not an architecture. It does not tell us whether the bottleneck is a few hundred requests per second, millions of persistent connections, terabytes of media, or a write-heavy event stream. Estimation turns a vague product statement into pressures that an architecture must withstand.
+
+The naive approach is to repeat the scale number (“10 million users”) and jump to familiar boxes: load balancer, cache, database, queue. That hides the reason each box exists. A better sequence is:
+
+1. State the usage assumptions.
+2. Convert them to rates and volumes.
+3. Separate average from peak and logical from physical quantities.
+4. Translate demand into resource capacity using measurements or explicit hypotheses.
+5. Vary the assumptions that could change the design.
+
+The goal in an interview is not a production capacity plan. It is to show that the design follows from the workload and that you know which numbers must be measured before launch.
+
+## Mental Model
+
+Think of a request flowing through five conversions:
+
+```text
+people and product behavior
+        ↓
+active users × actions per user
+        ↓
+requests per day → requests per second (average / peak)
+        ↓
+bytes, operations, and work in flight
+        ↓
+instances, connections, cache memory, disks, and network capacity
+```
+
+Keep three kinds of quantity separate:
+
+| Quantity | What it answers | Typical unit |
+| --- | --- | --- |
+| Rate | How fast work arrives or is served? | requests/s, writes/s, bytes/s |
+| State | How much data or work is present? | records, bytes, in-flight requests, open connections |
+| Capacity | How much a resource can sustain at a target SLO? | requests/s/instance, MiB RAM, connections/process |
+
+### Orders of magnitude
+
+Use powers of ten before reaching for a calculator. A day has 86,400 seconds, so:
+
+- 1 million events/day is about `1,000,000 / 86,400 ≈ 11.6 events/s`.
+- 1 billion events/day is about `11,574 events/s`, or roughly 12k/s.
+- 10k requests/s carrying 10 KB each is about `100 MB/s` of payload, or `800 Mb/s` before protocol overhead.
+
+These are approximations, not promises. Saying “about 10k/s” is usually more useful than reporting “11,574.0741/s” when the inputs are guesses.
+
+### Units are part of the reasoning
+
+Write the unit beside every intermediate value:
+
+- A byte is 8 bits. Convert bytes/s to bits/s when discussing network links (`B/s × 8 = bit/s`).
+- Use decimal SI prefixes for rates and storage capacity unless the system or vendor says otherwise: `1 kB = 10^3 B`, `1 MB = 10^6 B`, and `1 GB = 10^9 B`. NIST documents these decimal prefixes and explicitly distinguishes them from binary prefixes.
+- Use `KiB = 2^10 B`, `MiB = 2^20 B`, and `GiB = 2^30 B` for binary quantities. The NIST binary-prefix reference records, for example, `1 MiB = 1,048,576 B` and `1 GiB = 1,073,741,824 B`.
+- Do not call a value “bandwidth” without saying ingress or egress, payload or wire bytes, and bits/s or bytes/s.
+
+If a prompt gives “10 KB” without a convention, state one (“I will treat KB as decimal 1,000 bytes”) and keep it consistent. The precision of the answer cannot exceed the precision of the assumptions.
+
+## How It Works
+
+### 1. Start with explicit assumptions
+
+Write a small assumption table before doing arithmetic. Useful columns are:
+
+| Assumption | Example | Why it matters |
+| --- | ---: | --- |
+| MAU and DAU | 10M MAU, 4M DAU | Sets the active population |
+| Actions per DAU per day | 6 feed opens | Converts people into workload |
+| Read/write mix | 96% reads / 4% writes | Sends load to different bottlenecks |
+| Peak multiplier or peak-hour share | 5× daily average | Sets burst capacity |
+| Payload and record sizes | 24 kB response, 3 kB record | Sets network and storage |
+| Retention and replication | 90 days, 3 copies | Sets data footprint and cost |
+| Latency and connection lifetime | 150 ms, 2 s | Sets concurrency |
+| Per-instance sustainable rate | 250 QPS at target SLO | Converts demand to instance count |
+
+If the prompt supplies a number, use it. Otherwise choose a round assumption, label it, and spend interview time validating only assumptions that affect the design.
+
+### 2. DAU, MAU, and user actions
+
+Monthly active users (MAU) describe reach; daily active users (DAU) describe the population that can generate load today. If only a daily engagement fraction `e` is known:
+
+```text
+DAU = MAU × e
+actions/day = DAU × actions per DAU per day
+```
+
+Do not substitute MAU for DAU. A service can have a large MAU and modest daily load, or a small MAU with an unusually high action rate. Also call out background jobs, bots, retries, and fan-out: they are workload sources that user counts do not capture.
+
+### 3. Average QPS, peak QPS, and workload shape
+
+Normalize daily actions using seconds per day:
+
+```text
+average QPS = actions/day ÷ 86,400
+peak QPS ≈ average QPS × peak multiplier
+```
+
+If you know the busiest-hour volume, use it directly:
+
+```text
+peak QPS in busiest hour = requests in that hour ÷ 3,600
+```
+
+The peak multiplier is an assumption about a distribution, not a law. A launch, a sports event, a cron job, or a synchronized retry storm can make a short burst much larger than a daily-average estimate. Model at least a base case and a high case when the peak shape is unknown.
+
+For endpoint-level load, calculate each source separately and add them. A feed read, a post write, a notification fan-out, and an internal index update do not have the same cost even when they are all counted as “one request.” Google SRE specifically warns that QPS alone can be a poor proxy when requests consume different amounts of CPU, memory, or other resources; use measured resource consumption for final capacity decisions.
+
+### 4. Read/write mix and internal work
+
+For total request rate `Q` and read fraction `r`:
+
+```text
+read QPS  = Q × r
+write QPS = Q × (1 − r)
+```
+
+If one external write triggers `f` internal operations (indexing, replication, notifications, or queue work), estimate that stream separately:
+
+```text
+internal operation rate = external write QPS × fan-out f
+```
+
+Do not silently add replication traffic to client egress. Replication and index traffic consume internal network, disk, and write capacity; they are separate arrows in the resource budget.
+
+### 5. Payload bandwidth
+
+Calculate ingress and egress independently:
+
+```text
+ingress bit/s = request QPS × average request bytes × 8
+egress bit/s  = response QPS × average response bytes × 8
+```
+
+Then state what is excluded: TLS framing, HTTP headers, compression, retries, cross-zone replication, and media fetched through a CDN may change wire traffic. If an estimate must include an overhead allowance `o`, make it visible:
+
+```text
+wire bit/s ≈ payload bit/s × (1 + o)
+```
+
+For example, a 20% allowance means `o = 0.20`; it is not a universal constant. Separate API JSON from large objects or media because the latter may belong on object storage and a CDN rather than on application servers.
+
+### 6. Storage growth and replication
+
+First estimate logical growth, then physical placement:
+
+```text
+logical bytes/day = new records/day × logical bytes per record
+retained logical bytes = logical bytes/day × retention days
+replicated bytes = retained logical bytes × replication factor
+planned bytes = replicated bytes × (1 + total overhead fraction)
+```
+
+Here, `total overhead fraction` can cover free space, indexes, metadata, and compaction headroom that are not already included in the logical record size. “Logical bytes per record” should say what it includes: row, indexes, tombstones, versions, metadata, or only the payload. Append-only history, updates that retain old versions, and secondary indexes can make physical write volume larger than the user-visible record size. Backups and cross-region copies may be additional multipliers rather than part of the primary replication factor.
+
+### 7. Concurrency and Little’s Law
+
+Little’s Law relates average arrival rate `λ`, average time in a system `W`, and average number of items in that system `L`:
+
+```text
+L = λW
+```
+
+For requests, if a service receives 2,000 requests/s and each request spends 0.15 s in the service, the average in-flight population is `2,000 × 0.15 = 300` requests. Apply the law to a defined boundary: frontend requests, a database queue, or a connection pool—not an undefined mixture of all three. The original result is John D. C. Little’s 1961 proof; the lesson’s backend use is the same rate-times-time relationship under steady-state assumptions.
+
+For long-lived connections, `W` is connection lifetime rather than request latency:
+
+```text
+open connections ≈ new connections/s × average connection lifetime (s)
+```
+
+An HTTP keep-alive socket can be open while no request is executing, so open sockets and in-flight requests are different limits. For WebSockets or long polling, include heartbeats, per-connection memory, file descriptors, load-balancer limits, and reconnect bursts. Little’s Law gives an average; design guardrails for expected peaks and tail behavior too.
+
+### 8. Cache sizing
+
+Cache size follows the distinct working set, not merely request count. A practical first estimate is:
+
+```text
+cache bytes ≈ distinct keys touched during TTL ×
+               (key bytes + value bytes + metadata bytes) × overhead factor
+```
+
+If a trace or product assumption says the cache sees `D` distinct feed pages in a TTL window, use `D`; `read QPS × TTL` is only a rough upper bound when every request touches a new key. To estimate backend relief with hit ratio `h`:
+
+```text
+backend read QPS after cache ≈ read QPS × (1 − h)
+```
+
+Include eviction metadata, allocator fragmentation, replicas, and a safety margin. A cache-sized-for-average system can fail during a hot-key event or a cold-cache restart, so test both warm and cold behavior.
+
+### 9. Convert demand to capacity
+
+Use a measured sustainable capacity at the target latency and error SLO, not a vendor headline:
+
+```text
+required healthy instances = ceil(peak QPS × headroom factor /
+                                  sustainable QPS per instance)
+```
+
+If the design must tolerate `f` simultaneous instance failures, the provisioned count must leave the required healthy count after those failures:
+
+```text
+total instances ≥ required healthy instances + f
+```
+
+The “sustainable QPS per instance” may not be the right denominator for a heterogeneous workload. A CPU-intensive write and a cached read should be capacity-tested separately or represented by a resource-cost model. Google SRE recommends load testing to correlate raw resources with service capacity and explicitly planning redundancy; AWS likewise calls out demand patterns, provisioning lead time, and correctly sized buffers.
+
+## Example
+
+### Worked example: a photo-feed backend
+
+Suppose the prompt is: “Design the backend for a social photo feed.” We will estimate the feed API and post metadata, not the original photo bytes; photos are stated to be stored and delivered by a separate object-storage/CDN path.
+
+#### Assumptions
+
+- `10M MAU`, with a `40%` daily engagement fraction → `4M DAU`.
+- Each DAU opens the feed `6` times/day → `24M feed reads/day`.
+- Each DAU creates `0.25` posts/day → `1M post writes/day`.
+- A feed response is `24 kB` decimal; a post record’s logical database footprint is `3 kB`, including its primary and secondary indexes.
+- Use a `5×` peak multiplier over daily average, `90` days of retention, and replication factor `3`.
+- A feed request averages `150 ms` at peak and a write averages `200 ms` at peak.
+- Load testing is hypothesized to show one application instance can sustain `250 QPS` at the target SLO. This is an input to the estimate, not a universal benchmark.
+
+#### QPS and read/write mix
+
+Daily requests are `24M + 1M = 25M`. Therefore:
+
+```text
+average total QPS = 25,000,000 ÷ 86,400
+                  = 289.3518... ≈ 290 QPS
+
+average feed-read QPS = 24,000,000 ÷ 86,400
+                      = 277.7777... ≈ 278 QPS
+
+average post-write QPS = 1,000,000 ÷ 86,400
+                       = 11.5740... ≈ 11.6 QPS
+
+peak total QPS = 289.3518... × 5 = 1,446.759... ≈ 1,447 QPS
+peak feed-read QPS = 277.7777... × 5 = 1,388.888... ≈ 1,389 QPS
+peak post-write QPS = 11.5740... × 5 = 57.870... ≈ 58 QPS
+```
+
+The external mix is `24M / 25M = 96%` reads and `4%` writes. If every write fans out to three index/notification operations, those are an additional `58 × 3 ≈ 174` internal operations/s at peak; they should not be mistaken for 58 client writes/s.
+
+#### Payload bandwidth
+
+Ignoring protocol overhead and CDN-delivered photo bytes:
+
+```text
+peak API egress = 1,388.888... feed reads/s × 24,000 B × 8
+                = 266,666,666.7 bit/s
+                ≈ 267 Mb/s (or 33.3 MB/s)
+
+peak API ingress = 57.870... writes/s × 3,000 B × 8
+                 = 1,388,888.9 bit/s
+                 ≈ 1.39 Mb/s (or 0.174 MB/s)
+```
+
+The arithmetic check is `1,389 × 24,000 = 33,336,000 B/s`; multiplying by eight gives about `266.7 Mb/s`. If TLS, headers, compression effects, and retries add a stated `20%` allowance, the egress planning number is `267 × 1.2 ≈ 320 Mb/s`, not an unexplained “about 300.”
+
+#### Storage growth and replication
+
+```text
+logical growth/day = 1,000,000 writes/day × 3,000 B
+                   = 3,000,000,000 B/day
+                   = 3 GB/day (decimal)
+
+90-day logical retention = 3 GB/day × 90 = 270 GB
+3-way replicated primary = 270 GB × 3 = 810 GB
+with 20% free-space / compaction allowance = 810 GB × 1.2 = 972 GB
+```
+
+So plan on roughly `1 TB` for this metadata store’s primary replicas, before backups, cross-region copies, and photo objects. If the record size doubles to `6 kB`, every storage result in this subsection doubles; that is a more useful conclusion than pretending the 3 kB assumption is exact.
+
+#### Concurrency and application instances
+
+Using Little’s Law at peak:
+
+```text
+in-flight feed requests = 1,388.888... QPS × 0.150 s
+                        = 208.333... ≈ 208 requests
+
+in-flight writes = 57.870... QPS × 0.200 s
+                 = 11.574... ≈ 12 requests
+
+total API work in flight ≈ 220 requests
+```
+
+If keep-alive sockets remain open for an average of `2 s`, the corresponding socket occupancy for feed clients is roughly `1,388.888... × 2 = 2,778` open sockets. That is not a claim that exactly 2,778 sockets are required: connection reuse, client behavior, and load-balancer idle timeouts can change it. It demonstrates why “requests in flight” and “open connections” need separate assumptions.
+
+Add `30%` headroom for burst and efficiency variation:
+
+```text
+healthy capacity required = 1,446.759... peak QPS × 1.3
+                          = 1,880.787... ≈ 1,881 QPS
+
+healthy instances = ceil(1,881 ÷ 250)
+                  = ceil(7.524)
+                  = 8
+```
+
+Arithmetic check: `7 × 250 = 1,750 < 1,881`, while `8 × 250 = 2,000 ≥ 1,881`. To tolerate two simultaneous instance failures, provision at least `8 + 2 = 10` instances so eight remain. This is a capacity-and-failure trade-off, not an assertion that two failures are the right availability target.
+
+#### Cache size
+
+Assume a `60 s` feed-page TTL and a traffic trace suggesting `60,000` distinct feed-page keys are touched in any TTL window. Let metadata and allocator overhead be `20%`:
+
+```text
+cache bytes ≈ 60,000 keys × 24,000 B/value × 1.2
+             = 1,728,000,000 B
+             ≈ 1.73 GB (decimal)
+```
+
+With an observed `80%` hit ratio, peak feed reads reaching the database are:
+
+```text
+1,388.888... × (1 − 0.80) = 277.777... ≈ 278 QPS
+```
+
+The cache entry count is based on distinct keys, not `1,389 QPS × 60 s = 83,340` by default. That latter product is a rough upper bound only if almost every request introduces a new key. If cache replicas are required, multiply the cache’s physical memory budget by the replica count and reserve memory for failover.
+
+## Visualization We Eventually Want
+
+Build a **Capacity Calculator** that exposes the chain of units instead of returning one opaque number. It should render a compact assumption panel, an arithmetic trace, and a result dashboard.
+
+### Controls
+
+- MAU, DAU/MAU engagement, actions per DAU/day, background-job rate, and retry multiplier.
+- Read/write fractions, internal fan-out per operation, and either a peak multiplier or peak-hour request count.
+- Request and response payload bytes, compression/overhead allowance, and an option to split API payload from object/media traffic.
+- Record bytes, index/metadata allowance, retention days, backup/cross-region copies, replication factor, and free-space/compaction allowance.
+- Average latency, connection lifetime, expected reconnect burst, and per-instance sustainable QPS at the target SLO.
+- Cache TTL, distinct keys touched in the TTL window, entry overhead, target hit ratio, cache replicas, headroom, and simultaneous failures.
+
+### Outputs and interactions
+
+Show average and peak QPS by endpoint, read/write/internal operation rates, ingress and egress in both MB/s and Mb/s, logical and physical storage growth, in-flight work, open connections, cache memory, and healthy/provisioned instance counts. Each result should display its formula and units; rounding should be to sensible significant figures.
+
+Provide scenario presets for a read-heavy feed, a write-heavy telemetry collector, and a long-lived chat connection workload. A “what changed?” panel should recalculate dependent values when one assumption moves. A sensitivity view can sweep one input at a time (or show a simple tornado chart) so learners see that peak factor, payload size, retention, and replication may dominate different budgets. A failure toggle should remove one or two instances and show remaining capacity, overload, and possible mitigations such as throttling, queueing, cache degradation, or load shedding.
+
+The calculator should warn when units are mixed (bytes versus bits, decimal versus binary prefixes), when a cache estimate uses request count in place of distinct keys, or when a rate is being used to infer state without a duration. It should label every number as an estimate and keep the assumptions editable. An optional timeline mode may animate a 24-hour traffic curve, but the static arithmetic trace must remain understandable without the animation.
+
+## Scaling Behavior
+
+- **More users or actions:** DAU and actions/day increase QPS approximately linearly until behavior changes. Re-check hot tenants, fan-out, and per-user quotas rather than assuming uniform distribution.
+- **Sharper peaks:** A larger peak multiplier requires more warm capacity, headroom, queueing, admission control, or elastic scale-out. Autoscaling may be too slow for a burst, so scheduled capacity or a buffer can be cheaper and safer.
+- **Larger payloads:** Egress and ingress grow linearly with bytes/request, often hitting network or CDN limits before CPU. Compression changes wire bytes but costs CPU and may not help already-compressed media.
+- **Longer retention:** Storage grows linearly with retention for append-only data. At larger volumes, tiering, partitioning, compaction, deletion windows, and backup restore time become design constraints.
+- **More replicas or regions:** Physical storage and internal network traffic grow with copies. Replication improves durability or read locality but does not make a write free.
+- **Higher fan-out:** One user action can multiply backend work. A queue or asynchronous pipeline can smooth demand, but it adds lag, retries, duplicate handling, and a new capacity budget for consumers.
+- **More concurrent connections:** Per-connection memory, file descriptors, TLS state, load-balancer limits, and reconnect storms can dominate even when request QPS is modest.
+
+Capacity should be validated with load tests at representative payloads and distributions. Google SRE notes that a service’s behavior becomes nonlinear near overload; a simple linear QPS model is a starting estimate, not a substitute for measuring the SLO boundary.
+
+## Failure Modes
+
+Estimates fail in predictable ways:
+
+- **Peak underestimation:** A launch or synchronized event exceeds the multiplier. Keep burst headroom, pre-warm capacity, throttle, queue non-urgent work, or shed load deliberately.
+- **Average-based provisioning:** A system sized for daily average exhausts capacity in the busy hour. Provision for the stated peak and failure policy, not just the mean.
+- **QPS as a universal capacity metric:** A cache hit and an uncached search may both count as one request but use very different resources. Track CPU, memory, disk I/O, network, queue depth, and latency alongside QPS.
+- **Retry amplification:** Timeouts or errors create more work precisely when the dependency is overloaded. Bound retries, use exponential backoff with jitter, and budget retries as demand.
+- **Cold cache or hot key:** A restart or skewed key distribution sends a much larger miss stream to the database. Warm gradually, single-flight expensive fills, and reserve backend capacity.
+- **Replica or region loss:** The remaining copies must serve traffic and possibly rebuild data. The failure scenario belongs in the instance, storage, network, and recovery estimates.
+- **Unit error:** Treating bits as bytes gives an eightfold network error; treating `GB` as `GiB` changes capacity by about 7%; dividing by 3,600 instead of 86,400 inflates daily QPS by 24×.
+- **State inferred from rate without time:** `1,000 events/s` does not tell us queue depth or open connections until event lifetime or retention is specified. Use `state = rate × duration` where the steady-state assumptions fit.
+
+## Trade-offs
+
+Estimation makes trade-offs visible before choosing components:
+
+| Choice | Helps | Costs / risks |
+| --- | --- | --- |
+| More headroom or N+2 capacity | Absorbs bursts and failures | More idle spend; may hide inefficient work |
+| Larger cache | Fewer backend reads and lower latency | Memory, invalidation, staleness, cold-start risk |
+| More replicas or regions | Durability, read locality, failover | Write and network cost; consistency and repair complexity |
+| Queue and asynchronous processing | Smooths bursts and isolates user latency | Queue delay, replay/duplicate semantics, consumer capacity |
+| Compression or smaller payloads | Lower network/storage volume | CPU cost, complexity, and possible latency |
+| Throttle/load shed | Protects the system and preserves a subset of traffic | Some requests are delayed or rejected |
+| Overprovisioning | Simple predictable response to spikes | Cost and low utilization; cannot fix a wrong workload model |
+
+The estimate should name the objective being protected: user latency, availability, durability, cost, or recovery time. There is no universally correct safety factor.
+
+## Alternatives
+
+Different workload shapes call for different estimation paths:
+
+- For a **batch pipeline**, use jobs/hour, records/job, service time, worker parallelism, and queue backlog rather than treating every record as interactive QPS.
+- For **large objects**, separate object count, average object size, request rate, storage growth, CDN egress, and upload/download concurrency from metadata QPS.
+- For **event streams**, estimate events/s, bytes/event, partition or consumer capacity, retention, and replay traffic; the producer’s QPS alone is insufficient.
+- For **long-lived real-time connections**, estimate connection arrivals, lifetime, heartbeat rate, per-connection memory, and reconnect bursts. Request latency is not connection lifetime.
+- For a **multi-region service**, estimate per-region demand, failover demand, replication bandwidth, and the capacity required while one region is unavailable.
+
+## When to Use
+
+Estimate early whenever a prompt includes “large scale,” a user count, a throughput target, a retention promise, real-time behavior, or a failure objective. Use a lightweight version even for a small service: one minute of explicit arithmetic often exposes an impossible latency, a very large payload, or a hidden fan-out.
+
+During an interview, show the two or three assumptions that select the architecture. If the prompt gives no numbers, ask for the most consequential one first (active users, action frequency, payload/retention, or peak behavior) and state a reasonable default for the rest.
+
+## When Not to Use
+
+Do not spend ten minutes refining arithmetic that cannot change the architecture. Do not present guessed per-server capacity as fact, multiply every number by an arbitrary “large-scale” constant, or choose a database from a QPS number without access patterns and consistency requirements. Replace guesses with load tests, production telemetry, and capacity models when moving from interview reasoning to implementation.
+
+## Common Misconceptions
+
+- **MAU equals load:** MAU is reach over a month; DAU and actions per DAU determine daily demand.
+- **Average QPS is capacity:** Peaks, retries, skew, failover, and cold starts matter.
+- **One request equals one unit of work:** Fan-out and payload shape make request costs unequal.
+- **GB and GiB are interchangeable:** They are different units; state the convention.
+- **Little’s Law predicts p99:** `L = λW` relates averages under defined steady-state assumptions; it does not provide a tail-latency percentile or a queueing model by itself.
+- **Cache size equals QPS × TTL:** That is a rough distinct-key upper bound, not a replacement for a working-set estimate.
+- **Replication factor is total system storage:** Backups, indexes, compaction, snapshots, cross-region copies, and media may be additional.
+- **A calculator creates certainty:** It makes assumptions inspectable; measurements establish real capacity.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+“I’ll state usage assumptions, convert DAU and actions into average and peak QPS, split reads from writes and internal fan-out, then estimate payload bandwidth, retained logical storage, replicated physical storage, in-flight work with `L = λW`, and cache working set. I’ll keep bits/bytes and decimal/binary units explicit, add only justified headroom, and vary the assumptions that could change the architecture. Finally I’ll connect capacity to failure handling—what remains after a node or region is lost—and call out which values need load testing.”
+
+### When to Introduce It
+
+Introduce estimation immediately after clarifying functional and non-functional requirements, before drawing components. Return to it whenever a proposed cache, queue, shard, replica, or region needs to be justified.
+
+### Common Follow-Ups
+
+- What is the busiest hour or largest burst, and how long does it last?
+- Are the request sizes and costs uniform, or are there hot keys and expensive outliers?
+- What happens to capacity when two instances or one region is unavailable?
+- How much is user-facing API traffic versus internal fan-out, retries, replication, or replays?
+- Which number would you measure first in a load test?
+
+### Common Candidate Mistakes
+
+- Starting with infrastructure nouns instead of workload assumptions.
+- Mixing daily totals, average QPS, peak QPS, and per-instance capacity in one equation.
+- Forgetting `× 8` for network bit rates or using ambiguous KB/GB.
+- Applying a read/write ratio to storage without accounting for record size, indexes, and retention.
+- Treating cache hit ratio, replica count, or headroom as guaranteed facts rather than assumptions.
+- Giving excessive decimal precision and failing to check whether the result is even the right order of magnitude.
+
+## Summary
+
+1. Begin with MAU/DAU and behavior, not component names.
+2. Convert actions to average and peak rates with visible units and a stated peak shape.
+3. Split reads, writes, fan-out, retries, and replication into separate workload streams.
+4. Convert payload sizes to ingress/egress bandwidth; convert logical storage to retained and replicated physical storage.
+5. Use `L = λW` for defined in-flight work or connection populations, and distinguish sockets from executing requests.
+6. Size caches from distinct working sets and backend capacity from measured sustainable rates plus an explicit failure/headroom policy.
+7. Use sensitivity analysis to find the assumptions that deserve measurement.
+
+## Quiz Seeds
+
+1. **Numerical:** A service receives 2.4M events/day. What is its average QPS, and what changes if the peak multiplier is 6×?
+2. **Numerical:** At 3,000 QPS and 12 kB responses, what are approximate egress MB/s and Mb/s? Explain the factor of eight.
+3. **Conceptual:** Why is DAU more useful than MAU for a daily request estimate? Give a case where MAU still matters.
+4. **Trade-off:** A read-heavy API has a 90% cache hit ratio. What backend read rate remains, and what new failure mode appears after a cold-cache restart?
+5. **Storage:** If 2M new 4 kB records/day are retained for 30 days with three replicas and 25% overhead, estimate planned bytes.
+6. **Concurrency:** At 1,200 requests/s and 250 ms average service time, how many requests are in flight? What extra assumption is needed to estimate open WebSocket connections?
+7. **Failure reasoning:** Eight instances are required at peak with 30% headroom. How many are provisioned if two simultaneous failures must be survivable, and what capacity remains after the failures?
+8. **Architecture:** A product has low average QPS but millions of long-lived connections. Which estimates and limits take priority over request throughput?
+9. **Sensitivity:** Which change is more consequential for retained storage: doubling daily writes, doubling record size, or doubling replication factor? Under a simple multiplicative model, explain why.
+
+## Related Topics
+
+- [Requirements](./requirements.mdx) defines the functional and non-functional constraints that supply the assumptions for these estimates.
+- [Interview framework](./interview-framework.mdx) places estimation between requirements and API/data/architecture decisions.
+- The planned `01-03-latency-vs-throughput` lesson will connect these workload rates to service performance and bottlenecks; it is a curriculum connection, not a local-file link.
+
+## References
+
+### Documentation / Articles
+
+- [Production Services Best Practices — Capacity Planning](https://sre.google/sre-book/service-best-practices/) — Google’s SRE guidance on forecasting, load testing, peak capacity, and N+2 redundancy; especially useful for connecting estimates to failure tolerance.
+- [Handling Overload](https://sre.google/sre-book/handling-overload/) — Google SRE’s discussion of why QPS can misrepresent work, how to use resource utilization, and how overload/retries change demand.
+- [Manage demand and supply resources](https://docs.aws.amazon.com/wellarchitected/2024-06-27/framework/cost-mandem.html) — AWS Well-Architected guidance on workload demand patterns, buffers/throttles, provisioning lead time, and avoiding both over- and under-provisioning.
+- [NIST Guide to the SI: SI prefixes](https://www.nist.gov/pml/special-publication-811/nist-guide-si-chapter-4-two-classes-si-units-and-si-prefixes) — authoritative decimal-prefix definitions and the warning not to use SI symbols for binary powers.
+- [Definitions of the SI units: The binary prefixes](https://physics.nist.gov/cuu/Units/binary.html) — NIST’s direct table for Ki, Mi, Gi, and the distinction between binary data units and decimal SI prefixes.
+
+### Papers
+
+- [A Proof for the Queuing Formula: L = λW](https://doi.org/10.1287/opre.9.3.383) — John D. C. Little’s original 1961 Operations Research paper grounding the rate × time relationship used for concurrency and queue populations.

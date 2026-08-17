@@ -1,0 +1,408 @@
+---
+type: lesson
+id: 00-01-interview-signals
+slug: interview-signals
+title: What System Design Interviews Measure
+description: Turn an ambiguous design prompt into explicit requirements, defensible trade-offs, and a conversation an interviewer can evaluate.
+module: interview-method
+order: 1
+difficulty: core
+estimatedMinutes: 25
+prerequisites: []
+tags:
+  - interview-method
+  - requirements
+  - scalability
+  - trade-offs
+  - reliability
+  - communication
+objectives:
+  - Identify the observable behaviors behind the main system-design interview signals.
+  - Turn an ambiguous prompt into assumptions, workload constraints, and a deliberately scoped design.
+  - Connect each major component to a requirement, bottleneck, or failure mode instead of naming technologies by habit.
+  - Balance breadth, depth, reliability, and time while keeping the interviewer aligned with the reasoning.
+relatedLessons:
+  - 00-02-requirements
+  - 00-04-interview-framework
+---
+
+# What System Design Interviews Measure
+
+> A system design interview is an observed engineering conversation: make the problem explicit, derive a design from its pressures, and make your reasoning easy to inspect.
+
+## Why This Exists
+
+The prompt is usually short and intentionally incomplete: “Design a notification service,” “Design a feed,” or “Design a file-sync system.” The interviewer is not asking you to recall a diagram. They are giving you a small amount of information and watching how you decide what must be learned, assumed, measured, designed, and challenged.
+
+That makes the interview different from a coding problem with a fixed input and a mechanically checkable answer. Two candidates can choose different databases or deployment shapes and both be right if each design satisfies the stated constraints and the candidate can defend the consequences. [Amazon’s published system-design objectives](https://www.amazon.jobs/content/en-gb/how-we-hire/sde-iii-interview-prep) include practicality, accuracy, efficiency, reliability, optimization, and scalability; [Microsoft’s hiring guidance](https://careers.microsoft.com/v2/global/en/hiring-tips/technical-interviewing.html) describes technical interviews as problem-solving exercises that look at technical principles, approach, agility, and strategic thinking.
+
+The naive approach is to start drawing familiar boxes:
+
+```text
+Prompt → API → cache → database → queue → workers → “done”
+```
+
+That can look busy while proving very little. It hides assumptions, may solve the wrong product, and leaves no way to tell whether the queue, cache, or replica is necessary. A better approach makes each decision produce evidence:
+
+```text
+Ambiguous prompt
+    ↓ clarify
+Requirements and assumptions
+    ↓ quantify
+Workload, data, and latency pressures
+    ↓ derive
+Baseline architecture and critical path
+    ↓ stress-test
+Bottlenecks, failures, and trade-offs
+    ↓ communicate
+Aligned design and next deep dive
+```
+
+The signals are not a secret checklist to recite. They are observable habits that let an interviewer see how you work with another engineer when the answer is not known in advance.
+
+## Mental Model
+
+Think of the interview as a sequence of claims that need support. For every important claim, make the chain visible:
+
+> **Constraint → decision → consequence → mitigation or accepted cost**
+
+For example:
+
+> “Push delivery can be delayed by up to 60 seconds, so I will persist an event and process it asynchronously. That keeps the request path independent of a slow provider, but delivery is at-least-once, so the provider call needs an idempotency key and a retry policy.”
+
+This chain exposes more useful signal than “I would use Kafka.” The technology may be reasonable, but the interviewer needs to know which pressure caused it and what new risk it introduces.
+
+### The signals to make observable
+
+| Signal | Evidence the interviewer can observe | What a weak signal looks like |
+| --- | --- | --- |
+| Requirement clarification | You ask who uses the system, which actions matter, what is out of scope, and which guarantees are required. You restate the resulting scope. | You silently choose a product and optimize for an unstated use case. |
+| Decomposition | You separate request paths, responsibilities, state ownership, and synchronous from asynchronous work. | You list services without showing what each owns or why a boundary exists. |
+| Scalability reasoning | You estimate order-of-magnitude traffic, storage, concurrency, or peak behavior and name the first bottleneck. | You say “large scale” and add replicas, caches, and shards without workload evidence. |
+| Data modeling | You derive entities, access patterns, invariants, indexes, and partition keys from the use cases. | You choose SQL or NoSQL by brand or fashion before describing how data is read and changed. |
+| Trade-off reasoning | You compare at least two credible options against the requirements and state what each costs. | You call a tool “best” without a constraint, boundary, or downside. |
+| Reliability | You discuss timeouts, retries, idempotency, partial failure, degradation, recovery, and observability where they matter. | You draw replicas but never say what happens when a dependency is slow, unavailable, or duplicated. |
+| Communication | You signpost the plan, define unfamiliar terms, explain one decision at a time, check alignment, and summarize. | You monologue, jump between levels, or leave the interviewer to infer the design. |
+| Depth versus breadth | You cover the whole critical path, then go deep on the component with the most risk or interviewer interest. | You spend the whole hour on one subsystem or name every component without explaining any of them. |
+
+The dimensions overlap. Clarification creates the constraints for scale estimates; estimates reveal bottlenecks; bottlenecks motivate components; components create failure and trade-off questions. Treating the signals as one connected loop keeps the design coherent.
+
+## How It Works
+
+Use the following loop as a reasoning aid. It is deliberately compatible with, but less prescriptive than, the full [requirements lesson](./requirements.mdx) and [interview framework](./interview-framework.mdx).
+
+### 1. Establish the problem boundary
+
+Ask a small set of high-leverage questions:
+
+- Who are the users or callers, and what is the primary action?
+- Which functional paths are required for this interview? Which can be deferred?
+- What scale, latency, availability, durability, consistency, security, geographic, or cost constraints matter?
+- What is explicitly out of scope?
+
+Do not ask every possible question. Ask enough to turn an ambiguous prompt into a testable scope, then state assumptions and invite correction. “I’ll assume text notifications first, one region, and a 60-second delivery target unless you need global active-active behavior” is better than either silence or a ten-minute questionnaire.
+
+### 2. Build a small workload model
+
+Translate product facts into engineering pressure. Name units and identify averages versus peaks. A useful first pass might include:
+
+- active users or tenants;
+- operations per user or event;
+- average and peak requests per second;
+- read/write ratio;
+- object size and retention;
+- latency target and availability target;
+- concurrency, fan-out, or regional distribution.
+
+The numbers do not need fake precision. Their purpose is to reveal whether a single process, one database, synchronous provider calls, or a shared partition is likely to be the first limit. If the assumptions change, update the design rather than defending stale arithmetic.
+
+### 3. Decompose by responsibility and state
+
+Start with the critical request path, then identify durable state and work that can be delayed. A useful decomposition asks:
+
+1. Which component accepts and authenticates the request?
+2. Which component owns the invariant or durable record?
+3. Which work must complete before the caller receives success?
+4. Which work can be retried asynchronously?
+5. Which data is read frequently enough to cache, and where can it become stale?
+
+This prevents “microservices by reflex.” A component earns its place when a responsibility, scaling boundary, security boundary, or failure boundary justifies it.
+
+### 4. Model data from access patterns
+
+Before naming a store, describe the reads and writes. State the key invariant: for example, “a notification event must not be acknowledged until it is durably recorded,” or “a user preference update must be visible to subsequent sends in the same region.” Then choose a model, indexes, partitioning strategy, or replication policy that supports those operations.
+
+The interview signal is not whether you remember every database feature. It is whether you can connect a data decision to query shape, consistency, volume, and failure behavior.
+
+### 5. Derive the architecture progressively
+
+Follow the product pressure rather than presenting a prebuilt architecture:
+
+1. Draw the simplest design that satisfies the current scope.
+2. Point out the pressure that breaks it: traffic, latency, provider slowness, storage growth, or a failure.
+3. Add the smallest mechanism that addresses that pressure.
+4. State the new trade-off and how you will contain it.
+
+For example, a synchronous call to a notification provider may be adequate for a small prototype. If provider latency now consumes the request budget and provider errors make the API unreliable, persist an event and hand it to workers. The queue improves isolation and retryability, but introduces delayed delivery, duplicate work, and operational complexity. Those are design consequences to handle, not reasons to hide the queue.
+
+### 6. Stress-test the critical path
+
+Ask “what changes if...” questions:
+
+- traffic is ten times higher;
+- one dependency times out;
+- a worker dies after the side effect but before acknowledging the job;
+- a partition becomes hot;
+- the database is available but slow;
+- a region is unavailable;
+- a customer needs stronger ordering or consistency.
+
+Choose the two or three scenarios most relevant to the requirements. Reliability is not a final list of every imaginable disaster; it is a reasoned response to the failures that can violate the stated contract.
+
+### 7. Make the conversation inspectable
+
+Signpost transitions: “I have the scope and rough load; I’ll sketch the write path, then I’ll deep-dive retries because the provider is the riskiest dependency.” Check alignment: “Should I optimize for global availability, or is a single-region baseline acceptable?” Close a branch when it is no longer central. This lets the interviewer redirect you without the design becoming a private monologue.
+
+The [Microsoft Research study on technical interview expectations](https://www.microsoft.com/en-us/research/publication/the-tech-talk-balance-what-technical-interviewers-expect-from-technical-candidates/) analyzed 70 interview evaluations from nine software companies and found that evaluators looked not only at answers, but also at problem-solving walkthroughs, use of prior experience, and conversation beyond writing code. The exact rubric varies by company and level, but making your reasoning visible is robust across those variations.
+
+## Example
+
+Imagine the prompt:
+
+> Design a notification service.
+
+### A weak opening
+
+“I’ll put an API gateway in front of a notification service, use Kafka for events, Cassandra for history, Redis for preferences, and workers for email, SMS, and push.”
+
+This names plausible components but leaves important questions unanswered: what counts as success, which channels are required, what is the scale, can a notification be delayed or duplicated, and why are these stores necessary?
+
+### A signal-rich opening
+
+“Before drawing the system, I’ll clarify the contract. Should this version support push, email, SMS, or only in-app notifications? Do callers need a synchronous confirmation that a provider delivered the message, or only that we accepted it? Are duplicates acceptable? What delivery delay is acceptable? I’ll assume push and email, at-least-once delivery, a 60-second target for normal traffic, and one region for the baseline. I’ll also assume 10 million daily active users with an average of five notification events per day, or about 580 events per second on average; I’ll use a 5× peak, roughly 3,000 events per second, for capacity discussion. Please correct any assumption that changes the design.”
+
+The candidate has not solved the whole problem yet, but has already shown clarification, scope control, communication, and scale reasoning.
+
+### Progressive design
+
+1. **Naive baseline:** The API writes a notification record and calls the provider synchronously. This is easy to explain and gives the caller an immediate provider result.
+2. **Observed limitation:** Provider latency and outages now consume the API timeout budget. A provider retry can duplicate a message, and one slow provider can exhaust request workers.
+3. **Improved design:** The API durably records the event and a work handoff (for example, an outbox record) before acknowledging it. A relay makes that work visible to channel-specific workers, which call providers with a stable idempotency key when supported, record attempts, and use bounded backoff plus a dead-letter path for repeated failures. A preference store is read on the send path, with an explicit freshness policy.
+4. **New trade-off:** The API can acknowledge acceptance before delivery, so the contract must expose a status or delivery window. At-least-once processing is practical, but exactly-once delivery across an external provider is not assumed; duplicate-safe provider calls and reconciliation reduce the risk.
+
+### What to deep-dive
+
+The provider boundary is a good deep dive because it connects scale, reliability, and data semantics:
+
+- A timeout is not proof that the provider did nothing; retrying can duplicate a successful but unknown outcome.
+- The event needs a stable idempotency key and a durable attempt state.
+- Retries need a cap, backoff, and jitter so a provider outage does not create a retry storm.
+- A dead-letter queue or manual replay path prevents poison messages from blocking healthy work.
+- Metrics should distinguish accepted, attempted, provider-confirmed, permanently failed, and delayed notifications.
+
+The candidate does not need to enumerate every provider feature. They need to show how the chosen contract survives the most relevant partial failure.
+
+## Visualization We Eventually Want
+
+Build an interactive **interview signal timeline** for a 60-minute system-design round. The timeline should teach pacing as a consequence of coverage, not as a rigid script.
+
+### Baseline timeline
+
+```text
+0–5 min    Requirements
+5–10 min   Estimates
+10–20 min  APIs + data model
+20–30 min  High-level architecture
+30–45 min  Deep dives
+45–55 min  Bottlenecks + failures
+55–60 min  Wrap-up
+```
+
+### Interaction specification
+
+- Render seven labeled, draggable and resizable blocks on a 0–60 minute track.
+- Keep the block labels and signal coverage visible while the learner moves a block. Each block should indicate its primary evidence: clarification, scale, data modeling, decomposition, depth, reliability, or synthesis.
+- Provide a “balanced baseline” reset that restores the sequence above.
+- Include a scenario control that expands Requirements to 35 minutes. The visualization should visibly compress later blocks and explain the consequence: less time remains for the architecture, failure analysis, and summary. Do not mark one schedule as universally correct; show which signals become harder to demonstrate.
+- Let the learner inject an interviewer follow-up at a chosen minute, such as “What if the provider is unavailable?” The follow-up should consume time and highlight the need to leave slack for a deep dive and wrap-up.
+- Show a compact coverage panel with elapsed time, remaining time, and signals not yet demonstrated. A warning should distinguish “not covered yet” from “not relevant under the current scope.”
+- At the end, reveal a short reflection: Which assumption justified the architecture? Which failure changed it? Which trade-off did you communicate?
+
+The lesson remains complete without this component. The visualization is a future specification, so `visualizationId` is intentionally omitted until a registry entry exists.
+
+## Scaling Behavior
+
+The signals change with the prompt’s scale and with the level being assessed.
+
+- **More users or traffic:** estimates should move from rough average load to peak load, hot keys, concurrency, storage growth, and capacity boundaries. The point is not to add every distributed-systems mechanism; it is to identify the next bottleneck.
+- **More data or retention:** data modeling must address partition size, indexes, compaction or archival, replication, and recovery time. A design that works for a week of history may not work for years of history.
+- **More regions:** latency, data residency, failover, consistency, and operational ownership become explicit. Do not assume active-active is free or required.
+- **More ambiguity:** senior candidates are expected to drive the conversation by surfacing product and operational constraints rather than waiting for every detail.
+- **More seniority:** breadth remains necessary, but the expected depth and scope of trade-offs increase. A senior answer usually goes deep on the riskiest components; a staff-level answer may also discuss evolution, migration, ownership, cost, and system-wide consequences.
+
+Scale the answer to stated facts and the interviewer’s follow-ups. Designing for an imaginary billion-user workload can be as weak as ignoring scale because it replaces judgment with theater.
+
+## Failure Modes
+
+| Failure mode | How it appears | Recovery move |
+| --- | --- | --- |
+| Silent assumptions | You build for global, strongly consistent, multi-channel traffic without asking. | State the assumption, ask whether it is acceptable, and mark what would change if it is not. |
+| Requirements drift | The design quietly changes from “accept a notification” to “guarantee provider delivery.” | Restate the contract and separate acceptance, attempt, and delivery semantics. |
+| Premature technology choices | A named database or queue appears before a workload or invariant. | Explain the access pattern or failure pressure first; defer the product name if it does not affect the decision. |
+| Box-and-arrow breadth | Many components appear, but no request path or ownership is clear. | Trace one critical read or write end to end and remove components that do no visible work. |
+| Single-component depth | Fifteen minutes go into storage internals while the overall system is unfinished. | Time-box the branch, summarize the invariant, and return to breadth before another deep dive. |
+| Reliability as an afterthought | Replicas are drawn, but timeouts, retries, duplicates, and recovery are absent. | Pick the highest-risk dependency and walk through one partial failure from symptom to mitigation. |
+| Monologue | You speak continuously and miss interviewer hints or corrections. | Pause at transitions, ask whether the direction is useful, and incorporate the answer. |
+| Bluffing | You claim an exact guarantee or vendor behavior you cannot explain. | State the boundary of your knowledge and reason from the requirement and invariant you do understand. |
+| Running out of time | There is no summary or no opportunity for a final follow-up. | Use the timeline as a budget, reserve wrap-up time, and announce when you are parking a lower-risk detail. |
+
+Failures are useful signals when you recover visibly. A changed requirement is not automatically a failed design; revising a decision and naming its new cost demonstrates adaptability.
+
+## Trade-offs
+
+Interview performance is itself a constrained design problem:
+
+- **Breadth versus depth:** broad coverage demonstrates system ownership; depth demonstrates mechanics. Cover the critical path first, then choose the riskiest or most relevant branch.
+- **Precision versus speed:** exact numbers can help capacity reasoning, but false precision consumes time and implies unsupported certainty. Use orders of magnitude and state assumptions.
+- **Framework versus flexibility:** a framework prevents omissions under stress; a rigid script can make you ignore the interviewer or the product. Use it as a checklist, not a speech.
+- **Technical detail versus shared context:** terminology is useful only when the interviewer can connect it to the design. Define an unfamiliar acronym once and keep the explanation tied to a request, record, or failure.
+- **Confidence versus honesty:** defend a decision with its constraints, but acknowledge uncertainty. “I would verify this behavior; for the interview I’ll assume at-least-once delivery and design idempotently” is stronger than an invented guarantee.
+- **Feature coverage versus reliability:** a smaller scope with explicit failure behavior is often more credible than many features with no contract or recovery story.
+
+Communication is not decorative polish. It is the mechanism by which the interviewer can evaluate your assumptions, reasoning, and response to feedback. [Google’s Technical Writing One course](https://developers.google.com/tech-writing/one) emphasizes clarity, concision, consistent terminology, useful structure, and audience awareness; those same habits make a live architecture discussion easier to follow.
+
+## Alternatives
+
+There is no single interview format or answer style. Choose an approach that matches the prompt and interviewer while preserving the underlying signals.
+
+| Approach | Useful when | Risk |
+| --- | --- | --- |
+| Requirements-first framework | The prompt is broad and the timebox is long enough for a complete design. | It can sound rehearsed if you recite steps without adapting to answers. |
+| Prompt-driven conversation | The interviewer supplies constraints incrementally or wants a collaborative exploration. | You can omit a dimension; keep a private checklist of scope, scale, data, failures, and trade-offs. |
+| Architecture-first sketch | The prompt is already tightly scoped and the interviewer explicitly asks for a high-level design. | Unstated data and reliability assumptions become hard to repair. State them before drawing. |
+| Component-first deep dive | The role or follow-up explicitly targets one subsystem, such as a storage or coordination design. | You may fail to show system-level ownership; outline the surrounding contract first. |
+| Simple single-region baseline | Requirements and scale are modest or the interviewer wants an initial version. | The answer can look incomplete if you do not say how the design evolves when a stated pressure appears. |
+
+The stable principle across these alternatives is to connect decisions to requirements and make the consequences discussable.
+
+## When to Use
+
+Use these signals throughout every system-design interview, especially at transitions:
+
+- At the opening, to convert ambiguity into a bounded contract.
+- Before adding a component, to name the requirement, bottleneck, or failure that earns it a place.
+- After an estimate, to let the numbers change the architecture.
+- When the interviewer changes a constraint, to revisit affected decisions instead of bolting on an unrelated feature.
+- Before a deep dive, to explain why this component is the highest-risk or highest-value branch.
+- During the final summary, to restate the guarantees, biggest trade-off, and next evolution step.
+
+Use the level of detail the prompt calls for. A small internal tool may need a single service and a relational database; explaining why it does not need a queue is also system-design reasoning.
+
+## When Not to Use
+
+Do not turn the signals into a performance or a checklist recital:
+
+- Do not announce “now I will demonstrate scalability” instead of doing the estimate.
+- Do not ask questions whose answers cannot change the scope or design.
+- Do not force all eight dimensions when the interviewer has deliberately narrowed the exercise to one component.
+- Do not add global replication, event sourcing, or ten services merely to look senior.
+- Do not keep a memorized framework when the interviewer gives a correction; acknowledge it and adapt.
+- Do not fill every second with speech. A short pause to reason, a clear diagram, and a focused check-in are communication too.
+
+## Common Misconceptions
+
+- **“There is one correct architecture.”** The constraints determine whether a design is appropriate. Different stores or topologies can be valid when their guarantees and costs are explicit.
+- **“Scale means choosing the largest numbers.”** Scale means deriving the workload that matters for this product, including peaks and access patterns.
+- **“Communication means talking continuously.”** Communication means maintaining shared context: signposting, concise explanations, questions, listening, and summaries.
+- **“Breadth means shallow boxes.”** Breadth covers the critical path and its contracts; depth explains the mechanics where a wrong assumption would break the system.
+- **“Reliability means replicas.”** Replicas help some failures, but timeouts, idempotency, backpressure, graceful degradation, recovery, and observability may matter more for the contract.
+- **“Data modeling comes after the architecture.”** Access patterns and invariants often determine the architecture. A store is not justified until the data behavior is clear.
+- **“A framework guarantees a good answer.”** It reduces omissions under pressure; it cannot choose requirements or trade-offs for you.
+- **“A changed requirement means the earlier answer failed.”** It may reveal whether you can revise assumptions and explain the impact of a new constraint.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+“System design interviews measure how I reason through an ambiguous engineering problem, not whether I can recite a preferred architecture. I clarify the product and guarantees, estimate the workload, decompose the critical path and data, then choose a baseline design. I explain why each important component exists, stress-test the riskiest failure, and state the trade-offs. I cover the whole system before going deep, and I keep checking that the interviewer and I share the same assumptions.”
+
+### When to Introduce It
+
+Introduce the underlying behavior, not the label:
+
+1. Open with two to five high-leverage clarifying questions and a short restatement.
+2. Write down assumptions and rough scale before naming distributed components.
+3. For each component, say which requirement or failure motivates it.
+4. Announce the critical path and the branch you will deep-dive.
+5. Reserve time to summarize guarantees, failure handling, and the largest trade-off.
+
+### Common Follow-Ups
+
+- **“What are your must-have requirements?”** Separate required behavior from a useful but deferrable feature.
+- **“How did you estimate that load?”** Show the user/event assumptions, average-to-peak multiplier, and units; do not defend a number as universal.
+- **“Why this database or queue?”** Start with access pattern, invariant, throughput, latency, or delivery requirement, then name the cost.
+- **“What happens if this dependency is slow or unavailable?”** Trace timeout behavior, retries, queueing, idempotency, degradation, and recovery.
+- **“Can messages be duplicated or reordered?”** State the contract. If duplicates are possible, make side effects idempotent; if ordering matters, identify the scope and owner of that ordering.
+- **“How does it change at ten times the scale?”** Find the first bottleneck, then discuss partitioning, caching, batching, backpressure, or isolation only as needed.
+- **“Why not keep it synchronous?”** Compare the caller’s latency and availability budget with the dependency’s behavior; do not assume asynchronous work is always better.
+- **“What would you build first?”** Give a smallest useful version and a migration path tied to measured pressure.
+
+### Common Candidate Mistakes
+
+- Treating the prompt as a trigger for a memorized architecture.
+- Asking for scale but never using the answer to choose capacity or boundaries.
+- Giving one database choice without entities, access patterns, or invariants.
+- Drawing a queue without defining acknowledgement, retry, duplicate, and ordering semantics.
+- Mentioning “high availability” without a failure scope, recovery behavior, or user-visible contract.
+- Deep-diving before establishing the surrounding request path.
+- Covering every subsystem at a buzzword level and never explaining one critical mechanism.
+- Talking over the interviewer or ignoring a hint that should redirect the design.
+- Treating an assumption as fact after the interviewer has changed it.
+- Bluffing about a technology instead of stating what is known and designing around explicit guarantees.
+
+## Summary
+
+The strongest answer is not the one with the most boxes. It is the one where the interviewer can follow this chain:
+
+1. **Clarify** the user, scope, guarantees, and exclusions.
+2. **Quantify** the workload enough to reveal pressure.
+3. **Decompose** responsibilities, state, and critical paths.
+4. **Model data** from access patterns and invariants.
+5. **Derive** components from bottlenecks or failures.
+6. **Stress-test** the riskiest path and state the trade-offs.
+7. **Communicate** breadth, depth, uncertainty, and time deliberately.
+
+If a component cannot be tied to a requirement, bottleneck, or failure, it is probably premature. If a trade-off cannot be explained in terms of the contract, the contract is probably not clear enough yet.
+
+## Quiz Seeds
+
+These are reasoning prompts for a future structured quiz, not a trivia bank:
+
+1. For “Design a notification service,” write five clarifying questions. For each, explain which design decision would change based on the answer.
+2. Given 10 million daily active users, five notification events per user per day, and a 5× peak multiplier, estimate average and peak events per second. Name one assumption that could make the estimate misleading.
+3. Compare a synchronous provider call with a durable queue and worker. Which latency, availability, and delivery guarantees does each make easier or harder?
+4. A notification worker times out after calling a provider, but the provider may have accepted the message. What state, idempotency, and retry choices prevent an unsafe duplicate or silent loss?
+5. A candidate draws a cache, queue, and three databases before asking a question. Identify at least three missing signals and propose a recovery move for the next two minutes.
+6. On the timeline, requirements expand from five minutes to 35 minutes. Which later signals become difficult to demonstrate, and how would you re-scope the conversation without abandoning requirements clarity?
+7. Given two data stores with different consistency and query trade-offs, write a constraint → decision → consequence → mitigation chain for each option.
+8. Explain the difference between breadth and depth using one critical path from the notification example. What would count as useful depth rather than a product-name list?
+9. The interviewer changes the requirement from “accepted within 200 ms” to “provider-confirmed within 200 ms.” Which assumptions, components, and trade-offs must be revisited?
+
+## Related Topics
+
+- [Clarify functional and non-functional requirements](./requirements.mdx)
+- [Use the interview design framework](./interview-framework.mdx)
+
+## References
+
+### Documentation / Articles
+
+- [SDE III/Sr. SDE Interview Prep](https://www.amazon.jobs/content/en-gb/how-we-hire/sde-iii-interview-prep) — Amazon’s official guidance lists practicality, accuracy, efficiency, reliability, optimization, and scalability as system-design objectives, and explicitly advises candidates to ask questions to validate the design.
+- [Technical interviewing](https://careers.microsoft.com/v2/global/en/hiring-tips/technical-interviewing.html) — Microsoft’s official hiring guide frames technical interviews as problem-solving and calls out strategic thinking plus distributed-systems concerns such as resiliency, availability, replication, and partitioning.
+- [Technical Writing One introduction](https://developers.google.com/tech-writing/one) — Google’s course gives practical communication principles for clarity, concision, terminology, structure, and audience awareness that transfer directly to a live design explanation.
+- [Audience](https://developers.google.com/tech-writing/one/audience) — Google’s audience guidance explains how to fit vocabulary and detail to what the reader already knows; in an interview, that means maintaining shared context rather than relying on jargon.
+- [The System Design Interview Handbook: The System Design Interview](https://www.systemdesigninterview.com/guides/system-design-interview-handbook/81-the-system-design-interview) — A practical synthesis of the conversation model, breadth-versus-depth expectations, trade-off reasoning, and level-dependent scope; use it as a complement to company guidance, not as a universal rubric.
+
+### Papers
+
+- [The Tech-Talk Balance: What Technical Interviewers Expect from Technical Candidates](https://www.microsoft.com/en-us/research/publication/the-tech-talk-balance-what-technical-interviewers-expect-from-technical-candidates/) — Ford, Barik, Rand-Pickett, and Parnin’s 2017 IEEE ICSE CHASE study analyzed 70 evaluations from nine software companies and reports that evaluators considered problem-solving walkthroughs, prior experience, and conversation beyond writing code; it grounds the lesson’s emphasis on observable reasoning and communication.

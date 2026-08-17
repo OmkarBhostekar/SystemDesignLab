@@ -1,0 +1,8 @@
+.DS_Store
+node_modules/
+.next/
+out/
+coverage/
+*.log
+.env*
+!.env.example

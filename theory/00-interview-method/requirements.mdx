@@ -1,0 +1,308 @@
+---
+type: lesson
+id: 00-02-requirements
+slug: requirements
+title: Functional and Non-Functional Requirements
+description: Turn an ambiguous interview prompt into a small set of behaviors, measurable constraints, and explicit priorities.
+module: interview-method
+order: 2
+difficulty: core
+estimatedMinutes: 25
+prerequisites:
+  - 00-01-interview-signals
+tags:
+  - requirements
+  - non-functional-requirements
+  - trade-offs
+  - system-design-interviews
+objectives:
+  - Separate user-visible behavior from the qualities and constraints that shape an architecture.
+  - Convert vague goals such as fast or highly available into scoped, measurable targets.
+  - Identify tensions among consistency, latency, availability, durability, security, geography, and cost.
+  - Select a narrow interview scope and state assumptions without silently inventing requirements.
+relatedLessons:
+  - 00-03-estimation
+  - 00-04-interview-framework
+---
+
+# Functional and Non-Functional Requirements
+
+> Requirements are the reason an architecture exists: functions define what the system must do, while constraints and quality targets determine which design can do it acceptably.
+
+## Why This Exists
+
+“Design a payment system” is not yet a design problem. It is a label covering many different systems:
+
+- a checkout integration that sends a customer to an external processor,
+- an internal ledger that moves stored value,
+- a global card-processing platform,
+- or a batch settlement and reconciliation service.
+
+If a candidate immediately draws an API gateway, microservices, a queue, a cache, and several databases, none of those components has been justified. A cache might violate a balance-read requirement. A queue might be ideal for a receipt but wrong for confirming whether money was reserved. Multi-region writes might improve regional availability while making conflict handling much harder.
+
+Requirement clarification turns a product name into a bounded problem. It prevents two common failures:
+
+1. solving a different system from the one the interviewer intended; and
+2. optimizing every quality at once, producing an expensive and internally contradictory architecture.
+
+## Mental Model
+
+Treat clarification as building a **design contract** with three layers:
+
+```text
+User journeys        What must happen?
+Quality targets      How well must important journeys work?
+Constraints          What choices or assumptions are fixed?
+```
+
+Functional requirements describe observable behavior: create a payment, fetch its status, issue a refund, or send a receipt.
+
+Non-functional requirements describe qualities of that behavior: the success rate, response-time target, consistency guarantee, durability expectation, security boundary, geographic reach, and acceptable cost.
+
+Constraints limit the solution space. Examples include using an existing payment processor, retaining records for a specified period, operating in particular countries, or finishing a migration without changing a public API.
+
+The distinction is useful, but not absolute. “Export account history” is a function; “make a one-year export available within 30 seconds” adds a performance target. The architecture should be driven by the combined, concrete scenario.
+
+## How It Works
+
+### 1. Name the actors and critical journeys
+
+Ask who uses the system and what the few essential actions are. For an interview, select roughly two to four core journeys and explicitly defer secondary features.
+
+For a payment service:
+
+- a customer submits a payment,
+- a merchant checks its status,
+- an operator or workflow issues a refund,
+- the system reconciles its records with a processor.
+
+“Support payments” is too vague. “Accept a payment command exactly once from the merchant’s perspective and return a durable payment ID” is much more useful.
+
+### 2. Attach quality scenarios to important journeys
+
+A useful non-functional requirement has context, a stimulus, a measurable response, and scope. Replace adjectives with questions and targets:
+
+| Vague statement | Clarifying question | More useful target |
+| --- | --- | --- |
+| “It must be fast.” | Which operation, measured where, and at what percentile? | 99% of payment-status reads complete within 300 ms at the service boundary. |
+| “It must never go down.” | Which journey may degrade, and over what period? | Payment initiation succeeds for 99.95% of valid requests per month; receipt delivery may be delayed. |
+| “It must be consistent.” | What invariant must a user observe? | Repeating the same payment command with one idempotency key must not create a second charge. |
+| “Data cannot be lost.” | Which data and after what acknowledgment? | Once a payment is confirmed, its ledger record survives a single-zone failure. |
+| “It is global.” | Where are users and where may data live? | Serve India and Singapore initially; regulated records remain in their approved region. |
+
+The numbers are provisional interview assumptions, not claims about a universal payment standard. Their purpose is to expose architectural consequences.
+
+### 3. Cover the main design dimensions
+
+Use a compact checklist rather than interrogating the interviewer indefinitely:
+
+- **Scale:** active users, operations per second, peak-to-average ratio, payload size, storage growth, and read/write mix.
+- **Latency:** which synchronous path blocks the user, where it is measured, and whether a percentile or deadline matters.
+- **Consistency:** which invariants require fresh or serialized state and which views may lag.
+- **Availability:** which operations must remain usable during dependency or regional failure and which may reject or degrade.
+- **Durability:** which acknowledged records must survive which failures; include retention and recovery expectations where relevant.
+- **Security and privacy:** identities, permissions, sensitive fields, abuse risks, encryption boundaries, audit needs, and data residency.
+- **Cost:** the expected scale, business value, and whether a more expensive guarantee is justified.
+- **Geography:** user locations, latency expectations, failure domains, legal placement, and whether writes occur in one or many regions.
+
+Do not give every dimension equal time. A globally distributed chat service emphasizes connections, latency, ordering, and fanout. A payment ledger emphasizes correctness, durability, auditability, and duplicate-safe commands.
+
+### 4. Rank requirements instead of declaring everything critical
+
+Architecture is a choice under constraints. Ask which requirement wins when two cannot both be maximized.
+
+A practical priority statement might be:
+
+> Preventing duplicate charges and preserving confirmed payment records outrank accepting new payments during a partition. Status reads may briefly lag, and receipt delivery may be asynchronous.
+
+That sentence already guides several later choices. It distinguishes the correctness-critical command path from less critical read and notification paths without naming a database or queue prematurely.
+
+### 5. State assumptions and exclusions
+
+Close clarification with a short scope recap:
+
+> I will design payment initiation, status lookup, refunds, and reconciliation for third-party card processing. I will treat fraud scoring and processor internals as external, assume the peak load we estimate next, and prioritize idempotent writes and durable records over accepting writes during a partition. Is that the right scope?
+
+This gives the interviewer an inexpensive opportunity to correct the direction before the architecture depends on it.
+
+## Example
+
+Suppose the prompt is **“Design a global payment service.”**
+
+### Naive interpretation
+
+The candidate assumes every country, all payment methods, active-active writes, sub-100 ms responses, perfect availability, and strong consistency. The resulting design is large, costly, and impossible to defend in a 45–60 minute interview.
+
+### Clarified contract
+
+| Dimension | Interview assumption | Design consequence to investigate later |
+| --- | --- | --- |
+| Core functions | Initiate payment, query status, refund, reconcile | Define command/status APIs and a payment state machine. |
+| Scale | Two launch regions; peak load will be estimated next | Avoid claiming a global topology before calculating demand. |
+| Correctness | One merchant command must not cause two charges | Require idempotency and durable state transitions. |
+| Latency | Acknowledge initiation within 500 ms when the processor responds; status reads p99 under 300 ms | Keep optional work off the synchronous path; measure tail latency. |
+| Availability | Status reads should survive a processor outage; new payments may return a retryable result | Separate locally known state from an unavailable external action. |
+| Durability | Confirmed payment and ledger records must survive a zone loss | Replication and recovery must match the acknowledgment point. |
+| Security | Authenticate merchants, authorize refunds, encrypt sensitive data, retain an audit trail | Establish trust boundaries and least-privilege access. |
+| Geography | Customer traffic in India and Singapore; regulated records stay in approved locations | Data placement may constrain replication and failover. |
+| Cost | Prefer the simplest topology that meets launch targets | Do not add every-region active-active writes without evidence. |
+
+Now components can be introduced in response to something concrete. A durable idempotency record exists because duplicate commands are possible. An asynchronous receipt path exists because sending email should not extend payment latency. A regional decision exists because users, regulation, and failure domains require one—not because “global systems use multiple regions.”
+
+## Visualization We Eventually Want
+
+Build a **requirement trade-off board** with a payment-service preset.
+
+The learner can:
+
+- select critical journeys such as initiate, status, refund, and receipt;
+- set targets for peak traffic, p99 latency, availability, write consistency, durability, regions, data residency, and budget;
+- rank two requirements as dominant;
+- toggle a network partition, processor outage, or region loss;
+- compare candidate choices such as single-writer versus multi-writer placement and synchronous versus asynchronous optional work.
+
+The board should flag tensions, not pronounce one design correct. For example, selecting strong cross-region write consistency, very low write latency, regional independence, and minimal cost should reveal competing pressures. An explanation panel should say which requirement causes each pressure and what would need to be relaxed.
+
+## Scaling Behavior
+
+Requirements must include both a current operating point and a growth or peak scenario. Average traffic alone hides launch events, seasonal peaks, celebrity users, batch jobs, and retry amplification. Geographic growth also changes latency and failure domains even when total request volume stays constant.
+
+As scale grows, revisit:
+
+- whether one state owner can sustain write traffic;
+- whether reads, writes, and large exports need different paths;
+- whether a regional latency target requires moving computation or data;
+- whether cost grows with requests, stored bytes, replicas, or outbound bandwidth;
+- and whether an earlier consistency or availability target remains affordable.
+
+Requirements are not permanent facts. A good design names the threshold at which an assumption should be reconsidered.
+
+## Failure Modes
+
+Requirement clarification itself can fail:
+
+- **Unbounded scope:** every possible feature is treated as V1, so no path receives enough depth.
+- **Unmeasurable qualities:** “fast,” “scalable,” and “secure” never become observable targets.
+- **Averages without tails:** an acceptable mean hides a poor p99 user experience.
+- **Universal criticality:** every operation receives the same availability and consistency guarantee, inflating complexity and cost.
+- **Happy-path requirements only:** duplicates, timeouts, partial failure, recovery, and data loss are never discussed.
+- **Silent assumptions:** the candidate makes a pivotal choice without giving the interviewer a chance to correct it.
+- **Checklist paralysis:** clarification consumes the interview and leaves no time to design.
+
+The mitigation is a time-boxed contract: critical journeys, the few quality attributes that shape them, explicit priorities, estimates to perform next, and a scope recap.
+
+## Trade-offs
+
+Sharper requirements reduce wasted design and make trade-offs defensible, but precision has a cost. Early numbers are estimates, and excessive detail can create fake certainty. A five-minute interview clarification cannot reproduce months of product discovery, compliance work, or load testing.
+
+The goal is therefore **decision-grade precision**: enough specificity to choose and challenge an architecture, while clearly labeling assumptions that real teams would validate later.
+
+Common tensions include:
+
+- stronger coordination can improve consistency while increasing latency or reducing write availability during partitions;
+- more replicas and regions can improve failure tolerance and read locality while increasing cost and operational complexity;
+- synchronous durability can strengthen an acknowledgment while extending the critical path;
+- broader retention and observability can aid audit and recovery while increasing privacy, security, and storage obligations;
+- aggressive performance targets can consume money and engineering effort that produce little user value.
+
+## Alternatives
+
+This lesson describes the compact method needed in an interview. Real projects may use additional techniques:
+
+- product discovery and user research to identify valuable journeys;
+- Quality Attribute Workshops to elicit and prioritize concrete quality scenarios;
+- threat modeling and privacy reviews for security-sensitive systems;
+- SLO design using production or prototype measurements;
+- load tests, failure exercises, and cost models to validate proposed targets;
+- architecture decision records to preserve why a trade-off was chosen.
+
+These practices complement requirement clarification; they do not justify turning an interview into a formal workshop.
+
+## When to Use
+
+Use this method at the start of every system-design interview and again whenever a deep dive exposes an ambiguous guarantee. It is especially important for prompts containing words such as “global,” “real time,” “exactly once,” “highly available,” or “massive scale,” because each phrase can hide several materially different meanings.
+
+## When Not to Use
+
+Do not keep collecting requirements after the architecture-relevant uncertainties are resolved. Do not demand exact numbers the interviewer does not have; propose a reasonable assumption, mark it, and continue. Do not freeze early assumptions when the interviewer deliberately changes a constraint—adapting the design is part of the exercise.
+
+## Common Misconceptions
+
+- **“Non-functional means optional.”** These requirements often decide whether the system is usable, safe, and affordable.
+- **“High availability means every feature always works.”** Critical paths can have stricter targets than exports, notifications, or administrative actions.
+- **“Strong consistency is a property of the whole product.”** State the invariant and operation that need it; other views may accept lag.
+- **“Global means active-active writes everywhere.”** It may mean global users, regional reads, regulatory placement, or disaster recovery instead.
+- **“Security comes after architecture.”** Identity, trust, sensitive data, and residency constrain boundaries from the beginning.
+- **“The interviewer expects hidden magic numbers.”** What matters is exposing assumptions and tracing their consequences.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I first identify the critical user journeys, then attach the scale and quality targets that change the architecture: latency, consistency, availability, durability, security, geography, and cost. I rank conflicting requirements, state assumptions and exclusions, and confirm the scope before estimating capacity or drawing components.
+
+### When to Introduce It
+
+Start immediately after receiving the prompt. Return to it before a major deep dive—for example, ask which invariant matters before choosing a concurrency strategy, or which failure must be survived before adding a region.
+
+### Common Follow-Ups
+
+- Which two or three functions are in scope for V1?
+- Which operation has the strictest latency or correctness requirement?
+- Can writes be rejected during a partition, or must the system remain writable?
+- What does “no data loss” mean relative to the client acknowledgment?
+- Where are users and where is data allowed to reside?
+- Which feature may degrade first under overload or dependency failure?
+- Which assumption would most change your architecture if it were wrong?
+
+### Common Candidate Mistakes
+
+- Asking a long generic checklist without connecting answers to decisions.
+- Treating an availability percentage as meaningful without an operation and time window.
+- Saying “eventual consistency is fine” without naming what may be stale and for how long.
+- Promising incompatible extremes rather than asking which requirement dominates.
+- Introducing databases, queues, caches, or regions before a requirement motivates them.
+- Failing to recap scope, leaving the interviewer and candidate solving different problems.
+
+## Summary
+
+- Functions describe observable behavior; non-functional requirements and constraints determine acceptable behavior and the viable design space.
+- Make important qualities measurable and scoped to a journey, percentile or time window, acknowledgment point, failure, and region where applicable.
+- Rank requirements because consistency, latency, availability, durability, security, geography, and cost create real tensions.
+- State assumptions and exclusions, confirm them, and revise them when new information appears.
+- A component belongs in the architecture only when a requirement, bottleneck, or failure justifies it.
+
+## Quiz Seeds
+
+1. A prompt says a service must be “highly available.” Which clarifying questions turn that into an architecture-relevant requirement?
+2. A payment command times out and the client retries. Which requirement must be clarified before selecting a mitigation?
+3. Why is “average latency under 100 ms” insufficient for an interactive API with occasional ten-second responses?
+4. Which requirements are in tension when a design demands strongly consistent writes in every region, very low latency, partition-time write availability, and minimal cost?
+5. Classify “issue a refund” and “99% of refunds complete within two seconds” as functional behavior and quality target.
+6. A receipt email provider is unavailable. How could prioritizing payment confirmation over receipt delivery change the architecture?
+7. What does “zero data loss” need to specify about the acknowledgment point and failure scope?
+8. A candidate spends 20 minutes gathering every possible feature. What should they do instead, and why?
+9. How can data residency alter a multi-region replication or failover plan?
+10. Name one assumption in a URL-shortener design that would materially change the data or caching architecture.
+
+## Related Topics
+
+- [What System Design Interviews Measure](./interview-signals.mdx) — the communication and reasoning signals that clarification exposes.
+- [Back-of-the-Envelope Estimation](./estimation.mdx) — turn scale assumptions into workload and capacity estimates.
+- [The Interview Design Framework](./interview-framework.mdx) — carry the requirement contract through APIs, data, architecture, failures, and trade-offs.
+
+## References
+
+### Documentation / Articles
+
+- [Build for business needs — Azure Architecture Center](https://learn.microsoft.com/en-us/azure/architecture/guide/design-principles/build-for-business) — Microsoft guidance connecting functional and non-functional requirements, business value, risk, growth, recovery targets, and architecture choices.
+- [The pillars of the framework — AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/the-pillars-of-the-framework.html) — an official overview of operational excellence, security, reliability, performance efficiency, cost optimization, and sustainability as interacting architecture concerns.
+- [Implementing SLOs — Google SRE Workbook](https://sre.google/workbook/implementing-slos/) — explains how user-relevant availability, latency, freshness, durability, correctness, and quality goals become measurable objectives and trade-off tools.
+
+### Papers
+
+- [Quality Attribute Workshops (QAWs), Third Edition — Carnegie Mellon Software Engineering Institute](https://insights.sei.cmu.edu/library/quality-attribute-workshops-qaws-third-edition/) — a structured method for eliciting, prioritizing, and refining architecture-driving quality scenarios from business and mission goals.
+
+### Videos
+
+No video is included for this lesson because the sources above provide stronger direct treatment of measurable quality scenarios and their architectural consequences.
