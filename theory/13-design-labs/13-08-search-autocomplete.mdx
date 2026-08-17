@@ -1,0 +1,203 @@
+---
+type: lesson
+id: 13-08-search-autocomplete
+slug: search-autocomplete
+title: Search Autocomplete
+description: Design low-latency prefix suggestions with offline-built indexes, ranking, cache behavior, freshness, and abuse controls.
+module: design-labs
+order: 8
+difficulty: advanced
+estimatedMinutes: 55
+prerequisites:
+  - 00-03-estimation
+  - 00-04-interview-framework
+  - 02-07-api-design-interviews
+  - 04-06-database-indexes
+  - 05-03-cache-aside
+  - 06-10-batching-and-stream-vs-batch
+tags:
+  - autocomplete
+  - prefix-index
+  - ranking
+  - caching
+  - freshness
+objectives:
+  - Choose a prefix index and query path that meet a tight keystroke latency budget.
+  - Separate authoritative terms, index builds, ranking updates, and serving replicas.
+  - Estimate query QPS, index size, cache working set, and update lag.
+  - Design safe fallback, versioned rollout, and abuse/privacy controls.
+relatedLessons:
+  - 04-06-database-indexes
+  - 05-03-cache-aside
+  - 05-09-multi-layer-caching
+  - 06-10-batching-and-stream-vs-batch
+visualizationId: null
+quizId: null
+---
+
+# Search Autocomplete
+
+> Autocomplete is a read path measured in keystrokes: precompute compact prefix candidates, serve a versioned immutable index, and treat freshness/ranking as explicit trade-offs.
+
+## Problem Statement
+
+Design suggestions for a search box as a user types. The service accepts a prefix, locale/tenant/context, and limit, then returns ranked suggestions with optional highlighting. The dictionary comes from products, places, or queries and changes continuously. Suggestions need low tail latency, must not expose private terms, and should degrade safely during an index rollout or cache outage.
+
+## Functional Requirements (Scoped)
+
+- Return up to 10 suggestions for a normalized prefix and context.
+- Rank by popularity, quality, recency, policy, and locale; break ties deterministically.
+- Publish approved term updates and remove blocked/private terms.
+- Support index versions, atomic rollout/rollback, and a short freshness SLA.
+- Record anonymized query signals for offline ranking, subject to privacy policy.
+
+Out of scope: full document retrieval, spell-correction research, personalized ML training, and arbitrary user-private history in a shared index.
+
+## Non-Functional Requirements and Priorities
+
+| Priority | Requirement | Working target / question |
+| --- | --- | --- |
+| P0 | Latency | p99 under 50 ms from regional edge for a warm prefix. |
+| P0 | Safety | Blocked/private terms never appear from an old serving index beyond a bound. |
+| P0 | Availability | Return a safe cached/shorter suggestion set when a replica fails. |
+| P1 | Freshness | Approved update visible within 5 minutes; emergency block within seconds. |
+| P1 | Scale | Handle bursty keystrokes and hot prefixes without per-character database scans. |
+| P2 | Ranking | Rebuild/re-rank offline without taking serving traffic down. |
+
+## Estimation Prompts and Checked Example
+
+Ask for active searchers, keystrokes/session, query length, cache hit, suggestion payload, dictionary size, update rate, and replica count. Example:
+
+- 10M searchers/day × 20 keystrokes = 200M requests/day → `≈2,315 QPS`; a 10× peak is `≈23k QPS`.
+- If suggestions average 1.5 KB, peak egress is `23k × 1.5 KB ≈34.5 MB/s ≈276 Mb/s` payload.
+- A 50M-term dictionary with 20 bytes of normalized term plus 100 bytes of top-candidate metadata is about `6 GB` logical before trie/FST overhead, language shards, replicas, and memory alignment.
+- A 5% hot-prefix cache at 1.5 KB/value and 100k distinct keys is only `≈150 MB`; measure key cardinality instead of using QPS × TTL blindly.
+
+Sensitivity prompts: Are queries global or tenant-scoped? Are suggestions allowed to be stale? What does “remove immediately” mean when an edge cache is warm? Which context fields change the cache key?
+
+## API Design
+
+```http
+GET /v1/suggest?q=rea&locale=en-US&limit=10&context=home
+```
+
+Return `200 {suggestions, indexVersion, generatedAt, expiresAt}`. Normalize Unicode/case server-side and cap prefix length/limit. `400` covers invalid encoding/limit; `429` protects keystroke abuse; `503` is reserved for no safe serving replica. Suggestions are read-only and can retry on transport errors; callers should debounce rather than retry every key event.
+
+Admin ingestion uses `POST /v1/dictionaries/{id}/updates` with an idempotency key and version; repeated updates return the same build job. `GET /v1/builds/{id}` reports `queued/building/validated/published/failed`; publishing is an atomic pointer swap. A blocked-term update may be applied as an overlay denylist while a full index rebuild runs.
+
+A request with the same idempotency key but a different normalized update returns `409 BuildRequestConflict`; a retry after a lost response queries the existing build rather than starting a second build.
+
+## Data Model, Access Paths, and Ownership
+
+```text
+terms(term_id PK, normalized_term, locale, tenant, state, policy_version)
+rank_stats(term_id, window, score, updated_at)
+index_manifests(index_id PK, locale/tenant, checksum, build_version,
+                object_key, state, published_at)
+deny_overlays(key PK, normalized_prefix/term, policy_version, expires_at)
+query_events(event_id PK, coarse_prefix, context_hash, occurred_at)
+```
+
+The dictionary/policy service owns approved terms and denies; the index builder owns immutable trie/FST artifacts; serving replicas own only local memory-mapped/read-only state. Query access is prefix traversal plus top-k candidate selection, not a wildcard SQL scan. Ranking stats are periodically materialized into the index; the overlay handles urgent removals with a bounded lookup.
+
+## Progressive Architecture: Naive → Bottleneck → Improvement → New Trade-off
+
+1. **Naive:** query `LIKE 'rea%' ORDER BY popularity` on a relational table. It is correct for a small dictionary but becomes CPU/index-scan heavy at each keystroke and competes with writes.
+2. **Bottleneck/failure:** add a cache around prefix queries. Hot prefixes are fast, but cold prefixes, cache stampedes, ranking changes, and tenant/locale key cardinality still hit the database; stale blocked terms can persist.
+3. **Improvement:** build a compact per-locale/tenant prefix index offline, replicate immutable snapshots, cache hot responses, and apply versioned deny overlays. Route a request to one local replica and return index version/freshness.
+4. **New trade-off:** snapshots are eventually fresh and consume memory; a deny overlay adds per-query work and needs its own availability. Atomic pointer swaps and checksums make rollback safer, while a rebuild can lag during a data storm.
+
+Reference architecture:
+
+```text
+Term/Policy DB → change stream → index builder → validated artifact/object store
+                                                ↓ atomic publish manifest
+Query edge → response cache → autocomplete replicas (trie/FST + deny overlay)
+                       └→ anonymized query stream → ranking aggregation
+```
+
+The serving artifact is immutable and independently scalable; policy/deny state remains authoritative and versioned.
+
+## Bottlenecks and Concurrency / Consistency
+
+Hot prefixes, memory per replica, index build time, cache stampedes, ranking fanout, tenant-shard skew, and deny overlay lookups dominate. A published manifest is an atomic version pointer; serving requests use one snapshot, not a mix of nodes. A blocked term must be filtered against the overlay even if the snapshot is old. Cache keys include normalized prefix, locale, tenant, context bucket, and policy version. Query events are asynchronous and sampled/coarsened for privacy.
+
+## Failure Analysis
+
+- **Bad index build:** validate checksums/term policies and keep the prior version; never publish a partial artifact.
+- **Replica out of memory:** shard by locale/tenant, reduce candidate depth, or serve a smaller fallback set.
+- **Cache outage:** local index can serve directly; bound concurrent misses.
+- **Stale denylist:** emergency overlay is strongly/rapidly propagated and checked before response.
+- **Ranking pipeline lag:** serve stable prior scores with a freshness field.
+- **Keystroke flood:** debounce guidance, per-principal/IP limits, and edge sampling protect QPS.
+
+## Security
+
+Authenticate administrative ingestion and isolate tenant dictionaries. Apply privacy/abuse policy before indexing; do not put raw private search history into a shared model. Normalize confusable Unicode, cap query size, escape output/highlighting, and guard against enumeration of sensitive terms. Encrypt artifacts/logs, use least-privilege publish roles, and audit denylist changes.
+
+## Observability
+
+Track query QPS/latency by prefix length/locale/tenant, cache hit/miss/stampede, replica memory/CPU, index version/freshness, deny-overlay hits, blocked-term leakage tests, build duration/failure, publish/rollback count, candidate depth, empty-result rate, and ranking score age. Trace query ID through cache/replica and build ID through publish; do not log raw private prefixes. Alert on p99, stale policy age, and artifact checksum/version skew.
+
+## Explicit Trade-offs and Alternatives
+
+- **SQL prefix index:** simple and fresh for small dictionaries; poor at high QPS/complex ranking.
+- **Trie/FST:** compact, deterministic low-latency prefix lookup; immutable rebuilds and memory/version management.
+- **Search engine completion suggester:** operationally rich and ranking-aware; heavier cluster/cost and still needs policy overlays.
+- **Full cache only:** fast for hot keys but cannot cover long-tail prefixes or urgent updates.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+“I avoid a database scan per keystroke by building immutable prefix indexes per locale/tenant, serving them from local replicas with a response cache. A manifest pointer swaps versions atomically, while a rapidly propagated deny overlay prevents blocked terms from waiting for a full rebuild. Query events feed ranking asynchronously; the API exposes freshness/version and limits keystroke abuse. I would ask how quickly removals must take effect and how many tenant dictionaries exist.”
+
+### When to Introduce It
+
+Introduce an index when prefix scans or rank queries exceed the latency budget; introduce immutable snapshots when serving and ingestion have different scale/failure characteristics.
+
+### Common Follow-Ups
+
+- How can a blocked term disappear quickly?
+- What if one prefix is extremely hot?
+- How do you roll back a bad index?
+- What belongs in the cache key?
+
+### Common Candidate Mistakes
+
+Treating autocomplete as full search, omitting locale/tenant in cache keys, publishing partial indexes, and claiming a cache invalidation is immediate policy enforcement.
+
+## Summary
+
+Serve prefix reads from immutable, versioned artifacts; keep policy authoritative and fast to overlay. Estimate keystroke bursts and memory, then measure freshness, hot prefixes, and index rollout safety as first-class SLOs.
+
+## Quiz Seeds
+
+1. Calculate peak autocomplete QPS from daily keystrokes and a 10× multiplier.
+2. Why is `LIKE 'prefix%'` not enough at large dictionaries?
+3. What does an atomic manifest swap protect?
+4. How can a deny overlay bound blocked-term staleness?
+5. Which fields belong in the cache key?
+6. How do you handle a hot prefix without duplicating full index work?
+7. What happens if the latest index build fails validation?
+8. Why are raw query events sensitive observability data?
+
+## Related Topics
+
+- [Database indexes](../04-databases/database-indexes.mdx) — why access patterns drive prefix structures.
+- [Cache-aside](../05-caching/cache-aside.mdx) — response-cache miss behavior.
+- [Multi-layer caching](../05-caching/multi-layer-caching.mdx) — edge/local/index layers.
+- [Batching and stream vs batch](../06-messaging/batching-and-stream-vs-batch.mdx) — incremental signals and offline artifacts.
+
+## References
+
+### Documentation / Articles
+
+- [Elasticsearch completion suggester](https://www.elastic.co/guide/en/elasticsearch/reference/current/search-suggesters.html) — documents a production prefix-suggestion data structure and tuning surface.
+- [Apache Lucene FST](https://lucene.apache.org/core/9_12_2/core/org/apache/lucene/util/fst/FST.html) — describes the compact finite-state representation used for read-only term lookup.
+- [Unicode Technical Standard #15](https://unicode.org/reports/tr15/) — grounds normalization decisions for user-entered prefixes.
+- [OpenTelemetry metrics](https://opentelemetry.io/docs/concepts/signals/metrics/) — supports measuring latency, freshness, and serving health without logging raw queries.
+
+## Future Visualization / Workspace Spec
+
+Show SQL scan, cache miss, trie/FST lookup, ranking, deny overlay, and index publish transitions. Controls should vary prefix skew, dictionary size, cache TTL, build lag/failure, denylist urgency, tenant count, and replica memory. Display p99 latency, candidate count, cache hit ratio, index freshness/version skew, blocked-term leakage, and memory. The workspace should include Policy DB, Stream, Builder, Artifact Store, Serving Replica, Cache, and Query Edge nodes with version/consistency labels.

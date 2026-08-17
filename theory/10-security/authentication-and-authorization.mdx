@@ -1,0 +1,171 @@
+---
+type: lesson
+id: 10-01-authentication-and-authorization
+slug: authentication-and-authorization
+title: Authentication and Authorization
+description: Separate proving a principal’s identity from deciding which operation that principal may perform at each trust boundary.
+module: security
+order: 1
+difficulty: core
+estimatedMinutes: 30
+prerequisites:
+  - 02-07-api-design-interviews
+  - 03-06-api-gateway
+  - 09-01-logs-metrics-and-traces
+tags:
+  - authentication
+  - authorization
+  - trust-boundaries
+  - least-privilege
+  - identity
+objectives:
+  - Distinguish authentication, authorization, and accounting/audit responsibilities.
+  - Map principals, credentials, resources, and trust boundaries in a service architecture.
+  - Enforce object- and function-level authorization at the service that owns the data.
+  - Reason about compromise, revocation, propagation, and least-privilege trade-offs.
+relatedLessons:
+  - 10-02-sessions-and-tokens
+  - 10-05-rbac-and-abac
+  - 10-08-api-abuse-prevention
+  - 09-06-alerting
+---
+
+# Authentication and Authorization
+
+> Authentication establishes who or what is making a request; authorization decides whether that principal may perform this operation on this resource under current policy.
+
+## Why This Exists
+
+An API gateway can verify a credential and still let a user read another user's invoice. A service can know the caller is Alice and still permit Alice to approve a payment she is not allowed to approve. The naive design authenticates once at the edge, forwards a user ID in a header, and trusts every internal hop. It fails when a route is reached around the gateway, a header is spoofed, a service is compromised, or an object identifier is not checked against ownership.
+
+Security architecture begins by naming principals, credentials, resources, actions, and trust boundaries. Authentication (AuthN) answers “who presented valid evidence?” Authorization (AuthZ) answers “may that principal do this action here?” Auditability records the decision and relevant context without logging secrets. Neither AuthN nor AuthZ is supplied by a network location alone.
+
+## Mental Model
+
+```text
+principal ──credential──> identity verifier ──authenticated subject──>
+  request + resource + action + context ──policy──> allow / deny / audit
+```
+
+The principal can be a human, service, device, or job. A credential may be a password-derived proof, session handle, access token, client certificate, or signed request. The verifier must know which issuer/key/credential store it trusts and what compromise assumptions apply. The authorization decision needs resource ownership, tenant, action, workflow state, and sometimes time or risk context—not merely a role string.
+
+Trust boundaries are places where data or authority crosses an assumption: browser to edge, edge to API, service to service, service to database, or a third-party identity provider to the application. A gateway can perform coarse authentication and reject obviously invalid requests, but the resource-owning service must independently validate the token/session and enforce object/function access. Forwarded identity headers are derived data, never authority unless the receiving hop authenticates the sender and protects the channel.
+
+## How It Works
+
+1. Identify the principal and the credential issuer. Establish the cryptographic or stateful proof, expiry, audience, and replay assumptions.
+2. Normalize a request context containing subject, tenant, authentication strength, scopes/roles, and a correlation ID. Keep identity separate from untrusted input such as `X-User-Id` or a path parameter.
+3. At the resource owner, authorize the operation against the actual object and current policy. Check both function-level permission (“may approve?”) and object-level scope (“this invoice belongs to the subject’s tenant”).
+4. Enforce server-side workflow state and invariants. Do not rely on the UI hiding a button or on a previous endpoint having performed a check.
+5. Record an audit event for sensitive allow/deny decisions with principal, action, resource class/ID hash, tenant, decision, policy version, and reason. Redact credentials and personal data.
+6. Define revocation and compromise response: disable a subject, rotate keys, invalidate sessions/tokens, quarantine a service, and investigate the blast radius.
+
+Authorization may be centralized for policy administration, but synchronous checks must remain available at the enforcing service. A policy cache trades latency for staleness; document the maximum stale authorization window and fail closed for high-risk actions.
+
+## Example
+
+`GET /tenants/acme/invoices/42` arrives with a session/token that authenticates Alice and claims tenant `acme`. The Invoice service verifies the issuer, audience, expiry, and signature/session state, then checks that invoice 42 belongs to `acme` and Alice’s role permits reading it. A path change to invoice 43 cannot bypass the ownership query. `POST /invoices/42/approve` requires an approval permission and a workflow state of `PENDING`; the service records the decision and emits an audit event.
+
+The gateway may reject missing credentials and apply coarse rate limits, but it cannot safely decide ownership from a path alone. If an internal reporting service calls Invoice, it authenticates as its own service principal and supplies a delegated user context only through a documented, integrity-protected protocol; the Invoice service does not trust arbitrary user headers.
+
+## Visualization We Eventually Want
+
+Show browser, edge, identity verifier, invoice service, policy store, and audit sink as trust-boundary boxes. Let the learner alter credentials, issuer, tenant, object owner, route, workflow state, and whether the gateway or service performs a check. Inject a spoofed header, a direct service call, a compromised token, and a stale policy cache. Display AuthN evidence, AuthZ decision, audit record, and rejected/allowed side effect.
+
+## Scaling Behavior
+
+Authentication verification can be cached or performed with locally available public keys, but revocation and policy changes introduce consistency requirements. Authorization checks may fan out to a policy service or database; avoid making every read depend synchronously on a central service when a bounded local policy is sufficient. High-volume audit events need durable buffering, partitioning, retention, and privacy controls.
+
+For service-to-service traffic, each service should have a narrowly scoped identity and permission set. A shared credential makes rotation and incident attribution difficult and turns one compromise into fleet-wide authority. Multi-tenant systems need tenant-aware authorization at every storage, cache, queue, and blob boundary, not just at the edge.
+
+## Failure Modes
+
+- **Authentication without authorization:** any valid user can access every object.
+- **Gateway-only enforcement:** alternate routes or compromised internal callers bypass policy.
+- **Confused deputy:** a privileged service uses its authority for an untrusted caller without validating delegation.
+- **Header spoofing:** user or tenant identity is accepted from a client-controlled header.
+- **Stale policy cache:** revoked permission remains usable beyond the risk window.
+- **Fail-open dependency:** policy-service outage silently allows sensitive actions.
+- **Audit leakage:** logs contain tokens, passwords, or unredacted personal data.
+- **Overprivileged service account:** compromise grants unrelated database or administrative access.
+
+## Trade-offs
+
+Centralized identity and policy improve consistency and administration but add availability, latency, and blast-radius dependencies. Local verification reduces latency and coupling but complicates key/policy distribution and revocation. Coarse gateway checks are efficient; resource-owner checks are authoritative but consume service capacity. Stronger authentication and step-up checks reduce high-risk abuse at the cost of user friction and workflow complexity.
+
+## Alternatives
+
+- **Per-service local policy:** best for low-latency, stable rules; requires consistent policy deployment and revocation handling.
+- **Central policy decision point:** useful for dynamic, auditable policies; requires caching and a safe outage mode.
+- **Capability URLs/tokens:** concise delegation for narrow, expiring operations; dangerous if leaked and hard to revoke broadly.
+- **Network allowlists alone:** useful as defense in depth for service boundaries, never sufficient for user/object authorization.
+
+## When to Use
+
+Design AuthN and AuthZ explicitly for every public endpoint, service boundary, sensitive workflow, and tenant/data access path. Place authoritative checks beside the resource and define compromise and revocation before choosing token/session mechanics.
+
+## When Not to Use
+
+Do not build a custom identity protocol when a well-specified, reviewed protocol meets the requirement. Do not duplicate business policy in the UI, gateway, and services without a clear source of truth. Internal traffic still needs identity when it crosses a trust boundary or accesses sensitive data.
+
+## Common Misconceptions
+
+- **“If the user is authenticated, they are authorized.”** Identity and permission are separate decisions.
+- **“Internal means trusted.”** Internal services, headers, and networks can be compromised or misconfigured.
+- **“A role check protects an object.”** Object ownership/tenant scope and workflow state still need validation.
+- **“The gateway can authorize everything.”** The resource owner knows current ownership and business invariants.
+- **“Audit logs are optional.”** Without decision evidence, compromise investigation and policy debugging are severely limited.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I map principals, credentials, and trust boundaries first. The edge can authenticate and apply coarse policy, but every resource-owning service verifies the credential and performs object- and function-level authorization with tenant and workflow checks. I keep identity separate from client headers, record redacted audit decisions, and define key/session revocation and service-compromise blast radius.
+
+### When to Introduce It
+
+Introduce the split whenever a design has users, service identities, sensitive data, or multiple routes to the same resource. Ask who owns the data and which boundary can be bypassed.
+
+### Common Follow-Ups
+
+- Where is the authoritative authorization check?
+- How do you revoke access quickly?
+- What happens if the policy service is unavailable?
+- How do you prevent cross-tenant object access?
+
+### Common Candidate Mistakes
+
+- Trusting an `X-User-Id` header from the client.
+- Putting all authorization in the gateway.
+- Omitting object-level and workflow-state checks.
+- Giving every service one shared privileged credential.
+
+## Summary
+
+Authenticate evidence, authorize each action against the resource and current policy, and audit sensitive decisions. Gateways help with coarse controls, but resource owners enforce authority. State trust boundaries, stale-policy behavior, revocation, and compromise blast radius as first-class design choices.
+
+## Quiz Seeds
+
+1. What question does authentication answer, and what question does authorization answer?
+2. Why must the Invoice service check object ownership even after gateway authentication?
+3. What is a confused-deputy failure?
+4. How should a service treat a client-supplied identity header?
+5. When might a policy cache fail closed instead of serving stale data?
+6. Why are separate service principals safer than one shared credential?
+7. What information belongs in an audit record without exposing secrets?
+
+## Related Topics
+
+- [Sessions and Tokens](./sessions-and-tokens.mdx)
+- [RBAC and ABAC](./rbac-and-abac.mdx)
+- [API Abuse Prevention](./api-abuse-prevention.mdx)
+- [Actionable Alerting](../09-observability/alerting.mdx)
+
+## References
+
+### Documentation / Articles
+
+- [Authorization Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html) — covers least privilege, deny-by-default, server-side checks, and object authorization.
+- [REST Security Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/REST_Security_Cheat_Sheet.html) — explains endpoint access control, JWT validation, and audit logging boundaries.
+- [Zero Trust Architecture (SP 800-207)](https://csrc.nist.gov/pubs/sp/800/207/final) — grounds the principle that network location is not implicit trust.
+- [Application Security Verification Standard](https://owasp.org/www-project-application-security-verification-standard/) — provides verifiable requirements for authentication and access control.

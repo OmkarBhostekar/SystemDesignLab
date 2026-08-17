@@ -1,0 +1,170 @@
+---
+type: lesson
+id: 09-06-alerting
+slug: alerting
+title: Actionable Alerting
+description: Turn user-impact evidence into bounded pages, tickets, and logs with thresholds, context, ownership, and a recovery action.
+module: observability
+order: 6
+difficulty: core
+estimatedMinutes: 28
+prerequisites:
+  - 09-03-golden-signals
+  - 09-04-sli-slo-and-sla
+  - 09-05-error-budgets
+  - 08-05-circuit-breaker
+tags:
+  - alerting
+  - paging
+  - burn-rate
+  - runbooks
+  - incident-response
+objectives:
+  - Distinguish page-worthy symptoms from ticket-worthy trends and diagnostic logs.
+  - Design alerts with duration, severity, ownership, runbook, and user-impact context.
+  - Reduce noise through grouping, inhibition, deduplication, and multi-window thresholds.
+  - Cover async lag, telemetry failures, and recovery without alerting on every cause.
+relatedLessons:
+  - 09-05-error-budgets
+  - 09-07-health-checks
+  - 09-03-golden-signals
+  - 08-04-retry-storms-and-cascading-failures
+---
+
+# Actionable Alerting
+
+> An alert earns a human interruption only when someone can take a timely action; everything else belongs in a dashboard, ticket, or searchable record.
+
+## Why This Exists
+
+The naive monitoring system pages on every threshold: CPU high, one request slow, a pod restarted, or a single scrape failed. During a real outage, hundreds of alerts arrive from symptoms and causes across the same dependency. Operators mute the stream, and the one page that requires action is lost.
+
+Actionable alerting starts from the response, not the metric. A page says “user impact is happening now; do this.” A ticket says “someone should investigate soon.” A log or dashboard records evidence without asking a human to interrupt work. Good alerts are few, stable, owned, and linked to context.
+
+## Mental Model
+
+```text
+signal → condition persists? → user impact / urgency → page | ticket | log
+                 │                    └── context: owner, runbook, scope
+                 └─ transient noise → dashboard only
+```
+
+Alert on symptoms as high in the stack as practical: SLO burn, user-visible latency, error rate, or async freshness. Cause-oriented alerts (CPU, a single instance, a dependency timeout) are valuable as diagnostic evidence or capacity tickets, but they should not all page independently. A page can include likely causes without pretending the cause is certain.
+
+## How It Works
+
+1. Define the action and owner before writing the rule: page the on-call to rollback, shed optional work, fail over, or acknowledge a security event.
+2. Choose a stable user-impact signal and threshold. Require a `for` duration or multi-window condition to tolerate small blips.
+3. Attach scope (service, region, tenant class), severity, current value, expected target, first-seen time, and a runbook/dashboard link.
+4. Group alerts from one incident, deduplicate repeated evaluations, and inhibit dependent alerts when a root outage is known. Keep a metamonitoring alert for a broken alert pipeline.
+5. Test the rule with normal traffic, a slow tail, a real outage, and a telemetry gap. Verify the page wakes the right person and can be silenced safely.
+6. Review pages after incidents. If no action was possible, lower its severity or remove it; if action was needed but no page arrived, fix the signal or threshold.
+
+An alert expression should distinguish “no data” from “zero.” A missing scrape may mean the target is down, the collector is broken, or the query is wrong. Use an explicit freshness/monitoring-health signal instead of silently treating missing data as healthy.
+
+## Example
+
+For checkout, page when the 5-minute and 1-hour error-budget burn both exceed policy thresholds, grouped by region. The page contains the failed SLO, affected route, request rate, p99 latency, recent deployment, top dependency spans, and rollback/runbook links. A ticket opens when connection-pool utilization stays above 80% for 30 minutes; it informs capacity work but does not wake someone at 3 a.m. A debug log records individual validation failures without a page.
+
+For a queue, page on oldest-message age breaching the freshness SLO, not merely queue depth. If all consumers lose connectivity, one dependency alert can inhibit dozens of consumer-lag pages while preserving a single owner-facing symptom. If the telemetry backend is down, a black-box probe pages the monitoring owner.
+
+## Visualization We Eventually Want
+
+Show a stream of metric conditions and an alert router. Let the learner set thresholds, hold duration, severity, grouping key, inhibition rule, and runbook action. Inject a one-minute blip, sustained user errors, a dependency outage, a queue backlog, and a telemetry silence. Display pages/tickets/logs produced, deduplication count, human notification rate, and whether each page has a concrete next step.
+
+## Scaling Behavior
+
+Alert volume grows with services, regions, tenants, and dimensions. Group by incident identity and choose dimensions that map to ownership; grouping every user ID creates a page storm. Fleet-wide SLO alerts reduce noise but can hide a small region; combine a customer-facing page with diagnostic breakdowns and a separate local policy when the blast radius matters.
+
+Alert evaluations should be resilient to delayed scrapes and clock differences. Use recording rules or pre-aggregated metrics to avoid expensive queries at incident scale. Notification systems need retry, deduplication, rate limits, and durable state, but must avoid retrying notifications forever when an on-call channel is unavailable.
+
+## Failure Modes
+
+- **Alert fatigue:** too many pages or no runbooks cause operators to ignore notifications.
+- **Cause storm:** every downstream symptom pages during one dependency outage.
+- **Flapping:** a threshold crosses repeatedly near a boundary and sends contradictory pages.
+- **Missing data treated as healthy:** collector or target failure is invisible.
+- **Static threshold drift:** traffic seasonality or a new workload makes a once-useful limit wrong.
+- **Unowned alert:** the page reaches a team that cannot mitigate it.
+- **Sensitive context leakage:** notification text contains tokens, payloads, or personal data.
+
+## Trade-offs
+
+Higher sensitivity catches incidents sooner but increases noise; longer holds reduce noise but delay response. Symptom alerts are actionable and stable but may not identify the root cause. Cause alerts help diagnosis but are brittle and often correlated. Grouping prevents storms but can hide a second independent failure; inhibition needs careful scope and review. Automated remediation reduces response time but can amplify a bad diagnosis.
+
+## Alternatives
+
+- **Dashboard-only monitoring:** fine for low-risk systems or exploratory work, but no timely response contract.
+- **Synthetic probes:** strong user-boundary detection and independent metamonitoring; limited internal diagnosis.
+- **Anomaly detection:** useful for seasonal traffic and unknown patterns, but harder to explain and test than SLO thresholds.
+- **Automated rollback/remediation:** appropriate for well-understood, reversible failures; retain a page and audit trail.
+
+## When to Use
+
+Use pages for immediate human action, tickets for non-urgent work, and logs/dashboards for evidence. Make every page testable, owned, and connected to a user-impact objective or clear operational hazard.
+
+## When Not to Use
+
+Do not page for every metric anomaly, a condition nobody can act on, or a known low-risk event. Do not rely on a vendor default severity or send sensitive telemetry into broad chat channels.
+
+## Common Misconceptions
+
+- **“More alerts improve reliability.”** Noise degrades detection and response.
+- **“Alert on the cause to be proactive.”** The user symptom usually has a more stable and meaningful action.
+- **“One alert per instance is precise.”** It can become an outage-sized notification storm.
+- **“No data equals zero.”** Telemetry failure needs its own signal.
+- **“A page is a log with higher priority.”** A page is a contract to interrupt a human for an action.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I page on user-impact symptoms such as SLO burn, high tail latency, error rate, or async freshness, and include owner, scope, current value, recent change, and runbook action. I use hold durations and multi-window thresholds, group and inhibit correlated alerts, and distinguish pages from tickets and logs. Monitoring-pipeline health is itself monitored so silence does not look healthy.
+
+### When to Introduce It
+
+Introduce alerting after defining the SLI/SLO and failure responses. Ask what the on-call should do before selecting a threshold.
+
+### Common Follow-Ups
+
+- How do you avoid a page storm during a regional outage?
+- What if the telemetry backend is unavailable?
+- Why alert on queue age instead of depth?
+- Which signals should create tickets rather than pages?
+
+### Common Candidate Mistakes
+
+- Paging on CPU or every container restart without user impact.
+- Omitting a runbook or owner.
+- Ignoring missing data and alert pipeline health.
+- Using one threshold for all regions and workload classes.
+
+## Summary
+
+Actionable alerting is a human interface to system behavior. Page on persistent user impact with context and a response, route lower urgency to tickets, retain detail in logs/dashboards, and control volume with grouping, deduplication, inhibition, and tested runbooks.
+
+## Quiz Seeds
+
+1. What separates a page from a ticket or log?
+2. Why are SLO burn alerts often better page triggers than CPU?
+3. What does a `for`/hold duration protect against?
+4. How can grouping and inhibition reduce a dependency outage’s alert storm?
+5. Why is missing telemetry not equivalent to a healthy zero value?
+6. Which queue signal better represents an async freshness breach: depth or oldest age?
+7. What information should a page include so the on-call can act?
+
+## Related Topics
+
+- [Error Budgets](./error-budgets.mdx)
+- [Health Checks](./health-checks.mdx)
+- [Golden Signals](./golden-signals.mdx)
+- [Retry Storms and Cascading Failures](../08-reliability/retry-storms-and-cascading-failures.mdx)
+
+## References
+
+### Documentation / Articles
+
+- [Alerting](https://prometheus.io/docs/practices/alerting/) — recommends symptom-based alerts, simple rules, and actionable pages.
+- [Alerting overview](https://prometheus.io/docs/alerting/latest/overview/) — explains separation of rules, grouping, silencing, and notification routing.
+- [Service Best Practices](https://sre.google/sre-book/service-best-practices/) — frames pages, tickets, and logs as distinct monitoring outputs.
+- [Alerting on SLOs](https://sre.google/workbook/alerting-on-slos/) — provides multi-window burn-rate alerting guidance.

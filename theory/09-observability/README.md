@@ -1,6 +1,6 @@
 # Module 09 — Observability
 
-**Status:** Scaffold only. Observability theory and request-tracing exercises remain to be authored.
+**Status:** Theory complete (7/7 lessons). Interactive visualizations, structured quizzes, and application wiring remain future work.
 
 ## Purpose
 
@@ -37,5 +37,4 @@ The module is **Core** overall. Error budgets and the relationship between SLI/S
 
 ## Authoring boundary
 
-The README only establishes order. Future lessons should pair every signal with the decision it enables, show distributed context propagation, and keep dashboards subordinate to user-impact reasoning rather than presenting telemetry as decoration.
-
+The seven canonical lessons now pair every signal with the decision it enables, show distributed context propagation through synchronous and asynchronous paths, and keep dashboards subordinate to user-impact reasoning rather than presenting telemetry as decoration. Interactive visualizations and structured quizzes remain future work; the Markdown lessons are the current source of truth.

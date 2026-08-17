@@ -1,0 +1,174 @@
+---
+type: lesson
+id: 10-03-jwt-tradeoffs
+slug: jwt-tradeoffs
+title: JWT Trade-offs
+description: Use signed claims for bounded local verification while accounting for staleness, revocation, key boundaries, and replay.
+module: security
+order: 3
+difficulty: core
+estimatedMinutes: 28
+prerequisites:
+  - 10-02-sessions-and-tokens
+  - 10-01-authentication-and-authorization
+  - 09-02-distributed-tracing
+tags:
+  - jwt
+  - claims
+  - signatures
+  - key-rotation
+  - revocation
+  - bearer-tokens
+objectives:
+  - Explain what a JWT signature protects and what it does not hide.
+  - Validate issuer, audience, algorithm, time, subject, and application-specific claims.
+  - Reason about revocation, key rotation, claim staleness, and token size.
+  - Choose JWTs only when their local-verification benefit outweighs operational cost.
+relatedLessons:
+  - 10-02-sessions-and-tokens
+  - 10-04-oauth-and-oidc
+  - 10-06-tls-and-encryption
+  - 10-07-secrets-management
+---
+
+# JWT Trade-offs
+
+> JWT is a compact claims format, not an authentication system: signed claims can be verified locally, but they remain replayable, potentially stale, and operationally coupled to key and policy management.
+
+## Why This Exists
+
+Many services need to know the subject and scopes of a request without calling a central session database on every hop. The naive solution shares a symmetric secret with every service and trusts whatever claims a parser returns. It fails when one verifier is compromised, when the algorithm is chosen from attacker-controlled header data, or when a removed permission remains embedded until expiry.
+
+A JSON Web Token can carry claims in a signed JWS or encrypted JWE representation. A signature gives integrity and issuer authenticity under a key trust decision; it does not encrypt readable payloads, stop replay, or make claims current. JWTs are useful when local verification and interoperability matter, but opaque sessions or introspection may be safer for rapidly changing authorization.
+
+## Mental Model
+
+```text
+JWT = encoded header + encoded claims + signature
+        │                 │             └─ proves issuer/key signed bytes
+        │                 └─ statements, not automatically true policy
+        └─ algorithm/key hint; verifier chooses allowed policy
+```
+
+A resource service should accept a token only from an expected issuer, for an expected audience, with an allowed algorithm/key, valid time window, and claims that fit its authorization contract. Standard claims such as `iss`, `sub`, `aud`, `exp`, `nbf`, `iat`, and `jti` have defined meanings, but applications must decide which are required.
+
+The trust boundary is the verifier’s key set and issuer configuration. With symmetric MACs, every verifier that can validate can also mint tokens; compromise of one verifier can therefore compromise all consumers sharing the key. Asymmetric signatures let services verify with public keys while keeping signing authority at an issuer, reducing that blast radius. Key rotation still requires distribution, overlap, cache expiry, and a response to a compromised key.
+
+## How It Works
+
+1. The issuer authenticates a principal and selects a narrow audience and scope.
+2. It signs a minimal claim set with an approved algorithm and key ID, optionally encrypting sensitive content when confidentiality is required.
+3. The resource service parses defensively, selects verification keys from its configured trusted issuer, and rejects unsupported algorithms instead of obeying the token header.
+4. It validates signature, issuer, audience, expiry, not-before, time skew, subject format, token type, and application-specific tenant/scope claims.
+5. It applies current authorization policy and resource ownership checks; a valid token is evidence of issuance, not an unconditional allow.
+6. It records token ID/hash and decision context for audit without logging the bearer value. High-risk operations may require introspection, a denylist, fresh authentication, or sender-constrained proof.
+
+Keep claims small. A token sent through every fan-out call increases bandwidth, header parsing, and proxy-limit risk. Do not include mutable profile data, secrets, or a complete authorization graph just to avoid a lookup. If a claim changes frequently, use a short TTL or resolve current state at the resource owner.
+
+## Example
+
+The Identity service issues a 10-minute access JWT with `iss=https://id.example`, `aud=orders-api`, `sub=user-42`, `scope=orders:read`, `tenant=acme`, `exp`, and `jti`. Orders verifies the signature against its pinned issuer configuration, checks audience and expiry, then queries ownership for order 99. A token for `reports-api` is rejected even if signed by the same issuer.
+
+When Alice is removed from `orders:write`, existing read tokens remain valid for reads, but write requests consult current policy or a short-lived permission version. If the signing key is compromised, the issuer stops publishing it, services refresh key sets, reject tokens with that key after a bounded overlap, and revoke affected sessions/refresh chains. A key rotation alone does not invalidate every token if services cache old keys indefinitely.
+
+## Visualization We Eventually Want
+
+Show issuer, key set, token, resource services, policy store, and an attacker with a copied token. Let the learner toggle symmetric/asymmetric signing, claim changes, TTL, clock skew, key rotation, denylist, audience, and algorithm selection. Display which requests verify, which are authorized, the compromise window, header size, and the difference between readable claims, integrity, confidentiality, and replay protection.
+
+## Scaling Behavior
+
+Local verification scales CPU and key-cache reads with request rate but avoids a central lookup. Issuer key publication and refresh become control-plane dependencies; services need bounded stale-key behavior and emergency revocation. Large fan-out systems pay token parse/forwarding cost at every hop, so pass a minimal service-specific credential or use a token exchange/delegation pattern rather than forwarding a broad user token everywhere.
+
+High-cardinality token IDs should not become metric labels. If denylisting `jti` values is necessary, bound retention to token expiry, partition lookup storage, and decide behavior during its outage. Token size can exceed cookie or header limits; use references or sessions when claims become large.
+
+## Failure Modes
+
+- **Algorithm confusion/none acceptance:** verifier trusts attacker-controlled header choices.
+- **Wrong audience:** a token minted for one API is accepted by another.
+- **Issuer confusion:** a token from an unexpected tenant/identity provider is accepted.
+- **Stale claims:** a role, tenant, or account status changed after issuance.
+- **Key compromise:** shared symmetric key lets a compromised service mint fleet-wide tokens.
+- **Key-cache lag:** rotation or revocation is not observed promptly.
+- **Replay:** copied bearer token works from a different sender until expiry.
+- **Token leakage:** value appears in logs, traces, URLs, browser history, or referrers.
+
+## Trade-offs
+
+JWTs support local, interoperable verification and reduce session-store latency, but add key distribution, claim staleness, revocation, replay, and size complexity. Asymmetric keys reduce minting authority at consumers but require public-key discovery and rotation. Short TTLs narrow exposure but increase refresh traffic. Encryption protects payload confidentiality but adds keys and cost; often the safer choice is fewer non-sensitive claims.
+
+## Alternatives
+
+- **Opaque session/introspection:** current state and revocation are straightforward, at the cost of a lookup dependency.
+- **Macaroons/capability tokens:** support attenuated delegation, but require careful caveat verification and key management.
+- **Mutual TLS-bound access tokens:** reduce replay from stolen values, but certificate lifecycle is heavier.
+- **Signed request/object capability:** good for narrow service operations or downloads, not a general user session.
+
+## When to Use
+
+Use JWT access tokens when many services need local verification, the issuer/audience/key boundaries are clear, claims are small and stable enough, and bounded revocation delay is acceptable. Prefer asymmetric signing when many services verify but only an issuer should mint.
+
+## When Not to Use
+
+Do not choose JWT merely because it is popular or because “stateless” sounds scalable. Use opaque state when permissions change immediately, revocation is frequent, or claims would be large/mutable. Do not encode secrets or trust unsigned claims.
+
+## Common Misconceptions
+
+- **“JWT is encrypted.”** A signed JWT is usually readable; integrity is not confidentiality.
+- **“JWT means stateless.”** Keys, issuers, refresh/revocation, policy, and caches are stateful control planes.
+- **“A valid signature means allow.”** Audience, expiry, scope, tenant, object ownership, and current policy still apply.
+- **“Rotation revokes all tokens instantly.”** Services may cache keys and tokens may remain valid under policy.
+- **“JWT solves replay.”** A bearer copy remains usable unless expiry, denylist, or sender binding limits it.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> JWT gives a service a compact, signed claim set it can verify locally, but it is not encryption, authorization, or revocation by itself. I pin trusted issuer/algorithms, validate signature, issuer, audience, time, and scope, keep claims minimal, and use short TTLs or introspection for mutable/high-risk policy. I choose asymmetric key boundaries, plan rotation and compromise, and protect against bearer replay and leakage.
+
+### When to Introduce It
+
+Introduce JWT after identifying the number of verifiers, revocation latency, claim freshness, and key trust boundaries. Ask whether local verification is worth the operational burden.
+
+### Common Follow-Ups
+
+- What stops a token for service A being used at service B?
+- How do you revoke a JWT before expiry?
+- What is the blast radius of a shared HMAC key?
+- Which claims must the service validate?
+
+### Common Candidate Mistakes
+
+- Calling base64url encoding encryption.
+- Letting the `alg` header select verification behavior.
+- Treating a valid token as permission for every object.
+- Logging the raw token or putting sensitive data in claims.
+
+## Summary
+
+JWTs are signed claims with local-verification benefits and real revocation/replay costs. Validate against configured issuer and policy, keep claims narrow, choose key boundaries deliberately, and use sessions/introspection when current authorization matters more than stateless propagation.
+
+## Quiz Seeds
+
+1. What does a JWS signature guarantee, and what does it not guarantee?
+2. Why must a service verify `aud` and `iss` rather than only the signature?
+3. What is the compromise blast radius of one shared HMAC key?
+4. How can a role removal remain ineffective until token expiry?
+5. Why is a copied bearer JWT replayable?
+6. What operational steps follow a signing-key compromise?
+7. When is an opaque session preferable to a JWT?
+
+## Related Topics
+
+- [Sessions and Tokens](./sessions-and-tokens.mdx)
+- [OAuth and OIDC](./oauth-and-oidc.mdx)
+- [TLS and Encryption](./tls-and-encryption.mdx)
+- [Secrets Management](./secrets-management.mdx)
+
+## References
+
+### Documentation / Articles
+
+- [JSON Web Token (RFC 7519)](https://www.rfc-editor.org/rfc/rfc7519.html) — defines JWT claims, serialization, validation context, and security considerations.
+- [JSON Web Signature (RFC 7515)](https://www.rfc-editor.org/rfc/rfc7515.html) — specifies signing and integrity protection used by signed JWTs.
+- [REST Security Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/REST_Security_Cheat_Sheet.html) — highlights algorithm allowlists, issuer/audience/expiry checks, and logout/revocation limits.
+- [OAuth 2.0 Security Best Current Practice (RFC 9700)](https://www.rfc-editor.org/rfc/rfc9700.html) — covers audience restriction, token replay, sender constraints, and refresh rotation.

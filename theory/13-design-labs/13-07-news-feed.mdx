@@ -1,0 +1,207 @@
+---
+type: lesson
+id: 13-07-news-feed
+slug: news-feed
+title: News Feed
+description: Design a personalized read-heavy feed that balances push and pull fanout, freshness, ranking, cache locality, and celebrity skew.
+module: design-labs
+order: 7
+difficulty: advanced
+estimatedMinutes: 60
+prerequisites:
+  - 00-03-estimation
+  - 00-04-interview-framework
+  - 04-12-denormalization
+  - 05-08-hot-keys
+  - 06-03-pub-sub-and-topics
+  - 06-04-partitions-and-consumer-groups
+tags:
+  - news-feed
+  - fanout
+  - ranking
+  - read-heavy
+  - celebrity-skew
+objectives:
+  - Choose push, pull, or hybrid fanout from read/write skew and follower distribution.
+  - Separate source posts, feed materializations, ranking, and cache freshness.
+  - Estimate fanout writes, feed reads, cache working set, and rebuild cost.
+  - Explain how deletes, privacy changes, celebrity posts, and lag affect correctness.
+relatedLessons:
+  - 04-12-denormalization
+  - 05-09-multi-layer-caching
+  - 06-03-pub-sub-and-topics
+  - 06-10-batching-and-stream-vs-batch
+  - 08-07-load-shedding-and-graceful-degradation
+visualizationId: null
+quizId: null
+---
+
+# News Feed
+
+> A feed is a fanout and freshness problem: precompute enough to make reads fast, but do not multiply one popular author's post into an unbounded write storm.
+
+## Problem Statement
+
+Design a home feed for users who follow authors/pages. Users post text and media references, open a ranked page, paginate/refresh, and expect deleted/private posts to disappear within a documented bound. Ranking may depend on recency, affinity, and quality signals. The lab focuses on backend shape rather than a perfect recommendation model.
+
+## Functional Requirements (Scoped)
+
+- Create, delete, and privacy-change a post with an immutable `postId`.
+- Follow/unfollow authors and read a cursor-paginated personalized feed.
+- Support chronological baseline plus a pluggable ranker; expose a freshness/version field.
+- Fan out new posts to eligible followers or merge sources at read time.
+- Remove unauthorized/deleted posts and rebuild a user's feed after a relationship change.
+
+Out of scope: training a ranking model, full social graph design, media transcoding, and cross-product recommendations.
+
+## Non-Functional Requirements and Priorities
+
+| Priority | Requirement | Working target / question |
+| --- | --- | --- |
+| P0 | Feed read latency | p99 under 200 ms for a warm first page. |
+| P0 | Privacy/delete safety | Do not newly surface a revoked post beyond a bounded cache/materialization window. |
+| P0 | Availability | A stale/chronological feed may degrade while ranking or fanout is lagging. |
+| P1 | Freshness | Typical posts appear within seconds; celebrity/hot-source lag is visible. |
+| P1 | Fairness | One author cannot consume all feed-worker or cache capacity. |
+| P2 | Ranking quality | Ranker changes can roll out without rewriting source-of-truth posts. |
+
+## Estimation Prompts and Checked Example
+
+Ask for DAU, feed opens/user/day, posts/day, follower distribution, average feed page size, fanout strategy, ranking cost, and retention. Example:
+
+- 50M DAU × 8 feed opens/day = 400M reads/day → `≈4,630 RPS`; 5× peak is `≈23k RPS`.
+- 5M posts/day; average follower count 200 → 1B potential fanout entries/day (`≈11.6k writes/s` average, 58k/s peak). This is why celebrity exceptions matter.
+- If a materialized entry is 200 bytes and 30-day retention, logical fanout storage is `1B × 200 B × 30 = 6 TB` before indexes/replicas; pull/hybrid reduces this for high-degree authors.
+- A feed page of 30 entries at 1 KB each and 70% cache hit yields backend feed reads of `23k × 0.3 ≈6.9k RPS` at peak, but ranker/post-visibility work may dominate.
+
+## API Design
+
+```http
+GET /v1/feed?cursor=opaque&limit=30
+POST /v1/posts
+Idempotency-Key: post-device-42
+{"body":"...","visibility":"followers"}
+```
+
+`POST /posts` returns `201` after durable source-post commit; an outbox emits `PostCreated` once. A repeated idempotency key returns the same `postId`; changed content returns `409`. `GET /feed` returns entries, `nextCursor`, `feedVersion`, and freshness metadata. `410 CursorExpired` tells the client to restart from a snapshot. `DELETE /posts/{id}` is idempotent and publishes a tombstone; return `403` for non-owner and `404` where enumeration should be hidden.
+
+Feed reads may retry a transient ranking/cache failure but should not retry indefinitely. Return a stale page with a `staleAt` indicator or a chronological fallback; do not return a private/deleted entry merely to preserve freshness.
+
+## Data Model, Access Paths, and Ownership
+
+```text
+posts(post_id PK, author_id, body_ref, visibility, created_at, state, version)
+follows(follower_id, author_id, state, version, PRIMARY KEY(follower_id, author_id))
+feed_entries(follower_id, sort_key, post_id, source_version, expires_at,
+             PRIMARY KEY(follower_id, sort_key, post_id))
+rank_features(post_id, feature_version, features_ref, updated_at)
+feed_tombstones(post_id, audience_version, deleted_at)
+```
+
+The Post service owns source content and visibility. The graph service owns follows; a feed materializer owns derived entries, never authoritative privacy. Reads join/materialize only eligible IDs, then batch-fetch post/rank data. Cache keys include user, cursor/rank version, and policy version; entries are invalidated or filtered after tombstones.
+
+## Progressive Architecture: Naive → Bottleneck → Improvement → New Trade-off
+
+1. **Naive:** on every read, query followed authors, fetch recent posts, and sort. Writes are cheap, but read latency grows with follow count and ranker work; a celebrity graph makes fan-in expensive.
+2. **Bottleneck/failure:** push every new post to every follower's feed. Typical reads become fast, but one celebrity creates millions of writes and queue lag; unfollow/delete/privacy changes require large repair work.
+3. **Improvement:** use hybrid fanout: push ordinary authors to materialized feeds, pull high-degree/volatile sources at read time, batch rank candidates, and cache first pages. Version follow/privacy/ranker state and process tombstones asynchronously with read-time authorization.
+4. **New trade-off:** hybrid reads have variable latency and can show a slightly older/less-ranked page; materializations are eventually consistent and consume storage. A stale but authorized feed is preferable to a fresh privacy leak.
+
+Reference architecture:
+
+```text
+Post API → Post store + outbox → fanout classifier
+                              ├→ ordinary-author feed partitions → feed cache
+                              └→ high-degree source index
+Feed API → cache → materialized entries + pull candidates → ranker → post/visibility batch
+```
+
+The classifier is a policy decision based on degree, write rate, and freshness; it should be measurable and reversible.
+
+## Bottlenecks and Concurrency / Consistency
+
+Fanout queues, celebrity partitions, feed-entry writes, ranking CPU, first-page cache stampedes, and graph-change rebuilds are limits. Post visibility is authoritative; feed entries carry source/policy versions and are filtered against a tombstone/ACL check. A follow/unfollow race uses a graph version; a new post after unfollow must not be newly pushed, but an already materialized entry can be filtered. Use cursor snapshots so pagination does not duplicate/skip entries as new posts arrive.
+
+## Failure Analysis
+
+- **Fanout lag:** show freshness lag and pull important sources; do not block post creation.
+- **Ranker outage:** chronological or cached rank fallback with an explicit quality metric.
+- **Celebrity storm:** classify source as pull, throttle low-priority fanout, and isolate partitions.
+- **Delete/privacy event lost:** transactional outbox plus tombstone replay; enforce read-time visibility.
+- **Cache stampede:** request coalescing, TTL jitter, and a stale-if-authorized fallback.
+- **Feed rebuild backlog:** cursor/versioned rebuild, bounded work per user, and a “rebuilding” state.
+
+## Security
+
+Authorize source visibility at read/materialization boundaries; never treat a feed entry as permission. Protect private posts, block/mute relationships, and tenant/admin surfaces. Strip unsafe content, sign media URLs, enforce rate limits and anti-spam, and minimize social graph data in logs. Cache keys must include principal/tenant/policy version to prevent cross-user leakage.
+
+## Observability
+
+Track read latency and cache hit by page, candidate count, ranker latency/version, feed freshness age, fanout queue age/rate, entries per post, celebrity top-N, tombstone propagation lag, unauthorized-filter count, cache stampedes, rebuild progress, and stale fallback rate. Trace `postId` from commit through outbox/materializer and `feedRequestId` through read/rank. Alert on privacy/delete lag and SLO burn separately from rank quality.
+
+## Explicit Trade-offs and Alternatives
+
+- **Push fanout:** low read cost and predictable pages; high write/storage cost and poor celebrity behavior.
+- **Pull fanout:** cheap writes and fresh source reads; read latency grows with follow count and ranking candidates.
+- **Hybrid:** handles skew but adds classifier/version complexity.
+- **Chronological vs ranked:** chronological is explainable/resilient; ranked improves relevance but adds CPU, feature freshness, and fallback complexity.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+“I keep posts and visibility authoritative, then use hybrid fanout: push ordinary authors into per-user read models and pull high-degree/volatile authors at read time. Feed entries are versioned derived state, not permission; tombstones and read-time ACL checks protect deletes/unfollows. Caches and batch ranking keep first-page latency low, while queue lag, celebrity skew, and a ranker fallback are explicit operational concerns.”
+
+### When to Introduce It
+
+Start with pull for a small/flexible system. Introduce push when read fan-in dominates; introduce hybrid when follower-degree skew makes all-push fanout pathological.
+
+### Common Follow-Ups
+
+- How do you handle a celebrity with 50M followers?
+- Can a deleted private post appear from cache?
+- What is the cursor consistency model?
+- How does a ranker outage affect reads?
+
+### Common Candidate Mistakes
+
+Calling feed entries source of truth, pushing all celebrity posts synchronously, ignoring unfollow/delete races, and assuming cache invalidation is a privacy guarantee.
+
+## Summary
+
+Choose fanout from workload shape, not habit. Keep source visibility authoritative, version derived entries, isolate hot authors, and degrade ranking/freshness before correctness. Estimate fanout writes as seriously as user reads.
+
+## Quiz Seeds
+
+1. Calculate peak feed reads and potential fanout writes from the example assumptions.
+2. Why is a celebrity a different workload from an ordinary author?
+3. Which data must remain authoritative when a feed entry is cached?
+4. How does a hybrid strategy reduce write amplification?
+5. What should happen if the ranker is unavailable?
+6. Why do cursor snapshots need a version or boundary?
+7. How can an unfollow race leak a post?
+8. Which metrics show that all-push fanout is failing?
+
+## Related Topics
+
+- [Denormalization](../04-databases/denormalization.mdx) — read models and source ownership.
+- [Hot keys](../05-caching/hot-keys.mdx) — skewed authors/caches.
+- [Pub/sub and topics](../06-messaging/pub-sub-and-topics.mdx) — fanout event distribution.
+- [Batching and stream vs batch](../06-messaging/batching-and-stream-vs-batch.mdx) — materialization and rebuild paths.
+
+## References
+
+### Documentation / Articles
+
+- [Meta: Client-side ranking for News Feed](https://engineering.fb.com/2016/10/20/networking-traffic/client-side-ranking-to-more-efficiently-show-people-stories-in-feed/) — an operator's view of feed ranking, client caching, and poor-network trade-offs.
+- [Apache Kafka consumer design](https://kafka.apache.org/42/design/design/) — grounds partitioned fanout, replay, and consumer lag.
+- [Redis sorted sets](https://redis.io/docs/latest/develop/data-types/sorted-sets/) — illustrates a useful derived-feed ordering primitive, not an authority for privacy.
+- [Google SRE: Handling Overload](https://sre.google/sre-book/handling-overload/) — supports isolating hot/low-priority work and graceful fallback.
+
+### Papers
+
+- [The Tail at Scale](https://research.google/pubs/the-tail-at-scale/) — explains why fanout and ranker branches amplify tail latency.
+
+## Future Visualization / Workspace Spec
+
+Build a feed simulator with ordinary and celebrity authors, follower-degree skew, push/pull/hybrid policy, ranker latency/failure, cache TTL, follow/unfollow/delete races, and queue lag. Show read latency, fanout writes, queue age, feed freshness, stale-but-authorized responses, cache hit ratio, and privacy-filter drops. The workspace should include Post Store, Graph, Fanout Classifier, Push Queue, Pull Index, Ranker, Feed Store, and Cache nodes and let learners compare cost/latency/freshness.

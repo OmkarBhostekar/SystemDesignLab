@@ -1,0 +1,213 @@
+---
+type: lesson
+id: 13-12-distributed-message-queue
+slug: distributed-message-queue
+title: Distributed Message Queue
+description: Design durable partitioned messaging with replication, consumer groups, ordering, offsets, backpressure, and recovery.
+module: design-labs
+order: 12
+difficulty: advanced
+estimatedMinutes: 70
+prerequisites:
+  - 00-03-estimation
+  - 00-04-interview-framework
+  - 04-08-replication
+  - 04-09-partitioning-and-sharding
+  - 06-04-partitions-and-consumer-groups
+  - 06-06-delivery-semantics
+  - 07-03-consensus-and-raft-intuition
+  - 08-10-multi-region-and-region-failover
+tags:
+  - message-queue
+  - partitions
+  - replication
+  - consumer-groups
+  - ordering
+objectives:
+  - Define append, durability, visibility, ordering, offset, and delivery guarantees at named boundaries.
+  - Partition and replicate a log while balancing ordering, throughput, rebalancing, and recovery.
+  - Design producer/consumer retries, idempotent offsets, backpressure, and dead-letter handling.
+  - Estimate disk/network throughput, retention, replica traffic, and consumer lag.
+relatedLessons:
+  - 04-08-replication
+  - 04-09-partitioning-and-sharding
+  - 06-04-partitions-and-consumer-groups
+  - 06-06-delivery-semantics
+  - 07-03-consensus-and-raft-intuition
+  - 08-10-multi-region-and-region-failover
+visualizationId: null
+quizId: null
+---
+
+# Distributed Message Queue
+
+> A queue is a durable ownership and replay contract: partitions define parallelism and order, replicas define loss boundaries, and offsets define what a consumer has safely processed.
+
+## Problem Statement
+
+Design a multi-tenant distributed queue/log supporting producers, topics, partitions, consumer groups, retention/replay, and dead-letter handling. Producers may require acks and ordering by key; consumers may crash after processing but before committing an offset. Brokers fail, partitions rebalance, and a slow consumer must not stall unrelated traffic. Ask whether messages are ephemeral work or an append-only replayable log; this lab assumes both modes may exist under explicit topic policies.
+
+## Functional Requirements (Scoped)
+
+- Create topics with partition count, retention, replication, and max message policy.
+- Append records with optional key, producer ID/sequence, and ack level.
+- Read by partition/offset and join/leave consumer groups with committed offsets.
+- Preserve per-partition order and expose lag; support replay and retention deletion.
+- Handle broker/replica failure, rebalance, poison messages, pause/resume, and DLQ.
+
+Out of scope: arbitrary cross-topic transactions, global ordering across partitions, and exactly-once side effects in external systems.
+
+## Non-Functional Requirements and Priorities
+
+| Priority | Requirement | Working target / question |
+| --- | --- | --- |
+| P0 | Durability | Acknowledged record survives the configured replica failure/RPO. |
+| P0 | Ordering | Records with one key remain ordered within their partition. |
+| P0 | Availability | A healthy partition can append/read despite an isolated follower, subject to ack policy. |
+| P1 | Throughput | Sustain append/read bandwidth with bounded tail latency and disk/fsync policy. |
+| P1 | Recovery | Leader failover/rebalance does not lose committed offsets or duplicate ownership indefinitely. |
+| P2 | Operability | Lag, retention, under-replication, and poison records are actionable per tenant/topic. |
+
+## Estimation Prompts and Checked Example
+
+Ask for topics, records/s, average/max bytes, partitions, replication factor, retention, producer/consumer throughput, and cross-zone bandwidth. Example:
+
+- 1M records/s × 2 KB = `2 GB/s` logical append, or `16 Gb/s` before protocol overhead.
+- Replication factor 3 means approximately `6 GB/s` broker disk writes and `4 GB/s` replica network for a single leader-to-two-follower path; topology/acks can change exact traffic.
+- 24-hour retention is `2 GB/s × 86,400 ≈172.8 TB` logical; RF3 physical is `≈518.4 TB` before indexes, compaction, headroom, and backups.
+- If one consumer handles 50k records/s and peak is 1M/s, `ceil(1M/50k)=20` active consumer slots/partitions are needed; extra consumers beyond partition count are idle.
+
+Sensitivity prompts: Are messages large blobs or references? Is loss acceptable for analytics topics? What is the maximum rebalance pause? How many keys are hot?
+
+## API Design
+
+```http
+POST /v1/topics/orders/records
+{"key":"order-42","value":"...","producerId":"p7","sequence":18}
+```
+
+Return `202` only if durably queued per topic policy; `200/201` with partition/offset after the configured ack. Producer retries with `(producerId, sequence)` or an idempotency key return the original offset; conflicting payload returns `409`. `429` means quota/backpressure, `413` too large, `503` unavailable quorum, and `400` invalid topic/key/schema.
+
+Consumer API `POST /groups/{group}/poll` returns records plus lease/partition epoch; `POST /groups/{group}/commit` is conditional on that epoch. A stale member commit returns `409 StaleGeneration`. Acknowledge only after the documented side effect boundary. Poison records may be paused, retried with attempt metadata, or moved to a DLQ with an explicit original offset. Do not claim end-to-end exactly-once from broker ack to arbitrary API.
+
+## Data Model, Access Paths, and Ownership
+
+```text
+topics(topic_id PK, tenant, partition_count, rf, retention, policy_version)
+partitions(topic_id, partition_id, leader_epoch, high_watermark,
+           log_start, PRIMARY KEY(topic_id, partition_id))
+records(topic_id, partition_id, offset, key, payload_ref, timestamp,
+        producer_id, producer_seq, PRIMARY KEY(topic_id, partition_id, offset))
+replicas(topic_id, partition_id, broker_id, match_offset, state)
+group_offsets(group_id, topic_id, partition_id, committed_offset, epoch)
+```
+
+The broker cluster owns logs/replicas and group coordination; producers own event schema/identity; consumers own external side effects and their idempotency. Partition leadership/epochs prevent stale members and old leaders from committing. Large payloads should be references to object storage with lifecycle policy, not unbounded broker records.
+
+## Progressive Architecture: Naive → Bottleneck → Improvement → New Trade-off
+
+1. **Naive:** one FIFO queue and one consumer. Ordering is simple but throughput, durability, and consumer outage all share one bottleneck.
+2. **Bottleneck/failure:** add workers and a shared database table with status/locks. Concurrent scans, lock contention, polling load, and ambiguous commits make ordering/replay fragile.
+3. **Improvement:** append immutable partition logs, replicate to followers, elect leaders with epochs, assign partitions to consumer groups, and commit offsets separately. Batch sequential disk/network operations and apply retention.
+4. **New trade-off:** partition count caps parallelism and hot keys; replication/acks cost bandwidth and latency; rebalances pause consumers; at-least-once delivery requires idempotent effects. Cross-region synchronous replication may reduce availability.
+
+Reference architecture:
+
+```text
+Producer → broker leader partition → follower replicas
+                                 ↘ committed log/offsets
+Consumer group coordinator → partition assignments → consumers → inbox/effect store
+```
+
+The leader epoch and quorum policy define which records are acknowledged. Consumer offsets are not a proof that an external side effect committed unless stored atomically with that effect or made idempotent.
+
+## Bottlenecks and Concurrency / Consistency
+
+Disk/fsync, network replication, hot partitions, page cache, group rebalances, offset commits, and retention/compaction are limits. Key hashing chooses partition; strict per-key order cannot survive repartition without a migration protocol. A leader writes and followers advance; only a committed/high-watermark record is exposed under the chosen ack/read policy. Consumer ownership uses a generation/lease; stale consumers cannot commit offsets. At-least-once read/commit races are expected and handled by inbox/idempotency.
+
+## Failure Analysis
+
+- **Leader crash:** elect a sufficiently caught-up follower with a new epoch; producers retry by sequence and consumers resume from committed offsets.
+- **Follower lag:** mark under-replicated, adjust ack/placement policy, and alert before losing quorum.
+- **Producer timeout after append:** sequence dedupe/status lookup avoids duplicate records.
+- **Consumer crash after effect:** offset not committed, so replay; idempotent inbox prevents duplicate outcome.
+- **Rebalance storm:** leases/epochs, cooperative movement, and bounded assignment rate.
+- **Disk full/retention stall:** throttle producers, shed low-priority topics, or extend storage; never silently delete unexpired contractual data.
+- **Poison record:** bounded retries/DLQ with replay metadata, not an infinite partition block.
+- **Region loss:** choose local durability plus async replication or cross-region quorum; communicate potential loss/latency.
+
+## Security
+
+Authenticate producers/consumers, authorize topic/group/partition access, and isolate tenant quotas/retention. Encrypt broker links and disks, rotate credentials, validate schemas/size, and prevent payloads from becoming executable logs. Audit topic/policy/ACL changes, redact PII from record headers/metrics, and rate-limit admin/replay APIs.
+
+## Observability
+
+Measure append/read latency, bytes/records, producer retries/dedupe, ack level, under-replicated partitions, leader epochs/elections, disk/fsync, partition skew, consumer lag/age, rebalance duration, offset commit failures, DLQ count/age, retention/compaction, and cross-region replication lag. Trace producer record IDs to consumer effect IDs where safe; sample payload-free spans. Alert on under-replication and lag before user-visible backlog.
+
+## Explicit Trade-offs and Alternatives
+
+- **Work queue vs append log:** work queue deletes/acks quickly; append log supports replay/independent consumers at storage cost.
+- **More partitions:** parallelism and hot-key isolation improve; metadata/rebalance and ordering complexity increase.
+- **RF/ack quorum:** stronger durability costs latency/bandwidth and may reject writes during failures.
+- **Pull vs push consumers:** pull enables backpressure/replay; push can lower latency but complicates flow control.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+“I model a topic as partitioned append logs with a leader, replicated followers, and explicit ack/high-watermark policy. Keys choose partitions, so order is per partition—not global. Consumer groups own partitions by generation, and offsets commit after a duplicate-safe effect; a crash can redeliver. I expose lag, under-replication, epochs, and DLQs, and choose cross-region durability based on latency/RPO.”
+
+### When to Introduce It
+
+Introduce partitions when throughput/order scope requires parallelism; introduce replication and offsets when loss/replay/failure matters. Keep a simple queue for one-off jobs that do not need retained history.
+
+### Common Follow-Ups
+
+- What does an acknowledged record guarantee?
+- How does a consumer avoid duplicate side effects?
+- Why cannot all messages be globally ordered at high throughput?
+- What happens when a partition leader dies?
+
+### Common Candidate Mistakes
+
+Claiming a queue gives exactly-once external effects, ignoring partition hot keys, committing offsets before work, and treating follower lag as invisible.
+
+## Summary
+
+Partitions determine order and parallelism; replicas determine loss tolerance; offsets determine replay. State each boundary, protect producer/consumer retries with IDs and epochs, and make lag/under-replication visible before a queue becomes an outage amplifier.
+
+## Quiz Seeds
+
+1. Calculate logical and RF3 physical bytes for 1M 2 KB records/s and 24-hour retention.
+2. Why do extra consumers beyond partition count not add throughput?
+3. What does a leader epoch prevent?
+4. Which crash creates a duplicate consumer effect?
+5. How does a producer sequence dedupe an ambiguous append?
+6. What is the trade-off between RF3 quorum acks and availability?
+7. Why are hot keys a partitioning problem?
+8. When is a DLQ preferable to blocking a partition?
+
+## Related Topics
+
+- [Replication](../04-databases/replication.mdx) — replica/ack reasoning.
+- [Partitioning and sharding](../04-databases/partitioning-and-sharding.mdx) — ownership and skew.
+- [Partitions and consumer groups](../06-messaging/partitions-and-consumer-groups.mdx) — assignment/lag semantics.
+- [Delivery semantics](../06-messaging/delivery-semantics.mdx) — boundary-specific guarantees.
+- [Consensus and Raft intuition](../07-distributed-coordination/consensus-and-raft-intuition.mdx) — leader/epoch coordination.
+
+## References
+
+### Documentation / Articles
+
+- [Apache Kafka design](https://kafka.apache.org/42/design/design/) — primary documentation for partitions, replication, delivery, and ordering trade-offs.
+- [Apache Kafka consumer groups](https://kafka.apache.org/documentation/#intro_consumers) — explains partition assignment and offset-based consumption.
+- [RabbitMQ reliability](https://www.rabbitmq.com/docs/reliability) — contrasts acknowledgments, redelivery, and durable queue behavior.
+- [Google SRE: Handling Overload](https://sre.google/sre-book/handling-overload/) — supports backpressure and overload isolation around queues.
+
+### Papers
+
+- [In Search of an Understandable Consensus Algorithm (Raft)](https://raft.github.io/raft.pdf) — grounds leader election, log replication, epochs, and quorum safety.
+
+## Future Visualization / Workspace Spec
+
+Create a partitioned-log simulator with producers, keyed records, leader/follower replicas, high-watermarks, consumer groups, leases/epochs, offsets, lag, retention, and DLQ. Controls should vary partition count, key skew, RF/ack policy, broker crashes, follower lag, producer/consumer retries, rebalance timing, and region loss. Show committed versus uncommitted records, duplicate effects, lag age, under-replication, disk/network use, and recovery. The workspace should support Producer, Broker, Replica, Coordinator, Consumer, Effect Store, and DLQ nodes with explicit guarantees.

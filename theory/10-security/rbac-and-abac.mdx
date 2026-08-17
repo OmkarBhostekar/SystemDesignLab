@@ -1,0 +1,174 @@
+---
+type: lesson
+id: 10-05-rbac-and-abac
+slug: rbac-and-abac
+title: RBAC and ABAC
+description: Choose role- or attribute-based authorization by policy shape, ownership, context freshness, and operational complexity.
+module: security
+order: 5
+difficulty: advanced
+estimatedMinutes: 32
+prerequisites:
+  - 10-01-authentication-and-authorization
+  - 10-02-sessions-and-tokens
+  - 04-01-data-modeling-from-access-patterns
+tags:
+  - rbac
+  - abac
+  - policy
+  - authorization
+  - ownership
+  - least-privilege
+objectives:
+  - Compare RBAC roles and ABAC attributes for coarse and contextual decisions.
+  - Enforce object ownership, tenant scope, workflow state, and deny-by-default policy.
+  - Design policy evaluation, caching, versioning, and revocation behavior.
+  - Recognize role explosion, stale attributes, policy conflicts, and auditability trade-offs.
+relatedLessons:
+  - 10-01-authentication-and-authorization
+  - 10-09-multi-tenancy-and-isolation
+  - 10-08-api-abuse-prevention
+  - 04-14-concurrency-control
+---
+
+# RBAC and ABAC
+
+> RBAC answers with assigned roles; ABAC evaluates attributes and context—both need an authoritative resource check, deny-by-default semantics, and a plan for policy change.
+
+## Why This Exists
+
+The naive policy says “admins can do everything; users can read.” It works for a small prototype and fails when a support agent may read but not export, a manager may approve only within a cost limit, or a user belongs to multiple tenants. Adding one role for every exception creates role explosion. Moving all logic into application conditionals creates inconsistent and unauditable access.
+
+Role-based access control (RBAC) groups permissions into roles assigned to principals. Attribute-based access control (ABAC) evaluates subject, resource, action, and environment attributes, such as tenant, department, ownership, classification, workflow state, device assurance, and time. Real systems often combine them: a role grants a candidate action, then attributes constrain the specific resource and context.
+
+## Mental Model
+
+```text
+subject + action + resource + context
+       ├─ RBAC: role → permission candidate
+       └─ ABAC: policy predicates → allow/deny/obligations
+                         └─ default deny + audit
+```
+
+RBAC is easy to explain and cache when roles are stable. ABAC expresses least privilege and avoids a role for every combination, but depends on attribute quality, policy evaluation, and freshness. A policy should specify precedence for conflicting rules, whether explicit deny wins, and which missing attributes cause denial.
+
+Authorization must remain tied to the resource owner. A policy engine can say Alice may `read invoice`, but the Invoice service still verifies invoice ownership, tenant, version/state, and any side-effect conditions. Policy decisions are not business transactions; if the resource changes between check and update, use a transaction/conditional write to preserve the invariant.
+
+## How It Works
+
+1. Inventory actions and resources from access patterns, not only UI pages. Separate read, mutate, export, administer, and approve operations.
+2. Define a role baseline for stable coarse grants. Model attributes for subject, tenant, resource owner/classification, request assurance, and workflow state.
+3. Evaluate policy at the enforcement point with a signed/authenticated request context. Treat missing/untrusted attributes as deny for sensitive actions.
+4. Enforce object-level scope and workflow transition in the resource transaction. Do not rely on a previously evaluated role or on the client hiding controls.
+5. Version and test policies. Log policy ID/version, principal class, action, resource class, tenant, result, and reason without exposing sensitive data.
+6. Set cache TTL and invalidation behavior. Role/attribute revocation needs a bound on how long a stale decision may continue; high-risk changes can bypass caches or require reauthentication.
+
+A policy decision service can return obligations such as “mask fields” or “require step-up authentication,” but each resource service must apply them consistently. Separate administrative policy editing from runtime enforcement, with review and rollback for policy changes.
+
+## Example
+
+An expense platform has roles `employee`, `manager`, and `auditor`. RBAC grants `employee:read-own`, `manager:approve-team`, and `auditor:read-audit`. ABAC then checks `expense.tenant == subject.tenant`, `expense.owner == subject` for own reads, `expense.team_id in subject.managed_teams` for approval, and `expense.amount <= subject.approval_limit`. A manager with a role cannot approve an expense in another tenant or over the limit.
+
+When a manager changes teams, the attribute source updates. Existing access tokens may still contain the old role; the service resolves sensitive attributes at authorization time or uses a short policy cache/version. The approval update uses a transaction that checks `PENDING` state, so a valid policy decision cannot approve an already-paid expense.
+
+## Visualization We Eventually Want
+
+Create a policy table with subjects, roles, attributes, resources, actions, and context. Let the learner switch RBAC, ABAC, and hybrid modes; add a tenant mismatch, stale team attribute, conflicting deny, workflow transition, and policy-cache outage. Display the evaluated predicates, decision version, cache age, masked fields, audit record, and object update result.
+
+## Scaling Behavior
+
+RBAC checks are cheap but role assignments and hierarchy can grow. ABAC evaluation cost grows with predicate count and attribute fetches; remote policy/attribute calls can sit on every request’s critical path. Cache stable policy and attributes with bounded TTL, precompute common grants, or attach policy versions to tokens while requiring current checks for sensitive actions.
+
+Large organizations need policy distribution, version compatibility, and observability for deny rates and evaluation latency. A globally consistent revocation stream is expensive; choose a measurable maximum stale window. Tenant-specific policies increase isolation and flexibility but make testing and rollout harder. Keep policy dimensions bounded to prevent a decision cache from becoming a high-cardinality data store.
+
+## Failure Modes
+
+- **Role explosion:** every exception becomes a new role with unclear ownership.
+- **Attribute staleness:** a removed team/tenant/clearance remains usable from cache or token.
+- **Missing-attribute fail-open:** unavailable context accidentally grants access.
+- **Object-level gap:** role permits a function but service does not check resource ownership.
+- **Policy conflict:** overlapping allow/deny rules have unspecified precedence.
+- **Check/use race:** resource changes after policy evaluation and before side effect.
+- **Unversioned policy rollout:** different services enforce contradictory rules.
+- **Opaque decisions:** no audit evidence explains why an action was allowed.
+
+## Trade-offs
+
+RBAC is understandable, fast, and easy to administer for stable organizational boundaries, but it can overgrant and explode in role count. ABAC is expressive and closer to least privilege, but attribute quality, evaluation latency, testing, and explainability cost more. Central policy improves consistency but adds a dependency; local policy improves availability but requires distribution and revocation discipline. Deny-by-default protects against omission but can cause availability/friction when context is unavailable.
+
+## Alternatives
+
+- **ACLs:** direct subject-to-resource grants fit small resource sets; hard to manage at large scale.
+- **Relationship-based authorization:** useful for graphs such as “member of team that owns document”; requires relationship storage and consistency.
+- **Capability tokens:** efficient delegation for narrow operations; leakage and revocation need careful bounds.
+- **Policy as code:** reviewable/versioned rules; still needs a runtime enforcement point and current attributes.
+
+## When to Use
+
+Use RBAC for stable coarse capabilities, ABAC for resource/context constraints, and a hybrid when organizational roles and ownership/policy conditions both matter. Choose based on the number of tenants/resources, change frequency, revocation latency, and audit requirements.
+
+## When Not to Use
+
+Do not build a flexible policy engine for a few fixed permissions, and do not encode every ownership rule in roles. Avoid evaluating remote attributes synchronously for low-risk reads when a bounded local rule is enough.
+
+## Common Misconceptions
+
+- **“RBAC and ABAC are mutually exclusive.”** Hybrid decisions are common and often clearer.
+- **“A role grants access to all objects.”** Resource ownership, tenant scope, and workflow state still apply.
+- **“ABAC is automatically least privilege.”** Bad or stale attributes can overgrant just as badly.
+- **“A policy allow completes the authorization.”** The state-changing transaction must preserve the invariant.
+- **“Caching authorization is harmless.”** Revocation delay is a security trade-off that must be bounded.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I use RBAC for stable coarse permissions and ABAC for tenant, ownership, classification, workflow, and context constraints. The resource-owning service evaluates a deny-by-default policy, checks the current object in the same transaction as a mutation, and records policy version/reason. Caches improve latency but need a documented revocation window; policy rollout and attribute failures must fail safely for high-risk actions.
+
+### When to Introduce It
+
+Introduce RBAC/ABAC after listing actors and operations, when a design has multiple tenants, resource ownership, approval limits, or dynamic context.
+
+### Common Follow-Ups
+
+- How do you prevent role explosion?
+- What if the attribute service is unavailable?
+- Where does object-level authorization run?
+- How do you test and roll back a policy change?
+
+### Common Candidate Mistakes
+
+- Storing every exception as a role.
+- Omitting deny precedence and missing-attribute behavior.
+- Authorizing a path before checking current object ownership.
+- Ignoring policy-cache staleness and auditability.
+
+## Summary
+
+RBAC provides understandable coarse grants; ABAC expresses contextual constraints. Combine them at the resource owner, deny by default, define precedence and freshness, and make policy decisions observable and transactionally safe for mutations.
+
+## Quiz Seeds
+
+1. Give one rule well-suited to RBAC and one to ABAC.
+2. Why does object ownership remain a service responsibility after a role check?
+3. What creates RBAC role explosion?
+4. What should happen when a required ABAC attribute is unavailable?
+5. Why must policy version be observable?
+6. How can a check/use race bypass an otherwise correct policy?
+7. When is a policy cache unsafe without invalidation or step-up checks?
+
+## Related Topics
+
+- [Authentication and Authorization](./authentication-and-authorization.mdx)
+- [Multi-Tenancy and Isolation](./multi-tenancy-and-isolation.mdx)
+- [API Abuse Prevention](./api-abuse-prevention.mdx)
+- [Concurrency Control](../04-databases/concurrency-control.mdx)
+
+## References
+
+### Documentation / Articles
+
+- [Authorization Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html) — covers least privilege, deny-by-default, server-side checks, and access-control testing.
+- [Access Control Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Access_Control_Cheat_Sheet.html) — compares authorization patterns and implementation concerns.
+- [NIST Guide to Attribute Based Access Control (SP 800-162)](https://csrc.nist.gov/pubs/sp/800/162/final) — defines ABAC components, policy evaluation, and attribute considerations.
+- [NIST Role Based Access Control](https://csrc.nist.gov/projects/role-based-access-control) — provides the standard RBAC model and terminology.

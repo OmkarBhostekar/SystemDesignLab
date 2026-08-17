@@ -1,0 +1,181 @@
+---
+type: lesson
+id: 12-01-read-heavy
+slug: read-heavy
+title: Read-Heavy Systems
+description: Evolve a read-dominant workload with replicas, caches, materialized views, and explicit freshness boundaries.
+module: architecture-archetypes
+order: 1
+difficulty: core
+estimatedMinutes: 40
+prerequisites:
+  - 00-04-interview-framework
+  - 01-03-latency-vs-throughput
+  - 04-08-replication
+  - 05-03-cache-aside
+  - 05-09-multi-layer-caching
+  - 11-04-search-autocomplete
+tags:
+  - read-heavy
+  - read-replicas
+  - caching
+  - freshness
+  - materialized-views
+objectives:
+  - Recognize a read-heavy workload from read/write ratio, access locality, and latency targets.
+  - Evolve from a single writer to replicas, caches, CDN, and read models without hiding write or freshness limits.
+  - Choose which reads can tolerate staleness and which require read-after-write or source validation.
+  - Explain cache invalidation, hot keys, replica lag, and failure behavior in an interview.
+relatedLessons:
+  - 04-08-replication
+  - 05-07-cache-stampede
+  - 05-08-hot-keys
+  - 11-05-full-text-search
+  - 12-06-search-and-discovery
+---
+
+# Read-Heavy Systems
+
+> “Read-heavy” is a workload shape, not an architecture: scale the repeated read path while preserving an explicit source of truth and freshness contract.
+
+## Why This Exists
+
+A product catalog, public profile, documentation site, or news page may receive 100 reads for every write. A single service and database can be correct, but repeated reads consume CPU, connections, I/O, and network. The naive response is “add a cache,” without asking whether values are mutable, personalized, authorization-sensitive, or hot enough to stampede.
+
+The improvement evolves one bottleneck at a time: indexes and query shaping, read replicas, caches/CDN, and eventually materialized read models or partitioning. Every step adds a new copy and a freshness/failure path. The workload can change: a catalog sale makes writes and invalidations hot; a social feed adds fanout; search adds a separate index.
+
+## Mental Model
+
+```text
+write authority ──> replicas/read models ──> cache/CDN ──> reader
+       │                  │                    │
+       └─ freshness/version/invalidations ────┘
+```
+
+Ask four questions before adding a layer:
+
+| Question | Why it changes the design |
+| --- | --- |
+| Is the result public or personalized? | Public responses share caches; user/tenant results require scoped keys and authorization. |
+| How stale may it be? | Determines replica routing, TTL, invalidation, or source read. |
+| Is demand uniform or hot-key skewed? | Determines cache protection, replication, and per-key admission. |
+| Do writes need read-after-write? | Determines session routing/version tokens or a source read after mutation. |
+
+## How It Works
+
+Start with a measured query/index path. A read replica increases aggregate read capacity but introduces lag and does not help writes. A cache-aside path checks cache, reads the source on miss, and stores a bounded representation; it needs invalidation/TTL and stampede protection. A CDN can terminate public, immutable, or versioned content close to users. A materialized view or search index precomputes expensive joins and ranking asynchronously.
+
+When a user writes then immediately reads, route to the writer, attach a version token, or wait until a chosen replica catches up. Do not globally send all reads to the writer simply because a minority needs read-after-write; classify requests. Critical values such as inventory, permissions, and price should revalidate against authority at the decision boundary.
+
+## Example
+
+A documentation service has 1,000 QPS, 99% reads, and a 200 ms p99 target. The first design uses a primary database with a title index. At 10,000 QPS, CPU and connection pools saturate. Adding two read replicas improves capacity, but a just-published page is invisible on a lagging reader for several seconds.
+
+The next improvement caches immutable page versions behind a CDN and uses a short application cache for metadata. Publishing writes a new content version and changes the pointer; old pages remain valid. A personalized permissions check runs separately and never gets cached under a public key. If a hot page expires, single-flight and stale-while-revalidate protect the source. If the replica cluster fails, public cached pages remain available while uncached admin reads degrade.
+
+Now suppose the product adds real-time comments. The original “read-heavy” shape has a write/fanout subproblem; comments need a write path, event stream, and possibly a separate recent-comments read model. The correct architecture evolves by access pattern, not by forcing every feature through the CDN.
+
+## Visualization We Eventually Want
+
+Build a **Read-Path Evolution Simulator**. Controls should include read/write ratio, key popularity skew, cache capacity/TTL, replica count/lag, CDN hit ratio, source latency/capacity, write burst, invalidation delay, and read-after-write percentage. Show source QPS, cache hits/misses, replica lag, stale age, p99 latency, stampede concurrency, and availability during source/replica failure. Presets should evolve a catalog from one primary to replicas, cache, CDN, and a materialized view, then change freshness or personalization constraints to make learners remove an unsafe layer.
+
+## Scaling Behavior
+
+Replicas multiply read capacity until replication, network, or storage apply work becomes the bottleneck. Caches reduce source work in proportion to hit rate and object cost; low hit rates or high cardinality may add overhead. CDN effectiveness depends on public/cacheable responses and geographic locality. Materialized views trade write/ingestion cost and staleness for fast reads.
+
+Estimate both average and hot-key load. A 99% read ratio still allows 1% of a billion writes/day to be substantial. A single key can saturate a cache shard and source even with a high global hit rate. Memory, invalidation traffic, and cache stampede recovery become capacity dimensions.
+
+## Failure Modes
+
+- **Replica lag:** stale reads violate an unspoken freshness assumption.
+- **Cache stampede:** synchronized expiry overloads the source.
+- **Hot key:** one object dominates a cache shard or CDN origin.
+- **Invalidation loss:** updates remain stale longer than policy allows.
+- **Cache poisoning/privacy leak:** an unauthorized or wrong-tenant response is reused.
+- **Read-after-write violation:** a user sees their own mutation disappear on a lagging reader.
+- **Layered outage:** CDN/cache miss flood hits a failed source.
+- **Materialized-view gap:** a new write is absent from the read model.
+
+Use versioned keys, scoped authorization, TTL/jitter/SWR where acceptable, single-flight, source fallback budgets, lag-aware routing, and explicit stale/partial UI states.
+
+## Trade-offs
+
+More read layers lower latency and source load but add copies, invalidation, lag, cost, and operational debugging. Replicas favor read scale while retaining a writer bottleneck. Caches favor speed over freshness. CDN favors public immutable content. Materialized views favor predictable read shape over immediate consistency. The best design may route different queries through different layers.
+
+## Alternatives
+
+- **Query/index optimization:** choose before adding a distributed copy if the bottleneck is an inefficient query.
+- **Read replicas:** choose for source-level read scale with tolerable lag.
+- **Application/distributed cache:** choose for reusable hot results and lower latency.
+- **CDN:** choose for public, cacheable, geographically distributed payloads.
+- **Materialized/read model:** choose for expensive joins/search/ranking that can be asynchronous.
+- **Scale-up/shard:** choose when one writer or key range, not reads, is the limit.
+
+## When to Use
+
+Use this archetype when reads dominate and many requests repeat a result or access pattern. Lead with freshness, personalization, source authority, and hot-key estimates.
+
+## When Not to Use
+
+Do not replicate/cache blindly for write-heavy or highly personalized data. Do not serve stale authorization, inventory, payment, or privacy decisions merely to improve p99.
+
+## Common Misconceptions
+
+- **“Read replicas solve read-heavy systems.”** They add lag and eventually hit shared replication/write limits.
+- **“A cache is always the first scale step.”** Index/query fixes may be simpler; a cache can hide correctness bugs.
+- **“99% reads means writes are negligible.”** Write volume and invalidation cost still matter.
+- **“CDN cache equals database cache.”** They have different visibility, invalidation, and authorization boundaries.
+- **“Eventual consistency is one number.”** Measure lag and state which reads tolerate it.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I classify reads by freshness, personalization, key skew, and source cost. I first fix access paths, then add read replicas for scalable stale-tolerant reads, caches/CDN for reusable public data, and materialized views for expensive shapes. I route read-after-write and correctness-critical decisions to an authoritative version, protect hot keys/stampedes, and define replica lag, invalidation loss, and source-outage behavior. The architecture evolves as the workload changes.
+
+### When to Introduce It
+
+Introduce the archetype after estimating read/write ratio, hot keys, payload size, freshness, and geographic distribution—not after saying “social app.”
+
+### Common Follow-Ups
+
+- Which data may be stale and for how long?
+- How does read-after-write work?
+- What if a replica is lagging or all caches expire together?
+- Why CDN versus application cache?
+- What new architecture appears when writes/fanout grow?
+
+### Common Candidate Mistakes
+
+They add every read layer, omit invalidation/lag, cache personalized data globally, or ignore that replicas do not scale a single writer.
+
+## Summary
+
+Read-heavy designs are selected by access pattern and freshness, not by a fixed stack. Scale queries with replicas, cache, CDN, and read models only where their copy/lag/privacy trade-offs fit; preserve an authoritative path and protect it from hot misses.
+
+## Quiz Seeds
+
+1. Which reads can safely use a lagging replica in a catalog?
+2. How does a 99:1 read/write ratio affect replica and cache planning?
+3. Why can a high global cache hit rate hide one hot-key overload?
+4. How can a user get read-after-write without routing all reads to the writer?
+5. When is a materialized view better than a cache?
+6. What happens when a CDN and application cache expire together?
+7. Why should checkout re-read source inventory?
+8. What workload change would make a read-heavy architecture need fanout?
+
+## Related Topics
+
+- [Replication](../04-databases/replication.mdx) covers lag and read scale.
+- [Cache stampede](../05-caching/cache-stampede.mdx) protects the source.
+- [Hot keys](../05-caching/hot-keys.mdx) explains skew.
+- [Full-text search](../11-building-blocks/full-text-search.mdx) is a specialized read model.
+
+## References
+
+### Documentation / Articles
+
+- [Amazon RDS read replicas](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/USER_ReadRepl.html) — documents the read-scale use case and replica limitations/lag considerations.
+- [AWS caching data access patterns](https://docs.aws.amazon.com/wellarchitected/latest/performance-efficiency-pillar/perf_data_access_patterns_caching.html) — frames caching benefits, read-heavy candidates, and freshness trade-offs.
+- [HTTP caching (RFC 9111)](https://www.rfc-editor.org/rfc/rfc9111.html) — grounds freshness, validation, and shared-cache semantics for public responses.
+- [Google SRE handling overload](https://sre.google/sre-book/handling-overload/) — connects overload, degraded responses, caching, latency, and graceful behavior in a serving path.

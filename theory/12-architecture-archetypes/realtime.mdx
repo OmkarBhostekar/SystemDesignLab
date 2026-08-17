@@ -1,0 +1,182 @@
+---
+type: lesson
+id: 12-04-realtime
+slug: realtime
+title: Real-Time Systems
+description: Design live interactions around persistent connections, gateways, presence, pub/sub, ordering, and reconnect recovery.
+module: architecture-archetypes
+order: 4
+difficulty: core
+estimatedMinutes: 40
+prerequisites:
+  - 02-06-realtime-transports
+  - 03-02-load-balancing-algorithms
+  - 06-03-pub-sub-and-topics
+  - 06-05-ordering
+  - 11-09-realtime-presence
+  - 11-08-notification-system
+tags:
+  - realtime
+  - persistent-connections
+  - websockets
+  - presence
+  - reconnect
+objectives:
+  - Distinguish connection scale, event throughput, state durability, and latency in a real-time workload.
+  - Evolve from polling to gateways and pub/sub while preserving ordering and reconnect semantics.
+  - Design heartbeats, backpressure, subscriptions, replay/snapshot recovery, and multi-device state.
+  - Explain what live delivery does and does not guarantee during partitions or client disconnects.
+relatedLessons:
+  - 02-06-realtime-transports
+  - 11-09-realtime-presence
+  - 06-03-pub-sub-and-topics
+  - 06-05-ordering
+  - 12-03-fanout
+---
+
+# Real-Time Systems
+
+> Real-time architecture is about bounded event freshness and connection behavior under churn; a live socket is a delivery path, not durable history.
+
+## Why This Exists
+
+Polling every five seconds is simple, but it adds request load, stale windows, and synchronized bursts for chat, collaboration, multiplayer state, or live dashboards. A naive WebSocket server removes polling but ties connections and application state to one process. Restarting that process drops clients, and another gateway cannot know which subscribers need an event.
+
+The improvement separates connection gateways from durable state and event distribution. Gateways own sockets and backpressure; a pub/sub or stream distributes events; clients reconnect with a cursor/snapshot. The new trade-offs are many long-lived connections, heartbeat traffic, ordering scope, replay/storage, slow consumers, and load-balancer routing.
+
+## Mental Model
+
+```text
+client ─ persistent connection ─> gateway ─ subscription ─> event bus/state
+   ▲              │                    │                 │
+   └─ reconnect + snapshot/cursor ◀────┴─ backpressure ───┘
+```
+
+Separate four scales:
+
+| Dimension | Question |
+| --- | --- |
+| Connections | How many concurrent sockets and heartbeats? |
+| Events | How many publishes/s and bytes/s? |
+| State | Must events be durable/replayable or merely live? |
+| Freshness | Is 100 ms, 5 s, or eventual delivery acceptable? |
+
+Presence is an ephemeral session observation; chat history or a document revision is durable source state. A live event can be dropped if the client can resync from a snapshot/stream; a financial or collaboration mutation cannot rely on best-effort broadcast alone.
+
+## How It Works
+
+A gateway authenticates a connection, subscribes it to bounded topics, enforces per-client send queues, and emits heartbeats. A routing layer can use connection-aware load balancing or let any gateway subscribe to a distributed bus. Pub/sub provides low latency but may lose events; a durable stream adds retention and replay. Clients carry a connection/session ID and last-seen event cursor.
+
+On reconnect, the client authenticates again, asks for a snapshot or events after its cursor, then resumes live delivery. The server must define cursor scope/order: global order is expensive; per-room, document, or aggregate order is often enough. If a consumer is too slow, drop/coalesce intermediate state updates, disconnect it, or persist a bounded replay; never let one socket block a gateway.
+
+## Example
+
+A collaborative whiteboard has 100,000 concurrent users, 20,000 pointer updates/s, and durable drawing commands. Polling creates stale movement and request bursts. A single WebSocket server handles the first pilot but fails on deploy and cannot scale connections.
+
+The improved design places authenticated connections on gateways, sends pointer updates through a lossy/coalescing channel, and writes drawing commands to a durable per-document log. Gateways subscribe to document topics and apply per-client backpressure. A reconnecting client fetches the latest document snapshot and replays commands after its cursor; pointer position is not replayed. Presence uses session TTL and is eventually updated.
+
+If one document becomes a hot room, its events are partitioned/isolated and update frequency is sampled. If a gateway crashes, clients reconnect with jitter to avoid a storm. The trade-off is that pointer movement may skip frames while durable commands preserve document correctness.
+
+## Visualization We Eventually Want
+
+Build a **Connection and Event Stream Lab**. Controls should include concurrent connections, gateway count, heartbeat interval, event rate/size, topic fanout, per-client bandwidth, durable versus lossy events, reconnect delay/jitter, and gateway failure. Show connection distribution, event lag, send queues, dropped/coalesced updates, replay cursor, snapshot size, heartbeat QPS, and reconnect storm load. Presets should include a slow mobile client, hot room, gateway deploy, and event-bus partition.
+
+## Scaling Behavior
+
+Connection capacity depends on file descriptors, memory, TLS, heartbeat, and per-socket send buffers—not only CPU QPS. Events multiply by subscribers and can cost more than connection setup. Partition topics by room/document/tenant, but isolate hot topics and avoid one global broadcast channel.
+
+Durable replay storage grows with event rate × retention. Snapshotting bounds reconnect cost; compaction/checkpoints bound logs. Multi-region systems need a region affinity/failover policy and an ordering scope. Cross-region global order can add latency and coordination that a local order plus conflict policy avoids.
+
+## Failure Modes
+
+- **Gateway crash/deploy:** all sockets reconnect together.
+- **Slow consumer:** send buffers grow and exhaust gateway memory.
+- **Bus loss:** live events disappear for disconnected clients.
+- **Cursor gap:** events expire before a reconnecting client can replay.
+- **Duplicate replay:** snapshot plus cursor events are applied twice.
+- **Ordering race:** events from multiple gateways arrive out of order.
+- **Heartbeat storm:** clients retry/renew synchronously.
+- **Unauthorized subscription:** a client receives another tenant's topic.
+
+Use reconnect jitter/backoff, per-client quotas, coalescing/drop policy, durable cursors/snapshots, idempotent/versioned client application, topic ACLs, and event age/lag metrics. Keep the durable command path authoritative.
+
+## Trade-offs
+
+Persistent connections lower freshness latency but consume per-connection resources and make deploy/failover churn visible. Pub/sub is simple/live but lossy; durable streams improve recovery but cost storage/replay. Strong ordering or global fanout costs throughput and latency. Coalescing protects capacity but can remove intermediate states.
+
+## Alternatives
+
+- **Long polling:** choose for moderate concurrency and simpler infrastructure.
+- **Server-sent events:** choose for server-to-client streams with browser reconnect semantics and no bidirectional requirement.
+- **Polling:** choose when freshness is coarse or clients are offline often.
+- **Durable stream consumption:** choose when replay/correction matters more than sub-second delivery.
+- **WebRTC/peer-to-peer:** choose for media/data paths where server fanout cost dominates, with additional NAT/security complexity.
+
+## When to Use
+
+Use this archetype when freshness and event delivery are interactive and connections remain open. State connection count, event fanout, ordering, replay, and slow-client policy.
+
+## When Not to Use
+
+Do not use sockets for a batch/report workload or to avoid designing durable state. Do not make a live event the only record of a business mutation.
+
+## Common Misconceptions
+
+- **“WebSockets guarantee delivery.”** They provide a transport while connected; reconnect and replay are application contracts.
+- **“Pub/sub preserves history.”** Many channels are at-most-once.
+- **“More gateways solve hot topics.”** One topic can still fan out to every gateway/subscriber.
+- **“Heartbeat means user activity.”** It only indicates a live session.
+- **“Global ordering is free.”** It requires coordination or a narrower ordering scope.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I separate connection gateways from durable state and event distribution. Gateways authenticate sockets, enforce per-client backpressure, and heartbeat; pub/sub handles live fanout while a durable stream/snapshot supports reconnect replay. I choose per-topic ordering, coalesce lossy updates, and make durable commands idempotent/versioned. Capacity is concurrent connections plus event bytes/fanout, and gateway/bus failure triggers jittered reconnect and resync.
+
+### When to Introduce It
+
+Introduce it when polling freshness/traffic is insufficient and users need a bounded live update path, after deciding which events are lossy versus durable.
+
+### Common Follow-Ups
+
+- How do clients recover events missed during disconnect?
+- What if one subscriber is slow?
+- What is ordered and at what scope?
+- How do you avoid reconnect storms?
+- What survives a gateway restart?
+
+### Common Candidate Mistakes
+
+They use a socket server as durable state, omit cursor/snapshot recovery, ignore connection memory/heartbeat estimates, and provide no slow-consumer policy.
+
+## Summary
+
+Real-time systems scale connections and event fanout separately from durable state. Gateways own transient sockets; buses/streams and snapshots provide distribution/recovery. Define ordering, backpressure, reconnect, and lossy-versus-durable semantics before choosing a transport.
+
+## Quiz Seeds
+
+1. What resource scales with concurrent sockets even at zero application QPS?
+2. Why must a client resync after reconnecting to a pub/sub channel?
+3. Which whiteboard updates can be dropped or coalesced?
+4. How does a hot room differ from a hot gateway?
+5. Why should reconnects use jitter?
+6. What ordering scope is sufficient for a document command stream?
+7. How do snapshot and cursor replay interact without duplicates?
+8. When is long polling a better architecture?
+
+## Related Topics
+
+- [Real-time presence](../11-building-blocks/realtime-presence.mdx) covers expiring session state.
+- [Realtime transports](../02-networking/realtime-transports.mdx) compares WebSocket/SSE/long polling.
+- [Pub/sub and topics](../06-messaging/pub-sub-and-topics.mdx) covers distribution semantics.
+- [Fanout](./fanout.mdx) generalizes one-to-many delivery.
+
+## References
+
+### Documentation / Articles
+
+- [WebSocket protocol (RFC 6455)](https://www.rfc-editor.org/rfc/rfc6455.html) — defines the bidirectional persistent transport and framing/close semantics.
+- [Redis Pub/Sub](https://redis.io/docs/latest/develop/pubsub/) — documents at-most-once live delivery and its boundary versus streams.
+- [Server-Sent Events specification](https://html.spec.whatwg.org/multipage/server-sent-events.html) — defines browser reconnection and one-way event streaming.
+- [AWS WebSocket API guidance](https://docs.aws.amazon.com/apigateway/latest/developerguide/apigateway-websocket-api-overview.html) — shows gateway connection lifecycle and integration considerations.

@@ -1,0 +1,178 @@
+---
+type: lesson
+id: 11-06-bloom-filter
+slug: bloom-filter
+title: Bloom Filter
+description: Reject likely-missing keys with a compact probabilistic membership structure while preserving no-false-negative safety.
+module: building-blocks
+order: 6
+difficulty: advanced
+estimatedMinutes: 30
+prerequisites:
+  - 04-06-database-indexes
+  - 04-07-b-tree-vs-lsm
+  - 05-02-local-and-distributed-cache
+  - 05-08-hot-keys
+tags:
+  - bloom-filter
+  - probabilistic-structures
+  - false-positives
+  - read-amplification
+  - storage
+objectives:
+  - Explain Bloom-filter bit setting, membership checks, and the one-sided error guarantee.
+  - Choose bit count and hash count from expected cardinality and false-positive budget.
+  - Identify deletion, rebuild, saturation, versioning, and adversarial-input limitations.
+  - Decide when a filter is worth adding before a cache, database, SSTable, or crawler fetch.
+relatedLessons:
+  - 04-07-b-tree-vs-lsm
+  - 05-08-hot-keys
+  - 11-05-full-text-search
+  - 11-04-search-autocomplete
+---
+
+# Bloom Filter
+
+> A Bloom filter is a cheap “definitely absent” test: it may say “possibly present,” but a correctly built filter must never make a real member look absent.
+
+## Why This Exists
+
+An LSM-based database or cache may receive a lookup for a key that does not exist. Checking every storage file, disk block, or remote cache for a miss wastes I/O and tail latency. The naive fix adds another exact index, but an exact index can approach the size of the data it protects.
+
+The improvement stores a compact bit array and several hash-derived positions. A negative result lets the caller skip the expensive lookup. A positive result still needs authoritative confirmation. The trade-off is a tunable false-positive rate, CPU for hashing, rebuild/merge work, and awkward deletion semantics.
+
+## Mental Model
+
+```text
+insert x: h1(x), h2(x), ... -> set bits
+query y: all bits set?       -> maybe present : definitely absent
+```
+
+An empty `m`-bit array starts at zero. Inserting an item sets `k` positions. A query is “definitely absent” if any required bit is zero; otherwise it is “possibly present.” Multiple items can set the same bits, causing false positives. No bit is cleared for deletion in the basic structure, because clearing one bit may erase evidence for another item.
+
+For `n` expected items and target false-positive probability `p`, an approximate sizing rule is:
+
+```text
+m ≈ -n ln(p) / (ln 2)^2       k ≈ (m/n) ln 2
+```
+
+The filter protects a source; it does not replace the source. A false positive costs an unnecessary source lookup. A false negative would be a correctness bug, so hash consistency, serialization, and rebuild atomicity matter.
+
+## How It Works
+
+Use two independent hash values and derive `k` positions, or use a proven hash family. The filter and the protected data must use the same normalization and namespace. Persist or publish the filter with a version of the data it describes. For immutable SSTables, one filter per table lets a read skip files; for a global key set, a partitioned filter keeps updates and memory bounded.
+
+Counting Bloom filters attach a small counter to each position to support deletion, but use more memory and can still underflow if operations are mismatched. A rotating or time-partitioned filter supports expiry by dropping old generations. Cuckoo filters support deletion and may offer better lookup/update behavior for some workloads, but have insertion failure and different sizing trade-offs.
+
+## Example
+
+A key-value service receives 1 million reads/s, 80% of which request missing keys. The naive path checks a remote SSD on every miss. A 10-bit-per-key Bloom filter at a 1% target false-positive rate can reject most absent keys in memory; roughly 1% of absent requests still reach storage, while every existing key reaches storage.
+
+The filter is rebuilt when a partition is compacted and published with the new table. If it becomes saturated because cardinality doubled, the false-positive rate rises; silently keeping it is a cost regression, not a correctness failure. If the service deletes keys from a mutable global set, a basic filter cannot remove them, so use generations, a counting filter, or rebuild from the authoritative set.
+
+## Visualization We Eventually Want
+
+Build a **Probabilistic Membership Lab**. Controls should include expected items, bit count, hash count, insert/query mix, deletion, adversarial keys, and number of table generations. Show the bit array, set-bit saturation, true positives/negatives, false positives, source lookups avoided, CPU/hash cost, and memory bytes. Presets should compare under-sized and correctly sized filters, deletions with a basic filter, a counting filter, and a rotated generation. Let learners inspect the exact hash positions for one key.
+
+## Scaling Behavior
+
+Memory is approximately linear in expected cardinality and `log(1/p)`, independent of value size. A filter per partition or SSTable limits rebuild scope but adds one check per candidate file. More hashes lower false positives until hash CPU and cache locality outweigh the benefit. Cardinality estimates must include replicas/generations and the actual query namespace.
+
+Filters are most useful when misses are expensive and common. If the source is already an in-memory hash map, the extra hash work may hurt. A hot missing key can still cause repeated filter checks but should be handled with negative caching or request coalescing; a filter does not cache the answer.
+
+## Failure Modes
+
+- **False-negative bug:** inconsistent hash/normalization or a stale filter published as authoritative.
+- **Saturation:** more inserts than planned raise false positives.
+- **Deletion error:** clearing a shared bit removes another member.
+- **Version mismatch:** filter describes a different partition/table snapshot.
+- **Hash DoS:** attacker chooses keys that collide/set many hot bits.
+- **Unavailable filter:** a fail-open lookup is safe but loses the optimization; fail-closed can lose real data.
+- **Serialization mismatch:** signed bytes, locale, or hash seed differs between builders/readers.
+
+Treat filters as advisory, fail open on filter uncertainty, publish atomically with data versions, monitor saturation and observed false-positive rate, and rebuild before the error budget is spent.
+
+## Trade-offs
+
+Bloom filters trade exact index memory for a bounded false-positive cost. They are simple and merge-friendly for compatible filters, but basic deletion and dynamic updates are hard. A lower target `p` consumes more bits. A filter saves I/O only when the protected lookup is meaningfully more expensive than hashing.
+
+## Alternatives
+
+- **Exact hash/set index:** choose when cardinality is small or false positives are unacceptable.
+- **Cuckoo filter:** choose when deletions and compact fingerprints matter.
+- **Counting Bloom filter:** choose for mutable sets with bounded deletion/update rates.
+- **Negative cache:** choose when absent answers remain valid for a known TTL, but account for invalidation.
+- **Partition metadata/index:** choose when exact range or key statistics can reject work cheaply.
+
+## When to Use
+
+Use a Bloom filter in front of expensive, read-mostly lookups with many misses and an acceptable false-positive budget. Estimate `n`, `p`, source cost, and rebuild/version behavior first.
+
+## When Not to Use
+
+Do not use it as an authorization decision, uniqueness proof, or source of truth. Do not use a basic filter for high-churn deletion-heavy data without generations/rebuilds. Avoid it when source lookups are already cheap.
+
+## Common Misconceptions
+
+- **“Bloom filters can return false negatives.”** Not if construction, hash, and version contracts are correct.
+- **“A positive result proves membership.”** It only means all bits are set; check the source.
+- **“Bits can be cleared on delete.”** Shared bits make that unsafe in a basic filter.
+- **“One target rate lasts forever.”** Saturation changes the observed false-positive rate.
+- **“A filter replaces a unique constraint.”** It cannot prove absence under concurrent writers.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I put a compact Bloom filter before an expensive lookup when misses are common. Hashes set bits on insert; a zero bit proves absence, while all set bits mean “maybe,” so the source remains authoritative. I size bits/hash count from cardinality and false-positive budget, publish it with a data version, monitor saturation, and use generations or a counting/Cuckoo variant when deletion matters.
+
+### When to Introduce It
+
+Introduce it after identifying high miss amplification and an expensive source path, not merely because memory is limited.
+
+### Common Follow-Ups
+
+- What false-positive rate do you need and how many bits/key?
+- How do you delete entries?
+- What happens when the filter is stale or full?
+- Can it replace a database uniqueness check?
+- How do you measure the real false-positive rate?
+
+### Common Candidate Mistakes
+
+They claim a positive means present, clear bits on deletion, omit saturation/rebuild metrics, or use fail-closed behavior that can hide real keys.
+
+## Summary
+
+Bloom filters are advisory negative tests with a one-sided guarantee. Size and version them from the data they protect, keep the source authoritative, and select a deletion/update variant deliberately. Their value is avoided expensive work, not exact membership.
+
+## Quiz Seeds
+
+1. What does a zero bit prove, and what does an all-one query prove?
+2. Why does cardinality growth increase false positives?
+3. Estimate the effect of halving the target false-positive probability on bits/key.
+4. Why is clearing a bit unsafe after deleting one key?
+5. When would a counting or Cuckoo filter be preferable?
+6. Why can a filter not replace a unique constraint?
+7. What should a service do if its filter cannot be loaded?
+8. How can a hot missing key still overload a source despite a Bloom filter?
+
+## Related Topics
+
+- [B-tree versus LSM](../04-databases/b-tree-vs-lsm.mdx) shows where per-table Bloom filters reduce LSM reads.
+- [Hot keys](../05-caching/hot-keys.mdx) covers skew and negative-cache amplification.
+- [Full-text search](./full-text-search.mdx) uses related index/segment trade-offs.
+- [Database indexes](../04-databases/database-indexes.mdx) compares exact and approximate lookup structures.
+
+## References
+
+### Documentation / Articles
+
+- [RocksDB Bloom filters](https://github.com/facebook/rocksdb/wiki/RocksDB-Bloom-Filter) — documents block-based filters, bits-per-key, and tuning in an LSM storage engine.
+- [Apache Cassandra Bloom filters](https://cassandra.apache.org/doc/stable/cassandra/architecture/storage-engine.html) — explains per-SSTable membership checks and their role in avoiding unnecessary reads.
+- [Redis probabilistic data types](https://redis.io/docs/latest/develop/data-types/probabilistic/) — shows practical approximate membership structures and the semantics that distinguish them from exact sets.
+
+### Papers
+
+- [Space/time trade-offs in hash coding with allowable errors](https://dl.acm.org/doi/10.1145/362686.362692) — Burton Bloom's original paper establishing compact membership tests and the space/error trade-off.
+- [Cuckoo Filter: Practically Better Than Bloom](https://www.cs.cmu.edu/~dga/papers/cuckoo-conext2014.pdf) — compares deletion-capable fingerprints and Bloom-filter alternatives.

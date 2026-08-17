@@ -1,0 +1,217 @@
+---
+type: lesson
+id: 13-14-e-commerce-inventory-and-ordering
+slug: e-commerce-inventory-and-ordering
+title: E-Commerce Inventory and Ordering
+description: Design inventory ownership, order state, payment boundaries, queues, and compensating actions for reliable checkout.
+module: design-labs
+order: 14
+difficulty: deep-dive
+estimatedMinutes: 75
+prerequisites:
+  - 00-03-estimation
+  - 00-04-interview-framework
+  - 04-14-concurrency-control
+  - 06-07-idempotent-consumers
+  - 07-07-saga-pattern
+  - 07-08-transactional-outbox
+  - 08-02-retries
+tags:
+  - e-commerce
+  - inventory
+  - checkout
+  - saga
+  - compensating-actions
+objectives:
+  - Partition ownership between cart, inventory, order, payment, fulfillment, and catalog services.
+  - Protect stock and order state across concurrent checkout attempts and retries.
+  - Design an order saga with outbox/inbox, compensation, and user-visible pending states.
+  - Estimate peak checkout pressure, stock hot keys, event fanout, and recovery work.
+relatedLessons:
+  - 04-14-concurrency-control
+  - 06-07-idempotent-consumers
+  - 07-07-saga-pattern
+  - 07-08-transactional-outbox
+  - 08-02-retries
+visualizationId: null
+quizId: null
+---
+
+# E-Commerce Inventory and Ordering
+
+> Checkout is a workflow of owned state transitions: reserve stock, authorize money, create an order, and compensate explicitly when one boundary fails.
+
+## Problem Statement
+
+Design checkout for a multi-tenant marketplace or retailer. Customers browse a catalog, add SKU quantities to a cart, submit an order, pay, and receive fulfillment updates. Inventory may be split across warehouses; flash sales create hot SKUs and duplicate clicks. Payment, tax, fraud, and shipping are external or separately owned. The design must avoid overselling while preserving a clear order state if payment or a downstream event is uncertain.
+
+## Functional Requirements (Scoped)
+
+- Read catalog/pricing and create/update a cart with a price snapshot.
+- Validate and reserve inventory for a checkout attempt with an expiry.
+- Create an order, authorize/capture payment, and release/compensate on failure.
+- Expose order status/history, cancellation/refund policy, and fulfillment events.
+- Support idempotent checkout/payment commands and operator reconciliation.
+
+Out of scope: product search/ranking, tax-law complexity, warehouse route optimization, and a universal atomic transaction across every provider.
+
+## Non-Functional Requirements and Priorities
+
+| Priority | Requirement | Working target / question |
+| --- | --- | --- |
+| P0 | Stock safety | Never commit more saleable quantity than the inventory owner permits. |
+| P0 | Financial safety | One order/capture/refund effect per command; ambiguous states reconcile. |
+| P0 | Durable state | Every order transition and event is replayable/auditable. |
+| P1 | Checkout latency | p95 under 2 s for synchronous validation/hold; long work is asynchronous. |
+| P1 | Flash-sale isolation | Hot SKUs and abusive carts cannot starve ordinary orders. |
+| P2 | Eventual fulfillment | Shipping/tax/fraud lag is visible as `pending`, not hidden as success/failure. |
+
+## Estimation Prompts and Checked Example
+
+Ask for DAU, cart/checkout rate, peak multiplier, SKUs, inventory hotness, payment latency, and event fanout. Example:
+
+- 10M daily visitors × 0.5% checkout = 50k checkouts/day → `≈0.58/s`; a flash-sale 100× multiplier makes `≈58 checkout/s` average over the sale window.
+- If each checkout touches 4 SKUs and one payment/inventory step, 58/s means about `232 SKU reservation writes/s`; a single hot SKU may receive most of them.
+- A 3-second synchronous payment/hold path at 58/s has `≈174` in-flight workflows (`58 × 3`); provider p99 30 s gives `≈1,740`, so worker and connection limits need a deadline.
+- 10 events/order × 50k orders/day = 500k events/day, about `≈5.8 events/s`; retries and fanout consumers multiply internal work, not customer checkout QPS.
+
+## API Design
+
+```http
+POST /v1/checkouts
+Idempotency-Key: checkout-cart42-v9
+{
+  "cartId":"cart42","priceVersion":"p17",
+  "items":[{"sku":"sku-hot","quantity":2}],
+  "paymentMethodToken":"pm_123","shippingAddressId":"addr7"
+}
+```
+
+Return `201` with an order in `pending`/`confirmed` only after durable state; `202` is appropriate when payment/fraud is asynchronous. Repeating the key/request hash returns the same order and status; a changed cart returns `409`. `POST /orders/{id}:cancel`, payment capture/refund, and inventory release all carry idempotency keys and state/version preconditions. `409` means price/inventory/state conflict, `422` business validation, `429` checkout/stock abuse, and `503` means the system cannot safely create an order—not “payment failed.”
+
+Clients can poll `GET /orders/{id}` or receive events. A network timeout after provider authorization is `payment_pending` until status/reconciliation, not a blind retry. Lower-level retries obey one owner and a deadline.
+
+## Data Model, Access Paths, and Ownership
+
+```text
+catalog_products(sku PK, price_version, price, state)
+carts(cart_id PK, customer_id, version, expires_at)
+inventory(sku, warehouse_id, on_hand, reserved, version,
+          PRIMARY KEY(sku, warehouse_id))
+orders(order_id PK, customer_id, cart_version, state, total,
+       payment_intent_id UNIQUE, version, created_at)
+order_items(order_id, line, sku, quantity, price_snapshot)
+workflow_steps(order_id, step, state, attempt, idempotency_key UNIQUE)
+outbox(event_id PK, aggregate_id, type, payload, published_at)
+```
+
+Catalog owns price/product availability; inventory owns stock/reservations; order owns the state machine and immutable price snapshot; payment owns payment status; fulfillment owns shipment. Reservation selection across warehouses is a policy/read model, but the chosen warehouse transaction enforces stock. An order transition and outbox event commit atomically; consumers use inbox/event IDs.
+
+## Progressive Architecture: Naive → Bottleneck → Improvement → New Trade-off
+
+1. **Naive:** synchronous checkout calls catalog, inventory, payment, shipping, then writes an order. A slow provider holds resources; partial failure gives unclear customer state and concurrent stock checks oversell.
+2. **Bottleneck/failure:** add a transaction around local order/inventory writes. Cross-service/network work cannot be included safely; one hot SKU or provider timeout creates lock/connection queues.
+3. **Improvement:** price snapshot + short inventory reservation, durable order state/outbox, and saga steps for payment/fraud/fulfillment. Partition workers by SKU/order, use idempotency/inbox, and expose pending/compensating states.
+4. **New trade-off:** the order can be pending or temporarily holds stock while payment/fraud is unresolved; compensation may be delayed and user experience is more complex. Stronger synchronous coupling reduces ambiguity but sacrifices availability and flash-sale throughput.
+
+Reference architecture:
+
+```text
+Catalog/Cart → Checkout API → inventory owner/reservation
+                         └→ order DB + outbox → saga/workflow queue
+                                                  ├→ payment/fraud
+                                                  ├→ fulfillment
+                                                  └→ release/refund/reconcile
+```
+
+The order service is the workflow coordinator; each participant owns its state and idempotent command. A choreography alternative is possible but requires clear event ownership and observability.
+
+## Bottlenecks and Concurrency / Consistency
+
+Hot SKU reservation, cart price drift, payment provider latency, saga queue age, order-state transitions, and warehouse selection are limits. Reserve exact quantity using CAS/row lock/actor; never decrement stock from a cached catalog. A price version and customer acceptance protect stale cart totals. Order transitions are a versioned state machine (`pending → paid → fulfilled`, with explicit `cancelled/payment_unknown`); stale commands return conflict. At-least-once events use inbox rows and idempotent compensation.
+
+## Failure Analysis
+
+- **Inventory reservation succeeds, payment fails:** release reservation with the same workflow key and expire as a safety net.
+- **Payment succeeds, order response lost:** provider status + idempotency key finalizes the order; never charge a second time.
+- **Fulfillment rejects after capture:** route refund/alternate fulfillment and mark a human-visible exception.
+- **Outbox/consumer lag:** order is durable but downstream pending; alert on age and support replay.
+- **Hot SKU overload:** queue or admission-limit flash-sale traffic, partition by SKU, and separate ordinary stock.
+- **Price/catalog change race:** reject/reprice with explicit user confirmation; do not silently alter total.
+- **Region loss:** route inventory/order ownership to a fenced region; use read-only status and recovery policy.
+
+## Security
+
+Authorize cart/order/customer/merchant scopes, bind prices and promotions to signed/versioned snapshots, and validate inventory/warehouse inputs. Use payment tokens rather than card data, protect webhook signatures/idempotency, encrypt PII, and audit refunds/admin overrides. Prevent cart/checkout bots and coupon abuse, isolate tenants, and redact addresses/payment IDs from traces/logs.
+
+## Observability
+
+Measure checkout state/latency by stage, reservation conflicts/hold age, hot-SKU skew, payment/fraud unknowns, saga step retries/age, outbox lag, consumer duplicate/dlq rate, order pending duration, refund/compensation drift, stock invariant checks, and price-conflict rate. Trace order/workflow IDs across services without payment secrets. Alert on stuck state transitions and invariant/reconciliation drift.
+
+## Explicit Trade-offs and Alternatives
+
+- **Synchronous checkout:** simple UX but couples failures/latency; use only for bounded local checks.
+- **Orchestrated saga:** visible workflow/compensation; coordinator is a dependency and must persist state.
+- **Choreographed events:** looser coupling; harder global reasoning, ordering, and debugging.
+- **Strong stock reservation vs oversell/backorder:** reservation preserves promise but can reduce utilization; backorder improves availability at fulfillment/user-cost risk.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+“Inventory and order state have clear owners. Checkout snapshots price, atomically reserves stock with a TTL, persists an order/outbox, and drives payment/fraud/fulfillment as an idempotent saga. A provider timeout creates `pending/unknown`, not a guessed failure; compensation releases stock/refunds with keys. Hot SKUs get admission/partition isolation, while product/catalog reads remain eventually consistent.”
+
+### When to Introduce It
+
+Introduce a saga when one checkout spans multiple owners that cannot share a transaction. Introduce holds/queues when payment latency or flash-sale contention makes a long synchronous request unsafe.
+
+### Common Follow-Ups
+
+- How do you avoid overselling one hot SKU?
+- What if payment succeeds after the client times out?
+- Which transitions are legal for an order?
+- What does a failed fulfillment do after capture?
+
+### Common Candidate Mistakes
+
+Updating stock from cache, capturing payment while holding a database lock, using one global transaction across providers, and treating compensating actions as guaranteed instantaneous.
+
+## Summary
+
+Checkout is a set of durable, owned state machines joined by idempotent commands/events. Reserve stock briefly, record price/order state, isolate hot keys, and reconcile ambiguous provider outcomes instead of pretending a single transaction spans the world.
+
+## Quiz Seeds
+
+1. Why is a catalog cache not an inventory authority?
+2. Which order state represents an unknown payment response?
+3. How many reservation writes/s arise from 58 checkouts/s touching four SKUs?
+4. Why are captures outside inventory locks?
+5. Which step compensates a payment failure after stock reservation?
+6. How does an inbox prevent duplicate fulfillment?
+7. When is choreography harder to reason about than orchestration?
+8. What metric exposes stuck saga steps?
+
+## Related Topics
+
+- [Concurrency control](../04-databases/concurrency-control.mdx) — stock CAS/locks.
+- [Idempotent consumers](../06-messaging/idempotent-consumers.mdx) — duplicate-safe workflow steps.
+- [Saga pattern](../07-distributed-coordination/saga-pattern.mdx) — compensation and workflow state.
+- [Transactional outbox](../07-distributed-coordination/transactional-outbox.mdx) — order/event atomicity.
+- [Retries](../08-reliability/retries.mdx) — deadlines and ambiguous providers.
+
+## References
+
+### Documentation / Articles
+
+- [Stripe idempotent requests](https://docs.stripe.com/api/idempotent_requests) — concrete payment-command replay semantics.
+- [AWS Builders' Library: Making retries safe](https://aws.amazon.com/builders-library/making-retries-safe-with-idempotent-APIs/) — explains duplicate-safe distributed commands.
+- [PostgreSQL transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html) — grounds stock race/isolation choices.
+- [Google SRE: Handling Overload](https://sre.google/sre-book/handling-overload/) — supports flash-sale admission and workload isolation.
+
+### Papers
+
+- [Sagas](https://www.cs.cornell.edu/andru/cs711/2002fa/reading/sagas.pdf) — original compensating-transaction model for multi-step checkout.
+
+## Future Visualization / Workspace Spec
+
+Create a checkout state machine with cart price version, hot SKU, reservation TTL, payment/fraud/fulfillment steps, retries, duplicate commands, outbox lag, compensation, and reconciliation. Controls should vary inventory contention, provider latency/failure, queue capacity, price changes, and flash-sale admission. Show stock invariant, order state, payment unknowns, reserved age, saga attempts, refund/release outcomes, and user-visible status. Canvas nodes should include Catalog, Cart, Checkout, Inventory, Order DB, Outbox, Payment, Fulfillment, Workflow, and Reconciler.

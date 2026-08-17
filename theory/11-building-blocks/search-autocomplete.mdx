@@ -1,0 +1,175 @@
+---
+type: lesson
+id: 11-04-search-autocomplete
+slug: search-autocomplete
+title: Search Autocomplete
+description: Serve useful prefix suggestions with an index, ranking policy, cache, and controlled freshness.
+module: building-blocks
+order: 4
+difficulty: core
+estimatedMinutes: 35
+prerequisites:
+  - 04-01-data-modeling-from-access-patterns
+  - 04-06-database-indexes
+  - 05-03-cache-aside
+  - 06-10-batching-and-stream-vs-batch
+tags:
+  - autocomplete
+  - trie
+  - prefix-index
+  - ranking
+  - caching
+objectives:
+  - Explain why scanning all documents per keystroke fails and how a prefix index narrows work.
+  - Compare trie, sorted-prefix, finite-state, and precomputed suggestion representations.
+  - Design ranking, cache invalidation, privacy filtering, and fallback behavior.
+  - Identify memory, tail latency, freshness, and hot-prefix trade-offs.
+relatedLessons:
+  - 11-05-full-text-search
+  - 04-06-database-indexes
+  - 05-08-hot-keys
+  - 05-07-cache-stampede
+---
+
+# Search Autocomplete
+
+> Autocomplete is a low-latency prefix lookup plus a ranking and policy problem; a fast trie with bad suggestions is still a poor search experience.
+
+## Why This Exists
+
+As a user types `sys`, the client may issue a request on every keystroke. The naive server scans every title, filters those beginning with the prefix, sorts them, and returns the top ten. With millions of documents and thousands of concurrent typists, the work grows with the corpus on every character and the same popular prefixes repeat constantly.
+
+The improvement precomputes or indexes the prefix-to-candidate relationship, keeps the hot suggestions close to the query path, and applies a ranking/policy layer. The new trade-off is memory amplification, update lag, ranking complexity, and privacy/safety filtering at high QPS.
+
+## Mental Model
+
+```text
+characters ─> normalized prefix ─> candidate set ─> rank/filter ─> top K
+                                      │
+                                      └─ cache hot prefixes
+```
+
+A trie stores one edge per character and reaches a prefix node in `O(prefix length)`; the node can hold a top-K list or a pointer to candidates. A sorted dictionary stores normalized terms lexicographically; a range lookup for `[prefix, prefix successor)` can find candidates without a pointer-heavy trie. A finite-state or compressed representation reduces repeated suffix/prefix memory for a mostly static dictionary.
+
+The lookup structure is not the ranking model. Ranking may combine popularity, recency, language, location, user history, typo tolerance, business rules, and safety. Separate candidate retrieval from ranking so the index can remain compact and policy can evolve.
+
+## How It Works
+
+Normalize input consistently: Unicode case folding, whitespace, punctuation, locale, and maximum prefix length are product decisions. Reject or constrain abusive query strings before expensive work. Query a read-optimized index and return a bounded number of suggestions; never let `K` become an unbounded response multiplier.
+
+For a static/global dictionary, an offline builder can compute the top suggestions for every prefix and publish an immutable version. For dynamic data, stream changes into a mutable index or rebuild snapshots periodically. Use versioned snapshots so readers see one coherent dictionary while a new one is built. Cache the most frequent normalized prefixes with a short TTL or explicit version key.
+
+Privacy and safety filters must run before a suggestion is exposed. A cached result is still subject to tenant, locale, authorization, and suppression policy; do not cache a user-specific result under a global prefix key.
+
+## Example
+
+A documentation site serves 50,000 searches/s at peak and has 20 million terms. The naive SQL query `WHERE term LIKE 'sys%' ORDER BY popularity LIMIT 10` becomes a database hot path. The first improvement creates a sorted prefix index and caches the top 10 results for popular prefixes. The result is fast, but a newly removed private document may remain in cache until TTL expiry.
+
+The production design publishes a versioned read-only snapshot every few minutes, uses a small per-prefix cache keyed by index version and locale, and runs suppression checks during publish. A user-specific history layer is queried separately and merged with global candidates. The trade-off is minute-level freshness and a snapshot build/rollback pipeline; a highly dynamic dictionary may need a mutable index with more write and compaction cost.
+
+## Visualization We Eventually Want
+
+Build an **Autocomplete Index Explorer**. Let learners choose a trie, sorted-prefix range, or precomputed table; set vocabulary size, prefix length distribution, top-K, update rate, cache capacity/TTL, rank skew, locale count, and index version lag. Show nodes/edges or sorted ranges, candidate counts, lookup latency, memory bytes, cache hits, stale suggestions, and publish cutover. Inject a hot prefix, a delete/suppression event, and a malformed/long query. Include a text result explanation showing why each suggestion ranked where it did.
+
+## Scaling Behavior
+
+Memory grows with dictionary representation, languages, metadata, and whether every prefix stores top-K results. A trie can be compact with shared prefixes but pointer overhead can dominate; compressed arrays or finite-state representations improve locality for static dictionaries. Precomputing all prefix lists speeds reads but amplifies updates and storage.
+
+Query traffic is usually read-heavy and hot-prefix skew is extreme: `a` and common product prefixes can dominate. Cache high-value prefixes, shard by normalized prefix, cap query length, and avoid a single global invalidation storm. User-specific personalization may prevent broad cache reuse and needs a separate capacity estimate.
+
+## Failure Modes
+
+- **Prefix scan fallback:** a missing or corrupted index sends every query to the primary database.
+- **Hot prefix:** one prefix overwhelms one shard or cache key.
+- **Stale suppression:** deleted/private content remains visible in an old snapshot/cache.
+- **Ranking drift:** popularity counters arrive late and produce poor ordering.
+- **Version split:** clients or shards read incompatible index snapshots.
+- **Unicode mismatch:** write and read normalization disagree, creating misses or unsafe matches.
+- **Unbounded K/query:** response size and ranking work grow with user input.
+
+Use immutable versioned snapshots, atomic publish, bounded fallbacks, per-prefix metrics, suppression at ingestion and response policy boundaries, and a circuit breaker around the source database.
+
+## Trade-offs
+
+Precomputed suggestions give predictable reads but spend build and memory budget. A mutable trie/index gives fresher data but complicates concurrent updates and compaction. Cache improves latency and source load but adds staleness and eviction behavior. Rich personalization improves relevance but reduces cache sharing and can expose private history if keys are scoped incorrectly.
+
+## Alternatives
+
+- **Database B-tree/prefix index:** choose for a small or moderately dynamic catalog where operational simplicity wins.
+- **Full-text search engine:** choose when tokenization, typo tolerance, field ranking, and filtering exceed a prefix lookup.
+- **Client-side dictionary:** choose for a small static vocabulary and offline needs; updates and privacy become client concerns.
+- **Approximate/ML candidate service:** choose for semantic or typo-heavy suggestions, with an explicit fallback to lexical prefix matching.
+- **No suggestions:** choose when search volume is low or suggestions create unacceptable privacy/safety risk.
+
+## When to Use
+
+Use a dedicated prefix index when keystroke-driven reads are high-QPS, latency-sensitive, and the candidate corpus is too large for per-request scanning. Define freshness and privacy before choosing precompute depth.
+
+## When Not to Use
+
+Do not build a trie for a ten-item enum or a low-QPS admin page. Do not optimize lookup before measuring ranking or network/rendering latency. Do not cache globally when results depend on user authorization or history.
+
+## Common Misconceptions
+
+- **“A trie solves autocomplete.”** It retrieves candidates; ranking, filtering, updates, and privacy remain.
+- **“Every prefix needs a stored top-K list.”** Range indexes or compressed structures may be smaller and sufficient.
+- **“A cache makes removed suggestions disappear.”** Versioning or invalidation policy is required.
+- **“Autocomplete is full-text search.”** Prefix matching and token relevance have different indexes and semantics.
+- **“Popularity ranking is stable.”** It is delayed, skewed, and often needs recency/fairness constraints.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> Keystroke search makes a full-corpus scan too expensive, so I normalize the prefix, retrieve candidates from a trie/sorted prefix index or precomputed snapshot, then rank and filter a bounded top-K. I cache hot prefixes but scope keys by locale and policy, publish versions atomically, and define update lag and suppression behavior. For dynamic or token/typo-heavy queries I may graduate to a full-text index.
+
+### When to Introduce It
+
+Introduce it when the QPS, latency target, corpus size, or keystroke interaction makes source scans measurable and the dominant access pattern is prefix lookup.
+
+### Common Follow-Ups
+
+- How are rankings updated?
+- How do you remove a private/deleted suggestion quickly?
+- What happens for a one-character hot prefix?
+- How do you support multiple languages or typo tolerance?
+- Why not query the database with `LIKE`?
+
+### Common Candidate Mistakes
+
+They name a trie without discussing top-K memory, ranking freshness, privacy scope, or cache invalidation. They also conflate prefix lookup with a general search engine.
+
+## Summary
+
+Separate prefix candidate retrieval, ranking, policy, and freshness. Choose a representation from corpus dynamics and memory locality; use versioned snapshots and scoped caches to keep fast results safe. A graceful bounded fallback is part of the design.
+
+## Quiz Seeds
+
+1. Why does scanning all documents per keystroke fail at corpus scale?
+2. Compare trie memory with a sorted-prefix index.
+3. What key dimensions must a cached personalized suggestion include?
+4. How can an immutable versioned snapshot reduce reader inconsistency?
+5. Why can a one-character prefix be a hot key even with a balanced index?
+6. What is the difference between candidate retrieval and ranking?
+7. When is a full-text engine a better alternative?
+8. How should a deleted private suggestion be removed from old caches?
+
+## Related Topics
+
+- [Full-text search](./full-text-search.mdx) extends retrieval beyond simple prefixes.
+- [Database indexes](../04-databases/database-indexes.mdx) explains ordered lookup and index costs.
+- [Cache stampede](../05-caching/cache-stampede.mdx) covers hot-prefix refresh behavior.
+- [Hot keys](../05-caching/hot-keys.mdx) explains skewed prefix traffic.
+
+## References
+
+### Documentation / Articles
+
+- [Apache Lucene 9 documentation](https://lucene.apache.org/core/9_0_0/index.html) — documents a production indexing engine whose term dictionaries and postings illustrate compact lexical lookup.
+- [Unicode normalization forms (UAX #15)](https://unicode.org/reports/tr15/) — defines normalization behavior needed for consistent prefix keys across languages and clients.
+- [PostgreSQL text pattern matching](https://www.postgresql.org/docs/current/functions-matching.html) — provides a baseline for why a database `LIKE` query has different index/pattern constraints from a dedicated prefix structure.
+- [Google SRE handling overload](https://sre.google/sre-book/handling-overload/) — connects read latency, caching, overload, and graceful behavior to production serving decisions.
+
+### Papers
+
+- [Incremental construction of minimal acyclic finite-state automata](https://aclanthology.org/J00-1002/) — grounds compressed lexicon representations useful for static autocomplete dictionaries.

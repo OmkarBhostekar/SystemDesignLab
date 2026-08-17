@@ -1,0 +1,206 @@
+---
+type: lesson
+id: 13-03-unique-id-generator
+slug: unique-id-generator
+title: Distributed Unique ID Generator
+description: Generate unique, sortable identifiers across many workers without making a single coordination point the throughput bottleneck.
+module: design-labs
+order: 3
+difficulty: core
+estimatedMinutes: 45
+prerequisites:
+  - 00-03-estimation
+  - 00-04-interview-framework
+  - 01-10-consistency-models
+  - 07-01-clocks-and-ordering
+  - 07-05-leases-and-fencing-tokens
+tags:
+  - unique-ids
+  - snowflake
+  - clocks
+  - coordination
+  - ordering
+objectives:
+  - State the uniqueness, sortability, opacity, and allocation guarantees required by an ID consumer.
+  - Compare database sequences, UUIDs, random IDs, and time/worker/counter layouts.
+  - Handle clock rollback, worker identity reuse, sequence exhaustion, and failover.
+  - Estimate ID rate, bit capacity, collision risk, and coordination overhead.
+relatedLessons:
+  - 04-04-acid-and-transactions
+  - 04-08-replication
+  - 07-02-leader-election
+  - 07-03-consensus-and-raft-intuition
+  - 08-10-multi-region-and-region-failover
+visualizationId: null
+quizId: null
+---
+
+# Distributed Unique ID Generator
+
+> The hard part is not printing a number; it is defining which uniqueness and ordering claims remain true when clocks, workers, and regions fail.
+
+## Problem Statement
+
+Provide IDs for orders, events, messages, and database rows from many application instances. IDs should be unique across regions, cheap to generate locally, and optionally roughly time-sortable for index locality. Consumers may retry a request, workers may restart with a new identity, and wall clocks can move backward. Ask whether IDs must be globally ordered, merely ordered per aggregate, opaque to users, or safe to expose publicly.
+
+## Functional Requirements (Scoped)
+
+- Generate one or a batch of IDs with bounded local latency.
+- Guarantee no duplicate IDs across active workers and regions for the supported epoch.
+- Expose a decode/debug path for operators only if timestamp/worker bits are not sensitive.
+- Support worker registration, lease expiry, and safe identity reuse.
+- Preserve idempotency: a retried create can reuse the caller's operation key instead of generating a second business object.
+
+Out of scope: cryptographic signatures, globally linearizable ordering of every ID, and using the ID as an authorization token.
+
+## Non-Functional Requirements and Priorities
+
+| Priority | Requirement | Working target / question |
+| --- | --- | --- |
+| P0 | Uniqueness | Zero collisions within the epoch under documented worker/clock assumptions. |
+| P0 | Availability | A worker can issue IDs without a network round trip on the hot path. |
+| P0 | Throughput | Sustain peak allocation rate with bounded sequence exhaustion. |
+| P1 | Sortability | IDs roughly increase by generation time, not strict global order. |
+| P1 | Recovery | Restarted workers cannot reuse another live worker's identity. |
+| P2 | Opacity | Do not leak tenant volume or precise event time unless acceptable. |
+
+## Estimation Prompts and Checked Example
+
+Ask for peak IDs/s, retention horizon, batch size, worker count, bit width, and whether ordering is per shard. Example assumptions:
+
+- 100M objects/day → `100M / 86,400 ≈ 1,157 IDs/s`; a 20× launch peak is `≈23k IDs/s`.
+- 1,000 workers each need up to 64 IDs/ms. A 12-bit sequence gives `4,096 IDs/ms` per worker, far above 64; if the counter is 12 bits per millisecond, a worker's local ceiling is 4.096M IDs/s.
+- A 41-bit millisecond timestamp spans `2^41 / (1000 × 60 × 60 × 24 × 365) ≈69.7 years`. State the custom epoch; rollover is a migration event, not an implicit guarantee forever.
+- With a 10-bit worker field, at most 1,024 active worker identities exist. A 10-bit sequence and 12-bit region/shard split change those trade-offs; bits are a finite budget.
+- A centralized database sequence at 23k/s may be viable, but a 5 ms round trip and 10k concurrent callers implies `≈115` in-flight allocations (`23k × 0.005`). Measure before replacing it.
+
+## API Design
+
+```http
+POST /v1/ids:allocate
+{"namespace":"orders","count":100,"requestId":"alloc-42"}
+```
+
+Return `200 {ids, schemeVersion, issuedAt}`. `requestId` is idempotent for the documented retention window: a replay returns the same batch, while a changed count or namespace returns `409 RequestIdConflict`. A worker's local generator should reserve a worker lease before serving; if the lease is unknown or expired, return `503 WorkerIdentityUnavailable` rather than guessing.
+
+For a business create, prefer `POST /orders` with `Idempotency-Key` and let the order service persist the generated ID with the command result. Returning a new ID on every transport retry is safe only if the caller can deduplicate. Treat `429` as allocation backpressure, `400` as invalid namespace/count, and `409` as identity or idempotency conflict. IDs that have been issued must not be “recycled” after a timeout.
+
+## Data Model, Access Paths, and Ownership
+
+```text
+worker_leases(worker_id PK, region, generation, lease_until,
+              fencing_token, owner_instance, updated_at)
+allocation_requests(request_id PK, namespace, request_hash,
+                    ids_blob, expires_at)
+id_scheme_versions(version PK, epoch, timestamp_bits, region_bits,
+                   worker_bits, sequence_bits, active_from)
+```
+
+The allocator owns scheme versions, worker identity leases, and allocation idempotency; the business service owns the object row and its uniqueness constraint. The hot access path is local timestamp + sequence arithmetic, not a database read. Lease registration is a control-plane path backed by a strongly consistent store. If an ID is used as a database key, the consuming service must still enforce its own primary key/duplicate handling.
+
+## Progressive Architecture: Naive → Bottleneck → Improvement → New Trade-off
+
+1. **Naive:** use one database auto-increment sequence. It is globally unique and ordered but adds a central round trip, reveals volume, and can be unavailable with the database.
+2. **Bottleneck/failure:** add per-process random UUIDs. Availability improves, but ordered index locality is lost; some schemes make collision probability hard to explain and clients may treat opaque IDs as sortable.
+3. **Improvement:** use a Snowflake-like layout: timestamp, region/worker identity, and per-tick sequence. Allocate worker IDs with leases/fencing and generate locally; hold back or fail on clock rollback.
+4. **New trade-off:** timestamp/worker bits leak timing and deployment shape, clock skew creates stalls, and the finite epoch/sequence budget needs versioning. A random UUID can be safer for public identifiers, while an internal sortable ID serves indexes.
+
+Reference architecture:
+
+```text
+Control plane → consensus-backed worker lease registry
+                     ↓ fencing token / scheme version
+Workers → local monotonic clock + sequence → IDs → owning services/databases
+```
+
+The registry is not on every allocation; it prevents simultaneous identity ownership. A worker fails closed when its lease is stale or its clock is behind the last emitted timestamp. Regions can allocate disjoint worker ranges, but cross-region strict order is intentionally not promised.
+
+## Bottlenecks and Concurrency / Consistency
+
+Sequence exhaustion within one millisecond, worker registration, lease renewal, clock rollback, and indexes receiving IDs out of order are the key pressure points. Compare the current timestamp to the last timestamp; if equal, increment sequence; if lower, wait until catch-up or switch to a documented logical-time mode. Never let two processes use the same worker ID without a fencing generation. The ID generator may be eventually consistent across regions, but uniqueness is a safety invariant. A consumer's insert remains the final duplicate detector.
+
+## Failure Analysis
+
+- **Clock moves backward:** pause, use a bounded logical offset, or fail; do not emit IDs that can collide with the prior tick.
+- **Lease store unavailable:** existing workers may continue only until lease expiry; new workers fail closed.
+- **Worker restarts quickly:** generation/fencing token prevents old and new processes sharing an identity.
+- **Sequence exhausted:** wait for next tick or return bounded backpressure; document latency.
+- **Scheme rollover:** dual-read/dual-write version metadata, test before timestamp exhaustion.
+- **Lost allocation response:** request ID replay returns the same batch; if the batch is lost after retention, reconciliation must inspect consumer usage.
+
+## Security
+
+Do not rely on guess-resistant IDs for access control. If IDs are public and volume/timing leakage matters, use a separate opaque external ID mapped to an internal sortable key. Authenticate namespace allocation, cap batch sizes, and prevent one tenant from exhausting sequence/lease control-plane capacity. Protect lease and scheme metadata with TLS, least privilege, audit events, and tamper-evident operator logs.
+
+## Observability
+
+Record IDs by scheme version, worker/region allocation, clock offset, sequence utilization, waits, lease renewals, fencing rejects, duplicate consumer errors, and allocation latency. Alert before epoch rollover, when sequence utilization approaches the limit, when clock rollback occurs, and when lease expiry margins shrink. Correlate a business request ID and idempotency key; avoid logging raw public identifiers if they reveal sensitive activity.
+
+## Explicit Trade-offs and Alternatives
+
+- **Database sequence:** strongest simple order and uniqueness; central bottleneck/availability and information leakage.
+- **UUID v4:** decentralized and opaque; random index locality and no temporal order.
+- **UUID v7:** time-ordered with random bits, standardized in RFC 9562; still needs collision/clock reasoning and may leak time.
+- **Snowflake-like:** compact, fast, roughly sortable; worker lease, clock, bit allocation, and rollover complexity.
+- **Range allocation:** a database leases ID blocks to workers; reduces round trips but loses tight ordering and needs safe block recovery.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+“First I ask whether uniqueness, per-entity order, global order, opacity, and offline generation are required. For high-rate internal keys I use a time/worker/sequence layout with disjoint leased worker IDs and fail closed on clock rollback or lease loss. For public IDs I may use UUIDv7 or a separate opaque mapping. Business creation remains idempotent at the owning service; an allocator retry must not create a second object.”
+
+### When to Introduce It
+
+Introduce a distributed generator when database sequences or a single coordinator show up as a measurable hot path, or when services need offline allocation. Keep a simple database sequence when rates and availability fit it.
+
+### Common Follow-Ups
+
+- What if the system clock moves backward?
+- How do two regions avoid worker-ID collision?
+- Is the generated ID globally ordered?
+- What happens when a client times out after allocation?
+
+### Common Candidate Mistakes
+
+Claiming UUIDs are ordered, recycling IDs after a timeout, ignoring worker identity reuse, and treating the timestamp field as a security boundary.
+
+## Summary
+
+ID generation is a contract about uniqueness, order, opacity, and failure—not merely an encoding. Keep coordination off the hot path with fenced worker leases, but be explicit about clock, bit, rollover, and public-leakage trade-offs. Make the business operation idempotent independently of the allocator.
+
+## Quiz Seeds
+
+1. What guarantees does a Snowflake-like ID provide, and which does it not?
+2. How many years does a 41-bit millisecond timestamp cover?
+3. Why can a worker ID lease without fencing still produce duplicates after a partition?
+4. What should happen when a per-millisecond sequence is exhausted?
+5. Why is a database sequence sometimes the best answer?
+6. How can public IDs leak business volume or event time?
+7. What is the difference between allocator idempotency and order-create idempotency?
+8. Which bit-field trade-off would you make for 100 regions and low per-worker rate?
+
+## Related Topics
+
+- [Clocks and ordering](../07-distributed-coordination/clocks-and-ordering.mdx) — wall-clock and logical-order limits.
+- [Leases and fencing tokens](../07-distributed-coordination/leases-and-fencing-tokens.mdx) — safe worker identity ownership.
+- [Leader election](../07-distributed-coordination/leader-election.mdx) — control-plane coordination choices.
+- [Replication](../04-databases/replication.mdx) — why database-generated IDs interact with failover.
+
+## References
+
+### Documentation / Articles
+
+- [RFC 9562: Universally Unique IDentifiers](https://www.rfc-editor.org/rfc/rfc9562.html) — standardizes UUID versions, including time-ordered UUIDv7 semantics.
+- [PostgreSQL sequence functions](https://www.postgresql.org/docs/current/functions-sequence.html) — documents the simple, durable baseline and its non-transactional sequence behavior.
+- [Google TrueTime](https://cloud.google.com/spanner/docs/true-time-external-consistency) — shows why bounded clock uncertainty matters when a system promises external ordering.
+- [etcd leases](https://etcd.io/docs/v3.6/learning/api_guarantees/) — provides a primary example of lease and linearizable key-value guarantees for worker registration.
+
+### Papers
+
+- [Announcing Snowflake](https://blog.x.com/engineering/en_us/a/2010/announcing-snowflake) — describes the original timestamp/worker/sequence motivation and layout.
+- [Time, Clocks, and the Ordering of Events in a Distributed System](https://lamport.azurewebsites.net/pubs/time-clocks.pdf) — grounds the distinction between wall-clock time and causal/logical ordering.
+
+## Future Visualization / Workspace Spec
+
+Simulate multiple workers and regions with adjustable clock offsets, lease duration, sequence width, request bursts, restart timing, and network partitions. Step through lease acquire, ID emission, rollback, fencing, and epoch rollover. Show duplicate attempts, local sequence utilization, monotonicity violations, wait time, and emitted scheme version. The workspace should offer Worker, Lease Registry, Clock, and Consumer nodes and ask learners to label whether each edge requires strong consistency or only eventual propagation.

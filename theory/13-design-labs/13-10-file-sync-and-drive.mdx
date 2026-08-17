@@ -1,0 +1,206 @@
+---
+type: lesson
+id: 13-10-file-sync-and-drive
+slug: file-sync-and-drive
+title: File Sync and Drive
+description: Design metadata/blob separation, resumable upload, multi-device sync, conflict handling, sharing, and durable large-object delivery.
+module: design-labs
+order: 10
+difficulty: advanced
+estimatedMinutes: 65
+prerequisites:
+  - 00-03-estimation
+  - 00-04-interview-framework
+  - 04-14-concurrency-control
+  - 05-06-cache-invalidation
+  - 06-07-idempotent-consumers
+  - 07-08-transactional-outbox
+  - 08-09-backups-rpo-rto
+tags:
+  - file-sync
+  - object-storage
+  - conflict-resolution
+  - sharing
+  - resumable-upload
+objectives:
+  - Separate authoritative file metadata, immutable content versions, and device sync cursors.
+  - Design resumable upload/download and conflict semantics without overwriting concurrent edits.
+  - Estimate change events, blob bandwidth, storage versions, and reconnect/rebuild load.
+  - Make sharing, revocation, integrity, and disaster recovery explicit.
+relatedLessons:
+  - 04-14-concurrency-control
+  - 05-06-cache-invalidation
+  - 06-07-idempotent-consumers
+  - 07-08-transactional-outbox
+  - 08-09-backups-rpo-rto
+visualizationId: null
+quizId: null
+---
+
+# File Sync and Drive
+
+> Sync is a versioned replication protocol over metadata and blobs: a device must learn what changed, upload bytes safely, and resolve concurrent edits without silent data loss.
+
+## Problem Statement
+
+Design a Drive-like service for folders/files across web, desktop, and mobile devices. Users upload, download, rename, move, share, and delete files. Devices can be offline and edit the same file concurrently. Large files need resumable transfer; collaborators need a predictable conflict policy. Ask whether content is immutable/versioned, whether server-side encryption/search is required, and how long deleted versions are retained.
+
+## Functional Requirements (Scoped)
+
+- Create/update file metadata and immutable content versions.
+- Start, resume, complete, and abort multipart uploads with checksum validation.
+- List changes after a per-user/device cursor and apply/download missing versions.
+- Share with users/groups/links, revoke access, and enforce inherited folder permissions.
+- Handle concurrent updates with optimistic version checks and conflict copies/merge policy.
+- Restore a deleted version within retention and expose sync status/errors.
+
+Out of scope: online document editing/CRDT semantics, malware classification research, and arbitrary cross-tenant sharing.
+
+## Non-Functional Requirements and Priorities
+
+| Priority | Requirement | Working target / question |
+| --- | --- | --- |
+| P0 | Integrity/durability | A committed version's bytes match its checksum and survive configured failures. |
+| P0 | Authorization | Every metadata and byte operation enforces current share/revocation policy. |
+| P0 | No silent overwrite | Concurrent device updates produce a conflict or explicit merge. |
+| P1 | Sync latency | Typical metadata changes visible to connected devices within seconds. |
+| P1 | Transfer efficiency | Resume after interruption; avoid re-uploading unchanged chunks. |
+| P2 | Recovery/cost | RPO/RTO, version retention, dedupe, and cold storage are stated. |
+
+## Estimation Prompts and Checked Example
+
+Ask for users/devices, file change rate, average/p99 size, sync fanout, storage retention, chunk size, and egress. Example:
+
+- 5M DAU × 4 changed files/day = 20M version events/day → `≈231 events/s`; 10× peak is `≈2,315/s`.
+- 20M changed files/day × 8 MB average = `160 TB/day` logical ingress; with 30-day versions, `4.8 PB` before dedupe/retention tiering—an assumption that likely changes the design.
+- At 8 MB chunks, each file averages one chunk; a 2,315/s peak is `≈18.5 GB/s` payload if all are new content. Deduplication, compression, and change distribution matter more than API QPS.
+- If a device holds a 64 KB sync cursor/metadata page and 1M devices reconnect, a full reconnect wave is 64 GB of metadata egress before blobs.
+
+## API Design
+
+```http
+POST /v1/files/{parentId}:start-upload
+Idempotency-Key: upload-deviceA-42
+{"name":"report.pdf","size":8388608,"sha256":"...","baseVersion":"v17"}
+```
+
+Return an upload session, chunk size, signed URLs, and required headers. `PUT /upload-sessions/{id}/parts/{n}` is idempotent by `(session, partNumber, checksum)`; a conflicting part returns `409`. `POST /upload-sessions/{id}:complete` verifies all parts/whole-object checksum, then atomically creates a new metadata version if `baseVersion` still matches. A stale base returns `409 Conflict` with the current version and conflict guidance; it never overwrites silently.
+
+`GET /v1/changes?cursor=...` returns changes and `nextCursor`; an expired cursor returns `410` and a full snapshot token. Metadata/file reads return `403` on current authorization failure, `404` when enumeration is hidden, `410` for intentionally retained tombstones, `412` for stale `If-Match`, and `503` only when no authoritative state is available. Delete/restore/share commands carry idempotency keys and version conditions. Retry transfer parts and status checks; do not retry a commit against a changed base without rebase/conflict handling.
+
+## Data Model, Access Paths, and Ownership
+
+```text
+nodes(node_id PK, parent_id, owner_id, name, kind, state, current_version,
+      acl_version, created_at, updated_at, UNIQUE(parent_id, name, state))
+file_versions(file_id, version_id, blob_key, size, checksum, base_version,
+              author_device, created_at, state, PRIMARY KEY(file_id, version_id))
+change_log(account_id, seq, node_id, version_id, event_type, acl_version)
+sync_cursors(account_id, device_id, cursor_seq, updated_at)
+shares(node_id, principal_id, role, expires_at, revoked_at, version)
+```
+
+Metadata/ACL service owns names, hierarchy, versions, and change sequence; object storage owns immutable chunks/blobs; sync workers own fanout/change delivery. Access paths are parent/name for listing, file/version for bytes, account/sequence for changes, and principal/ACL for authorization. A content hash can dedupe bytes, but metadata ownership still determines who may reference them.
+
+## Progressive Architecture: Naive → Bottleneck → Improvement → New Trade-off
+
+1. **Naive:** one API stores full files in a relational database and each device polls the full tree. Large rows, backups, and repeated scans make storage/egress the bottleneck; conflicts are last-write-wins.
+2. **Bottleneck/failure:** move blobs to object storage and add change polling. Byte delivery improves, but uploads restart after a lost connection and two devices can overwrite one version; ACL checks are easy to bypass with cached URLs.
+3. **Improvement:** use immutable versions, resumable multipart sessions, checksums, versioned change cursors, transactional metadata/outbox, and signed byte URLs issued after current ACL authorization. Push change hints but let devices replay from cursors.
+4. **New trade-off:** version history consumes massive storage, change cursors expire and require snapshots, and signed URLs/revocation are eventually fresh. Conflict copies/merges burden users, while stronger locks reduce availability/offline editing.
+
+Reference architecture:
+
+```text
+Device ↔ Sync/API → metadata + ACL DB → outbox/change log → sync gateways
+   └─ signed multipart URLs ↔ object storage/CDN
+                             └→ checksum/virus/retention workers
+```
+
+The commit transaction owns the visible version; object bytes become garbage-collectable only when no committed metadata references them and retention permits deletion.
+
+## Bottlenecks and Concurrency / Consistency
+
+Large-object bandwidth, metadata hierarchy queries, ACL evaluation, change-log fanout, reconnect snapshots, and version GC dominate. `baseVersion`/`If-Match` protects concurrent edits; a folder rename/move needs a tree version or transactional constraint. Cursor sequence is monotonic per account; devices may apply events at-least-once and deduplicate by `(node, version/eventId)`. Revocation is authoritative at URL issuance and metadata reads; a previously issued URL has an explicit maximum lifetime.
+
+## Failure Analysis
+
+- **Part upload lost:** list/verify parts and retry only missing or checksum-mismatched ones.
+- **Commit response lost:** idempotency/status query returns the visible version; a duplicate object is garbage-collected.
+- **Concurrent versions:** return conflict copy/merge metadata, never silent last-write-wins unless product explicitly accepts it.
+- **Change log/gateway outage:** devices resume from durable cursor; push is a hint, not correctness.
+- **ACL revocation:** stop issuing URLs and use short-lived links; invalidate cached metadata within the bound.
+- **Object replica loss/corruption:** checksum repair from replica/backup; mark version unavailable rather than serving wrong bytes.
+- **GC bug:** reference counting/tombstones plus delayed deletion and restore window prevent premature loss.
+
+## Security
+
+Authorize every parent/file/share operation, protect ACL inheritance against confused deputy paths, and use short-lived signed URLs scoped to object/version/verb. Encrypt in transit/at rest, rotate keys, support tenant separation, scan uploads, and log share/revoke/admin actions. Do not expose file names/paths in metrics or error text; rate-limit enumeration, upload sessions, and public links.
+
+## Observability
+
+Track metadata/read/write latency, upload part success/retry, checksum failures, bytes in/out, change-log age, cursor-expiry/full-snapshot rate, conflict rate, ACL denials, signed URL lifetime/revocation lag, orphan/unreferenced blob bytes, GC lag, restore success, and device reconnect backlog. Trace file/version and change sequence without body content. Alert on data-integrity violations, ACL lag, cursor backlog, and RPO/RTO drift.
+
+## Explicit Trade-offs and Alternatives
+
+- **Polling vs push hints:** polling is robust and replayable; push reduces latency but is ephemeral and reconnect-prone.
+- **Last-write-wins vs version conflict:** last-write-wins is simple but loses data; version/conflict copies preserve intent at user cost.
+- **Full replicas vs content-addressed dedupe:** replicas improve independent recovery; dedupe saves cost but couples retention/reference accounting.
+- **Locking vs offline editing:** locks simplify conflicts but reduce availability; optimistic versions permit offline work and surface conflicts.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+“I separate metadata/ACL from immutable blobs and expose a durable per-account change cursor. Uploads are resumable and checksum-verified; commit uses `baseVersion`/`If-Match`, so concurrent devices create conflicts rather than silent overwrite. A transactional outbox publishes change hints, but replay from the cursor is correctness. Signed URLs are short-lived and issued only after authorization, with a stated revocation bound.”
+
+### When to Introduce It
+
+Introduce multipart/object storage as soon as large bytes dominate, and versions/cursors when devices can be offline or reconnect. Add conflicts/merge policy before claiming sync correctness.
+
+### Common Follow-Ups
+
+- What if two devices edit offline?
+- How do you resume a 10 GB upload?
+- How does revocation affect a signed URL already issued?
+- How do you clean uncommitted chunks safely?
+
+### Common Candidate Mistakes
+
+Storing blobs and metadata as one row, making push delivery the only sync source, treating a checksum as authorization, and deleting old versions before reference/restore guarantees are satisfied.
+
+## Summary
+
+Metadata versions, change cursors, and ACLs define sync correctness; object storage defines byte durability and delivery. Make transfer resumable and idempotent, reject stale bases explicitly, and measure the cost of versions/reconnects before promising “instant sync.”
+
+## Quiz Seeds
+
+1. Why is `baseVersion` necessary for a concurrent upload commit?
+2. Calculate daily logical bytes from 20M 8 MB changes.
+3. What does a cursor-expired response require the client to do?
+4. Why is an object hash not an ACL?
+5. Which boundary makes a push hint non-authoritative?
+6. How can a signed URL remain usable after revocation?
+7. What protects a user from premature blob GC?
+8. What metrics reveal a reconnect storm versus blob egress growth?
+
+## Related Topics
+
+- [Concurrency control](../04-databases/concurrency-control.mdx) — optimistic versions and conflict behavior.
+- [Cache invalidation](../05-caching/cache-invalidation.mdx) — revocation/version freshness.
+- [Idempotent consumers](../06-messaging/idempotent-consumers.mdx) — at-least-once change application.
+- [Transactional outbox](../07-distributed-coordination/transactional-outbox.mdx) — commit/change publication.
+- [Backups and RPO/RTO](../08-reliability/backups-rpo-rto.mdx) — recovery guarantees.
+
+## References
+
+### Documentation / Articles
+
+- [Google Drive API: Manage file revisions](https://developers.google.com/workspace/drive/api/guides/manage-revisions) — documents revision/retention concepts for a Drive-like product.
+- [Amazon S3 multipart upload](https://docs.aws.amazon.com/AmazonS3/latest/userguide/mpuoverview.html) — grounds resumable part upload and completion semantics.
+- [RFC 9110: Conditional Requests](https://www.rfc-editor.org/rfc/rfc9110.html) — defines validators and preconditions such as ETags/If-Match.
+- [OWASP File Upload Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/File_Upload_Cheat_Sheet.html) — authoritative security checklist for untrusted uploads.
+
+## Future Visualization / Workspace Spec
+
+Provide a sync state machine for metadata version, upload session, parts, checksum, commit, change cursor, conflict, revoke, and GC. Controls should vary file size/chunking, offline duration, concurrent edits, cursor expiry, ACL revocation, object corruption, and region loss. Show bytes transferred, version graph, cursor lag, conflicts, stale URL window, orphan bytes, and recovery status. The canvas should support Device, Sync API, Metadata/ACL DB, Change Log, Object Store, CDN, Scanner, and GC/Restore nodes.

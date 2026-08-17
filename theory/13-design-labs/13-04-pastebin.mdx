@@ -1,0 +1,211 @@
+---
+type: lesson
+id: 13-04-pastebin
+slug: pastebin
+title: Pastebin
+description: Design an expiring text-sharing service that separates metadata from blobs, protects readers, and bounds retention cost.
+module: design-labs
+order: 4
+difficulty: core
+estimatedMinutes: 45
+prerequisites:
+  - 00-03-estimation
+  - 00-04-interview-framework
+  - 02-07-api-design-interviews
+  - 04-03-storage-models
+  - 04-08-replication
+  - 08-09-backups-rpo-rto
+tags:
+  - pastebin
+  - object-storage
+  - ttl
+  - blob-metadata
+  - abuse-prevention
+objectives:
+  - Separate paste metadata and large content so each path has appropriate durability and scaling.
+  - Design upload, fetch, expiry, deletion, and idempotency semantics with bounded retention.
+  - Estimate storage growth, bandwidth, cache footprint, and cleanup lag.
+  - Explain integrity, access control, abuse controls, and recovery behavior.
+relatedLessons:
+  - 04-03-storage-models
+  - 05-05-eviction-and-ttl
+  - 05-09-multi-layer-caching
+  - 08-09-backups-rpo-rto
+visualizationId: null
+quizId: null
+---
+
+# Pastebin
+
+> A paste service is a small object-storage system: the metadata path answers “may I read this?” while the blob path delivers bytes cheaply and safely.
+
+## Problem Statement
+
+Build a service where an authenticated or anonymous user submits text, receives a short paste ID, and shares a URL. Readers should fetch the content quickly until an expiry time. The service needs optional private pastes, one-time visibility, language metadata, deletion, abuse reporting, and size limits. Ask whether binary data is allowed; this lab assumes UTF-8 text only, with a hard maximum size.
+
+## Functional Requirements (Scoped)
+
+- Create a paste with content, optional title/language, visibility, and TTL.
+- Return an immutable or versioned paste URL and metadata.
+- Fetch metadata/content by ID while enforcing expiry and authorization.
+- Delete a paste, process reports, and prevent re-serving deleted content after the stated freshness bound.
+- Support resumable/streamed upload only if the size limit justifies it; otherwise a bounded single request is enough.
+- Make create/delete safe to retry with idempotency keys.
+
+Out of scope: rich editing/collaboration, arbitrary file execution, full-text search, and guaranteed immediate removal from users' already-downloaded copies.
+
+## Non-Functional Requirements and Priorities
+
+| Priority | Requirement | Working target / question |
+| --- | --- | --- |
+| P0 | Content integrity | Bytes fetched match the committed checksum/version. |
+| P0 | Durability | A successful paste survives one storage-node failure; state RPO/RTO explicitly. |
+| P0 | Abuse safety | Size, rate, malware/content policy, and public-read controls are enforced. |
+| P1 | Read latency | p99 metadata + small-paste read under 200 ms; large content streams without buffering in API servers. |
+| P1 | Expiry | Expired objects are not newly authorized; physical cleanup may lag within a defined bound. |
+| P2 | Cost | Cold/old pastes can move to cheaper storage or have shorter retention. |
+
+## Estimation Prompts and Checked Example
+
+Ask for creates/day, median and p99 paste size, read/share ratio, TTL distribution, cache hit rate, replicas, and egress budget. Example:
+
+- 2M pastes/day, average 20 KB → `40 GB/day` logical ingress; 30-day retention is `1.2 TB` before metadata/versions.
+- At 10 reads per paste, 20M reads/day → `≈231 reads/s` average; a 10× peak is `≈2,315 RPS`.
+- If average served bytes are 20 KB, peak egress is `2,315 × 20 KB ≈46.3 MB/s ≈370 Mb/s` payload, before protocol/CDN overhead.
+- Three durable object copies make 1.2 TB retained logical about `3.6 TB`; add metadata, erasure/parity, backups, and cleanup slack separately.
+- A 1% hot working set of 1.2 TB is still 12 GB; cache only metadata/small objects unless cost and invalidation policy justify larger blobs.
+
+Sensitivity prompts: What happens if one paste is 100 MB? How long may cleanup lag? Are anonymous writes allowed? Is a private paste encrypted per user or merely hidden by an unguessable ID?
+
+## API Design
+
+```http
+POST /v1/pastes
+Idempotency-Key: paste-2026-001
+Content-Type: application/json
+
+{"content":"...","visibility":"unlisted","expiresInSeconds":86400,"language":"text"}
+```
+
+For small content, return `201 {pasteId, url, checksum, expiresAt, version}`. For larger content, return an upload session and signed `PUT` URL; `POST /v1/pastes/{id}:commit` verifies the checksum before making metadata visible. A replay of the same idempotency key/request hash returns the same paste; a changed body returns `409 Idempotency-Key-Reused`.
+
+`GET /p/{id}` returns `200` metadata/content, `304` for a matching validator, `404` for unknown/expired private objects where enumeration should not be revealed, and `410` only when the product deliberately distinguishes takedown. `DELETE` is idempotent and returns the current tombstone state. Return `413` for size limit, `415` for unsupported encoding, `429` for write/read abuse, `403` for private access denied, and `503` when authoritative metadata cannot be read safely. A timeout after upload commit is resolved by an idempotency/status query, not a second object.
+
+## Data Model, Access Paths, and Ownership
+
+```text
+pastes(paste_id PK, owner_id, blob_key UNIQUE, checksum, size_bytes,
+       visibility, state, language, created_at, expires_at,
+       deleted_at, version)
+upload_sessions(session_id PK, paste_id, expected_checksum, size_limit,
+                state, expires_at)
+paste_events(event_id PK, paste_id, event_type, actor, occurred_at)
+```
+
+The Paste service owns metadata, authorization, lifecycle, and the manifest that points to `blob_key`; object storage owns immutable blob bytes and checksums. Reads first authorize metadata, then stream the blob. Expiry indexes/partitioning drive metadata sweeps; object deletion is asynchronous and retryable. A content-addressed key can deduplicate identical public content, but do not expose it as an authorization shortcut.
+
+## Progressive Architecture: Naive → Bottleneck → Improvement → New Trade-off
+
+1. **Naive:** API servers store text in one relational table and return it directly. This is easy to query but large rows inflate backups, connection memory, and database egress; one database outage loses both authorization and content.
+2. **Bottleneck/failure:** split blobs into object storage but proxy every byte through API servers. Bandwidth, open connections, and retries exhaust application capacity; expiration is enforced only by a periodic delete job.
+3. **Improvement:** keep metadata in a transactional store, upload immutable bytes directly to object storage with a signed URL, verify checksum at commit, and issue short-lived signed read URLs or stream through a CDN. Use a cache for public metadata/small objects and queue expiry cleanup.
+4. **New trade-off:** a signed URL may remain usable until its expiry after a metadata delete, CDN/object caches can retain stale bytes, and object deletion is eventually consistent operationally. Use short token TTL, cache purge/versioning, and authorization at the metadata boundary for private data.
+
+Reference architecture:
+
+```text
+Client → API → metadata SQL ──→ auth/lifecycle decision
+   └──── signed upload/read URL → object storage → CDN (public/large reads)
+                                   └→ checksum/expiry cleanup queue
+```
+
+The metadata commit is the visibility gate. Blob storage is immutable and addressed by an opaque key; the API never trusts a client-provided object path or checksum without verification.
+
+## Bottlenecks and Concurrency / Consistency
+
+Large object egress, public hot pastes, metadata point reads, upload sessions, cleanup backlog, and malware scanning are likely limits. Create commits metadata only after a complete, verified blob; a background scan can keep state `quarantined` until policy passes. Use a version/ETag for deletion and updates; immutable pastes simplify CDN correctness. A read can be eventually consistent for public metadata after create only if documented; private reads should route through authoritative authorization before issuing a URL.
+
+## Failure Analysis
+
+- **Upload succeeds, commit response is lost:** idempotency/status query discovers the session; an uncommitted blob is garbage-collected after a grace period.
+- **Object store unavailable:** metadata remains authoritative, but reads return bounded `503`/retry guidance rather than empty content.
+- **Checksum mismatch/corrupt replica:** mark object unhealthy, repair from a verified copy, and never serve silently altered bytes.
+- **Expiry sweeper lag:** authorization checks `expiresAt` on every read; sweeper is cost cleanup, not the access control.
+- **CDN serves deleted data:** use short signed URLs, cache purge/versioned keys, and document maximum stale delivery.
+- **Malicious huge upload:** enforce limits before allocation, stream with backpressure, and charge/rate-limit by principal.
+
+## Security
+
+Treat paste content as untrusted: HTML-escape or sandbox rendering, apply CSP, and do not execute scripts. Validate UTF-8 and content length; scan public uploads as policy requires. Use authenticated ownership checks, short-lived least-privilege signed URLs, encryption in transit/at rest, key rotation, and audit logs for private/takedown actions. Resist ID enumeration with high-entropy IDs and uniform not-found/forbidden behavior where appropriate. Do not log raw secret pastes or full content.
+
+## Observability
+
+Measure create/commit/read QPS, size distributions, upload and download bytes, checksum failures, metadata/object latency separately, cache/CDN hit ratio, signed URL issuance, expiry age, cleanup lag, orphan blob count, scan queue age, 4xx causes, 5xx, and authorization denials. Trace a paste ID and request ID across metadata, object, CDN, and cleanup; hash content IDs in logs if they may be sensitive. Alert on RPO/repair failures, orphan growth, and expiry authorization violations.
+
+## Explicit Trade-offs and Alternatives
+
+- **Database blobs vs object storage:** database transactions are convenient for small text but make growth/backups/egress expensive; object storage scales bytes and needs a metadata commit protocol.
+- **Proxy reads vs signed direct reads:** proxy centralizes auth/telemetry but consumes API bandwidth; signed URLs scale delivery but complicate revocation.
+- **Immutable vs editable pastes:** immutable keys simplify caches and integrity; edits need versions and stale-read rules.
+- **Delete immediately vs tombstone/async cleanup:** immediate auth denial is cheap; physical deletion and CDN purge are asynchronous and must be monitored.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+“I separate a transactional paste manifest from immutable object bytes. A verified upload becomes visible only after checksum and policy checks; reads authorize metadata, then stream via a short-lived signed URL/CDN. Expiry is enforced synchronously at authorization while cleanup is asynchronous. Idempotency protects upload/commit retries, and I state the maximum stale CDN/signed-URL window after deletion.”
+
+### When to Introduce It
+
+Introduce object storage when payload size, retention, or egress makes database rows the bottleneck. Introduce signed URLs/CDN when delivery, not metadata, dominates bandwidth; introduce quarantine when content policy is a requirement.
+
+### Common Follow-Ups
+
+- How do you ensure bytes were not corrupted?
+- What happens if upload commit times out?
+- Can a deleted paste still be read from a CDN?
+- How do you clean orphaned multipart uploads?
+
+### Common Candidate Mistakes
+
+Putting large content in the hot metadata table, treating a periodic expiry job as authorization, accepting client object paths/checksums blindly, and claiming signed URLs are instantly revocable.
+
+## Summary
+
+Make metadata the authorization/lifecycle source of truth and object storage the byte source. Verify integrity, stream large content, enforce expiry at read time, and treat cleanup/CDN invalidation as monitored eventual work. State deletion freshness and retry semantics instead of hiding them.
+
+## Quiz Seeds
+
+1. Why does the metadata/blob split reduce database pressure?
+2. Given 2M pastes/day at 20 KB, what are daily logical bytes and peak egress at 10× read QPS?
+3. Why must a reader check `expiresAt` even if the sweeper is healthy?
+4. What state should an upload have before checksum and malware policy pass?
+5. Which retry is safe after a lost commit response?
+6. How can a signed URL outlive a deletion, and what bounds the risk?
+7. Why is an opaque object key not authorization by itself?
+8. Which metrics reveal orphaned uploads and cleanup lag?
+
+## Related Topics
+
+- [Storage models](../04-databases/storage-models.mdx) — choose row/blob/log representations by access pattern.
+- [Replication](../04-databases/replication.mdx) — durability and repair choices.
+- [Multi-layer caching](../05-caching/multi-layer-caching.mdx) — metadata/CDN cache placement.
+- [Backups and RPO/RTO](../08-reliability/backups-rpo-rto.mdx) — recovery contracts for metadata and content.
+- [Object storage](../11-building-blocks/README.md) — composite building-block context.
+
+## References
+
+### Documentation / Articles
+
+- [Amazon S3 multipart upload](https://docs.aws.amazon.com/AmazonS3/latest/userguide/mpuoverview.html) — documents upload sessions, parts, completion, and checksum handling.
+- [Amazon S3 presigned URLs](https://docs.aws.amazon.com/AmazonS3/latest/userguide/using-presigned-url.html) — grounds scoped, time-limited direct access and its revocation limits.
+- [Amazon S3 data protection](https://docs.aws.amazon.com/AmazonS3/latest/userguide/data-protection.html) — describes versioning, replication, encryption, and integrity controls.
+- [RFC 9110: HTTP Semantics](https://www.rfc-editor.org/rfc/rfc9110.html) — supports conditional requests, status codes, and cache semantics.
+
+### Papers
+
+- [Erasure Coding in Windows Azure Storage](https://www.microsoft.com/en-us/research/publication/erasure-coding-in-windows-azure-storage/) — explains why large-object durability can use parity rather than only full replicas.
+
+## Future Visualization / Workspace Spec
+
+Show create → upload → checksum → quarantine → commit → signed read → expiry → tombstone → cleanup as a state machine. Let learners vary object size, multipart failures, checksum corruption, CDN TTL, signed URL TTL, scan latency, replica loss, and cleanup backlog. Display logical/physical bytes, bandwidth, orphan count, stale-read window, and RPO/RTO. The future canvas should support API, Metadata DB, Object Store, CDN, Scanner, and Cleanup Worker nodes with explicit ownership labels.

@@ -1,0 +1,217 @@
+---
+type: lesson
+id: 13-02-rate-limiter
+slug: rate-limiter
+title: Distributed Rate Limiter
+description: Design admission control that enforces fair limits across processes while remaining safe under races, skew, and store failure.
+module: design-labs
+order: 2
+difficulty: core
+estimatedMinutes: 45
+prerequisites:
+  - 00-03-estimation
+  - 00-04-interview-framework
+  - 01-03-latency-vs-throughput
+  - 03-06-api-gateway
+  - 08-07-load-shedding-and-graceful-degradation
+tags:
+  - rate-limiting
+  - admission-control
+  - token-bucket
+  - atomicity
+  - overload
+objectives:
+  - Compare fixed-window, sliding-window, leaky-bucket, and token-bucket behavior against a stated policy.
+  - Make a distributed decision atomic and bound the behavior when the limiter store is unavailable.
+  - Calculate token refill, burst capacity, key cardinality, and limiter-store load.
+  - Separate client-visible rejection semantics from internal overload protection.
+relatedLessons:
+  - 05-08-hot-keys
+  - 06-09-backpressure
+  - 08-04-retry-storms-and-cascading-failures
+  - 10-08-api-abuse-prevention
+visualizationId: null
+quizId: null
+---
+
+# Distributed Rate Limiter
+
+> A limiter is an admission-control policy with a state boundary: it must make one decision atomically, communicate who is limited, and fail without becoming an outage amplifier.
+
+## Problem Statement
+
+Design a service or gateway that limits requests by API key, user, tenant, IP, or endpoint. A product team wants `100 requests/minute` per user with bursts up to `20`, while the backend has an independent global safety limit. Multiple gateway instances receive requests concurrently, and requests may arrive through several regions. The lab asks which limits are contractual (fairness and quotas) and which are emergency load shedding (protecting a dependency).
+
+## Functional Requirements (Scoped)
+
+- Check a request against one or more named policies before expensive work.
+- Support a steady rate plus a bounded burst; return remaining quota metadata when safe.
+- Scope keys by authenticated principal, tenant, IP, route, or a composite key.
+- Allow policy versioning and an operator emergency limit without restarting gateways.
+- Provide a decision reason (`allowed`, `user-limit`, `global-overload`, `invalid-key`) and a retry hint when meaningful.
+- Keep an audit trail of policy changes, not every allowed request.
+
+Do not include billing-grade usage accounting, perfect global fairness across an intercontinental partition, or a full WAF. Those may be adjacent systems with different durability and false-positive requirements.
+
+## Non-Functional Requirements and Priorities
+
+| Priority | Requirement | Working target / question |
+| --- | --- | --- |
+| P0 | Safety | A limiter outage must not silently unleash unbounded load on a protected dependency. |
+| P0 | Decision latency | Add less than 2 ms p99 in the local region for a cache/store hit. |
+| P0 | Atomicity | Concurrent checks for one key cannot all spend the same token. |
+| P1 | Fairness | No single tenant can consume shared capacity; define acceptable clock/skew error. |
+| P1 | Availability | Choose fail-open/closed per endpoint and document degraded mode. |
+| P2 | Explainability | Operators can see policy version, decision reason, and store health. |
+
+## Estimation Prompts and Checked Example
+
+Ask for request QPS, number of keys, policy count, burst size, regions, state retention, and the store's atomic-operation capacity. Illustrative assumptions:
+
+- 2M active API keys, 100 requests/minute each, with 20% active in a minute → 400k hot keys.
+- 400k active keys × 1 decision/s average within their active minute → `400k decisions/s`; a 2× burst means roughly `800k decisions/s` for a short interval.
+- A token record with key, policy version, tokens, timestamp, and expiry is 120 bytes; 400k active records are `≈48 MB` logical before store overhead/replicas.
+- At 10 ms p99 for a remote limiter store and 2 ms gateway processing, Little's Law predicts `800k × 0.012 ≈9,600` outstanding decisions during the burst. This is why co-locating state or batching policies matters more than adding a larger request thread pool.
+- A token bucket with rate `100/min = 1.667 tokens/s`, capacity `20`, starts full; a client can spend 20 immediately, then receives one token every `0.6 s`. The earliest 21st request is therefore about `0.6 s` later if no token accrued.
+
+Sensitivity prompts: Does a rejected request retry? Are limits per endpoint or all traffic? Is a global cap allowed to be approximate during a partition? What is the cost of a false allow versus a false reject?
+
+## API Design
+
+Internal decision API:
+
+```http
+POST /v1/limit/check
+{
+  "policy":"user-write-v3",
+  "key":"tenant:acme:user:42",
+  "cost":1,
+  "requestId":"req-7f"
+}
+```
+
+Return `200 {allowed, remaining, resetAt, policyVersion, reason}`. `429 Too Many Requests` is the public response for a contractual quota, with `Retry-After` only when the estimate is meaningful. A global emergency shed can use `503` plus a distinct reason so clients do not treat it as a user quota. `400` means a malformed/missing key; `401/403` remain authentication/authorization errors, not quota failures.
+
+The check operation is logically idempotent only when it carries an `Idempotency-Key`/unique decision ID and a cost; retries can otherwise spend two tokens. For gateways, prefer a single atomic `consume(requestId, key, cost)` operation that records the decision briefly. Replaying the same request ID returns the prior decision; a different ID is a new attempt. Policy writes use optimistic versions and return `409 PolicyVersionConflict` on stale updates. Never retry `429` immediately; honor `Retry-After` and client budgets.
+
+## Data Model, Access Paths, and Ownership
+
+```text
+policies(policy_id PK, scope, rate_per_second, capacity, mode,
+         version, updated_at, expires_at)
+bucket_state(bucket_key PK, policy_id, tokens, last_refill_at,
+             policy_version, expires_at)
+decisions(decision_id PK, bucket_key, result, cost, expires_at)
+policy_audit(change_id PK, actor, old_version, new_version, reason, created_at)
+```
+
+The limiter owns policy and short-lived bucket/decision state. The identity service owns principal-to-tenant mapping; the limiter should consume a stable key, not query identity databases per request. Access is a point lookup/update by bucket key with one atomic script/transaction. Expired bucket state may be garbage-collected, but policy audit records are durable. A separate metrics stream aggregates counts; it is not in the decision path.
+
+## Progressive Architecture: Naive → Bottleneck → Improvement → New Trade-off
+
+1. **Naive:** each process keeps an in-memory counter. It is fast, but users can multiply quota across instances, restarts erase state, and a fixed window allows boundary bursts.
+2. **Bottleneck/failure:** centralize counters in a shared store. Every request now depends on a network hop and one hot tenant can overload one shard; store failure becomes a gateway-wide decision problem.
+3. **Improvement:** use token-bucket or sliding-window state with an atomic server-side operation, hash buckets across shards, co-locate a regional replica, and cache immutable policy definitions briefly. Apply local emergency budgets for dependency protection.
+4. **New trade-off:** regional replicas and local fallback can over-admit during partitions; a global strongly consistent limiter raises latency and reduces availability. State the error budget explicitly and choose fail-open for low-risk reads versus fail-closed for expensive or abusive operations.
+
+Reference architecture:
+
+```text
+Client → edge/API gateway
+       ├→ local policy cache
+       ├→ regional limiter shards (atomic bucket consume)
+       └→ protected service
+              └→ dependency-specific circuit/load-shed budget
+```
+
+The policy source publishes versioned updates; metrics and audit events flow asynchronously. The regional decision boundary keeps common latency low; a coarse global budget protects shared dependencies. Do not pretend these are the same fairness guarantee.
+
+## Bottlenecks and Concurrency / Consistency
+
+Hot keys, cross-region calls, policy-cache stampedes, and limiter-store connection pools dominate. Fixed-window `INCR` plus `EXPIRE` must be atomic or a crash can create an unbounded/never-expiring counter. Token refill uses a server-side timestamp or bounded clock-skew policy; two gateways cannot independently refill the same bucket. When an API request costs multiple tokens, consume the entire cost atomically. Policy propagation is eventually consistent; include a policy version in decisions and allow a bounded rollout skew.
+
+## Failure Analysis
+
+- **Shard unavailable:** use a documented local budget for low-risk traffic, fail closed for high-cost writes, and emit a degraded-mode metric.
+- **Slow store:** timeout before the request deadline; do not queue unlimited limiter checks.
+- **Clock jump:** cap elapsed time/refill, use monotonic clocks locally, and alert on timestamp anomalies.
+- **Policy push lag:** retain previous policy for a short grace period and show version skew.
+- **Retry storm:** `429` responses with long `Retry-After` prevent synchronized immediate retries; jitter client polling.
+- **Hot tenant:** shard by a salted key or use hierarchical budgets, but avoid splitting one exact quota across independent counters without a reconciliation policy.
+
+## Security
+
+Authenticate policy writers, authorize tenant scope, and make policy changes auditable. Derive keys from verified identity rather than trusting user-supplied headers; normalize IPs and account for NAT. Do not expose exact global capacity or sensitive tenant names in public errors. Protect the limiter store with network policy, TLS, least privilege, and bounded key length to prevent memory abuse. Rate-limit the rate-policy API itself.
+
+## Observability
+
+Measure allow/reject QPS by policy/reason/tenant class, decision p50/p95/p99, store round-trip latency, atomic-operation errors, bucket hotness, policy-version lag, fallback/fail-open count, false-reject reports, and protected-service saturation. Trace one sampled request through gateway and limiter with policy version, never raw credentials. Alert on reject-rate changes, store error budget, and fail-open time; compare limiter decisions with downstream 429/overload signals.
+
+## Explicit Trade-offs and Alternatives
+
+- **Fixed window:** simplest/cheap but boundary bursts; use for coarse quotas.
+- **Sliding log/window:** fairer but memory and write heavy; use for strict short-window limits.
+- **Token bucket:** clear burst/rate semantics and compact state; needs atomic time/refill.
+- **Leaky bucket/queue:** smooths work but adds delay and can hide overload; use when queueing is acceptable.
+- **Central strong store vs local approximation:** strong global fairness costs latency/availability; local budgets are resilient but can over-admit.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+“I define whether the policy is a user quota or a dependency-safety budget, then choose token bucket for explicit rate plus burst. The consume/refill decision is one atomic operation in a sharded regional store, with a short policy cache. I set fail-open/closed per endpoint, bound clock/skew and store timeouts, and emit 429 versus 503 semantics so clients and operators know whether to wait or degrade.”
+
+### When to Introduce It
+
+Introduce a limiter when a dependency has a finite budget, tenants need fairness, or retries/bots can amplify load. Introduce distributed state only after showing that per-process counters are inconsistent.
+
+### Common Follow-Ups
+
+- What happens if the limiter store is down?
+- How do you make a check atomic across gateways?
+- How do you handle multi-region quotas?
+- Why is a token bucket different from a queue?
+
+### Common Candidate Mistakes
+
+Using local counters for a global contract, making `INCR` and `EXPIRE` non-atomic, returning `429` for every overload condition, and claiming exact global fairness during a network partition.
+
+## Summary
+
+A limiter is a consistency-sensitive admission decision. Make key selection, refill, and spend atomic; separate contractual quota from emergency shedding; and state degraded behavior explicitly. Use metrics to tune limits rather than letting the limiter become an opaque source of latency.
+
+## Quiz Seeds
+
+1. A token bucket allows 100/minute with capacity 20. How long until the 21st request after a full burst?
+2. Why can per-process counters violate a user quota behind a load balancer?
+3. What race occurs when `INCR` and `EXPIRE` are separate operations?
+4. When should a gateway return 429 versus 503?
+5. Which limiter state must be atomic for a cost-5 request?
+6. What can a region-local fallback over-admit during a partition?
+7. Why should the limiter use a monotonic clock for elapsed time?
+8. Which metric distinguishes a user quota from a dependency overload incident?
+
+## Related Topics
+
+- [API gateway](../03-traffic-and-services/api-gateway.mdx) — natural placement for admission control.
+- [Load shedding and graceful degradation](../08-reliability/load-shedding-and-graceful-degradation.mdx) — emergency protection differs from quotas.
+- [Hot keys](../05-caching/hot-keys.mdx) — one tenant can overload a single state shard.
+- [Backpressure](../06-messaging/backpressure.mdx) — queueing and admission control are related but not interchangeable.
+- [API abuse prevention](../10-security/README.md) — security policy context for public limits.
+
+## References
+
+### Documentation / Articles
+
+- [Redis INCR](https://redis.io/docs/latest/commands/incr/) — shows atomic counter primitives and the need to combine expiry safely.
+- [Redis EVAL](https://redis.io/docs/latest/commands/eval/) — documents server-side scripting for one atomic bucket decision.
+- [RFC 6585: Additional HTTP Status Codes](https://www.rfc-editor.org/rfc/rfc6585.html) — defines 429 and its retry guidance.
+- [Google SRE: Handling Overload](https://sre.google/sre-book/handling-overload/) — explains admission control and load shedding as reliability mechanisms.
+
+### Papers
+
+- [The Token Bucket Algorithm](https://dl.acm.org/doi/10.1145/357401.357407) — grounds the burst/rate model and its traffic-shaping trade-offs.
+
+## Future Visualization / Workspace Spec
+
+Create a deterministic limiter simulator with fixed/sliding/token/leaky presets, one or many gateways, configurable shard count, key skew, clock offset, policy rollout lag, and store failure. Show each request's allow/reject reason, tokens, reset time, shard load, decision latency, and downstream overload. The workspace should let learners connect Gateway, Policy Store, Limiter Shards, and Service nodes, annotate fail-open/closed edges, and compare exactness versus availability in a text checklist.

@@ -1,0 +1,175 @@
+---
+type: lesson
+id: 12-02-write-heavy
+slug: write-heavy
+title: Write-Heavy Systems
+description: Scale sustained mutation volume with append-oriented paths, partitioning, batching, and asynchronous consumers while preserving ordering and durability.
+module: architecture-archetypes
+order: 2
+difficulty: core
+estimatedMinutes: 40
+prerequisites:
+  - 00-03-estimation
+  - 01-03-latency-vs-throughput
+  - 04-04-acid-and-transactions
+  - 04-09-partitioning-and-sharding
+  - 06-04-partitions-and-consumer-groups
+  - 06-09-backpressure
+  - 11-03-distributed-scheduler
+tags:
+  - write-heavy
+  - append-log
+  - batching
+  - partitioning
+  - backpressure
+objectives:
+  - Diagnose write-heavy pressure across CPU, indexes, WAL/durability, locks, connections, and replication.
+  - Evolve from synchronous row writes to append/batch/partition paths without losing ordering or durability.
+  - Choose what must be synchronous versus asynchronously derived.
+  - Explain hot partitions, backpressure, consumer lag, compaction, and recovery trade-offs.
+relatedLessons:
+  - 04-09-partitioning-and-sharding
+  - 06-09-backpressure
+  - 06-10-batching-and-stream-vs-batch
+  - 07-10-event-sourcing-and-cqrs
+  - 12-05-transactional-workflow
+---
+
+# Write-Heavy Systems
+
+> A write-heavy architecture is shaped by how mutations become durable, ordered, partitioned, and consumed—not by adding replicas to a saturated writer.
+
+## Why This Exists
+
+Telemetry, click events, counters, logs, inventory reservations, and transaction journals can generate far more mutations than a single relational writer can index and replicate. The naive design performs one fully indexed transaction per event, synchronously updates every derived table, and lets clients retry on timeout. WAL, random indexes, locks, and downstream work become the bottleneck.
+
+The improvement narrows the synchronous contract, appends or batches durable events, partitions ownership, and derives secondary views asynchronously. The new trade-offs are queue/consumer lag, replay and deduplication, eventual visibility, compaction, and more difficult global transactions.
+
+## Mental Model
+
+```text
+producers ─> admission/backpressure ─> durable append/partition
+                                             ├─ primary consumer
+                                             ├─ projections/analytics
+                                             └─ archive/retention
+```
+
+Ask which guarantee the write response means: received, durably appended, applied to the primary state, or visible in every read model. Separate event arrival rate from processing rate. If producers outrun consumers, backlog is a capacity signal; infinite queues only delay failure and increase recovery time.
+
+## How It Works
+
+An append log or partitioned table makes writes sequential within an owner and lets consumers replay. A key such as device, tenant, account, or aggregate defines ordering and parallelism; a key that preserves no ordering allows more concurrency. Batch writes amortize fsync, network, and index overhead, but add latency and a partial-batch failure policy.
+
+Partitioning increases aggregate writer capacity when keys distribute, but one hot tenant or timestamp range can still saturate an owner. Consumers use groups/partitions and checkpoint progress. At-least-once delivery means projections need idempotent event IDs and version checks. Retention, compaction, snapshots, and archive policies bound replay/storage cost.
+
+## Example
+
+A fleet sends 200,000 sensor events/s. The naive API inserts each event into a normalized SQL table, updates hourly aggregates synchronously, and keeps all indexes forever. The primary hits I/O and lock limits; retries duplicate events.
+
+The improved path authenticates and rate-limits producers, appends events partitioned by device/tenant to a durable log, acknowledges after the chosen durability point, and computes aggregates asynchronously. Batches reduce write overhead; consumers checkpoint and write idempotent projections. A retention job compacts old events into hourly summaries and archives raw data.
+
+If one customer sends 40% of events, the hash partition is still hot. Give that tenant salted substreams or dedicated capacity, but explain how ordered per-device queries merge. If consumers lag, backpressure or sampling protects storage; the product defines whether dropping telemetry is acceptable. Financial events would require durable retention and no sampling, so the same “write-heavy” label leads to a different architecture.
+
+## Visualization We Eventually Want
+
+Build a **Write Pipeline Pressure Simulator**. Controls should include producer rate, payload/index cost, batch size, fsync latency, partition count/key skew, consumer count, processing time, queue capacity, retention/compaction, and failure injection. Show append throughput, durability latency, partition hotness, backlog/oldest age, consumer lag, dropped/retried events, projection freshness, and recovery time. Presets should compare uniform telemetry, one hot tenant, financial append-only events, and a consumer outage.
+
+## Scaling Behavior
+
+Estimate bytes/s, records/s, index/WAL amplification, replication bandwidth, and retention storage. Batching improves throughput but increases loss/retry unit and p99. More partitions increase parallelism but add metadata, connections, ordering boundaries, and merge/fanout work. Consumers scale up to partition count and downstream capacity.
+
+Hot keys and global secondary indexes often cap scale before raw append capacity. Separate immutable raw append from mutable aggregates when query shapes differ. Compaction reduces retention cost but consumes I/O and can compete with foreground writes; schedule/throttle it.
+
+## Failure Modes
+
+- **Ack before durability:** a producer believes a write exists after process loss.
+- **Duplicate retry:** timeout causes repeated events or double increments.
+- **Hot partition:** one key saturates while others idle.
+- **Consumer lag:** derived views become too stale for product promises.
+- **Ordering violation:** events for one aggregate cross partitions or retries reorder.
+- **Backlog explosion:** unlimited buffering exhausts disk/memory during outage.
+- **Compaction/recovery storm:** maintenance consumes foreground capacity.
+- **Partial batch:** some records commit while the client retries all.
+
+Use explicit durability acknowledgments, stable event IDs, idempotent projections, partition-key analysis, bounded queues, backpressure/load shedding, lag SLOs, throttled compaction, and replay checkpoints.
+
+## Trade-offs
+
+Append/log paths maximize throughput and replayability but add eventual projections and retention/compaction work. Batching lowers per-record cost but increases latency and retry granularity. Partitioning scales writes but limits ordering/transactions to a key. Synchronous derived state gives stronger visibility but couples every writer to downstream work.
+
+## Alternatives
+
+- **Scale-up/index tuning:** choose when one writer still has headroom and transactions must remain local.
+- **Partitioned OLTP:** choose for transactional writes with a routable key and bounded cross-partition work.
+- **Durable event log:** choose for append-heavy, replayable, multi-consumer data.
+- **Time-series/columnar store:** choose for metrics and analytical ingestion, not arbitrary transactional invariants.
+- **Batch ingestion:** choose when minutes/hours of latency are acceptable and throughput/cost dominate.
+
+## When to Use
+
+Use this archetype when mutation rate, write amplification, or ingest bandwidth—not reads—limits the system. Clarify durability, ordering, loss tolerance, and projection freshness.
+
+## When Not to Use
+
+Do not make every CRUD application append-only if updates/transactions are simple and the writer is not saturated. Do not asynchronously defer an invariant that must be enforced before acknowledging a business operation.
+
+## Common Misconceptions
+
+- **“Read replicas scale writes.”** Replication usually repeats write work.
+- **“A queue absorbs any write spike.”** It trades immediate overload for bounded storage and lag.
+- **“Append-only means no ordering issue.”** Partition keys and consumers still define order.
+- **“Batching is free throughput.”** It adds latency and larger retry/failure units.
+- **“Eventual projections are fine for all domains.”** Financial/inventory invariants may need synchronous authority.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I identify the durability/ordering guarantee first, then use an append or partitioned write path, batch where latency allows, and derive secondary views asynchronously. Partition keys must distribute load while preserving required per-aggregate order. I bound queues, expose consumer lag, make projections idempotent, and define replay/compaction/recovery. A financial journal and telemetry stream are both write-heavy but differ in loss and transaction constraints.
+
+### When to Introduce It
+
+Introduce the archetype after estimating records/bytes per second, index/replication amplification, and the percentage that can be asynchronously derived.
+
+### Common Follow-Ups
+
+- What does the write acknowledgment guarantee?
+- What key defines ordering and partition ownership?
+- How do retries avoid double effects?
+- What if one tenant is 40% of writes?
+- What happens during a consumer outage or replay?
+
+### Common Candidate Mistakes
+
+They add read replicas, omit backpressure/retention, claim a global ordering without a coordinator, or asynchronously defer a business invariant.
+
+## Summary
+
+Write-heavy designs optimize durable mutation throughput and recovery. Choose append/partition/batch behavior from durability, ordering, key skew, and latency; keep queues bounded and derived state replayable. The synchronous boundary is the key architectural decision.
+
+## Quiz Seeds
+
+1. Which costs contribute to write amplification beyond payload bytes?
+2. Why can a partitioned log still have a hot partition?
+3. What does an acknowledgment after append guarantee versus after projection?
+4. How does batching change failure/retry semantics?
+5. What state makes an at-least-once projection idempotent?
+6. When is telemetry sampling acceptable but financial-event sampling not?
+7. Why does an unbounded queue worsen recovery?
+8. How would you evolve a write-heavy design when a single tenant dominates?
+
+## Related Topics
+
+- [Partitioning and sharding](../04-databases/partitioning-and-sharding.mdx) handles ownership/skew.
+- [Backpressure](../06-messaging/backpressure.mdx) bounds producers and consumers.
+- [Batching and stream versus batch](../06-messaging/batching-and-stream-vs-batch.mdx) compares time/throughput choices.
+- [Event sourcing and CQRS](../07-distributed-coordination/event-sourcing-and-cqrs.mdx) explores append plus projections.
+
+## References
+
+### Documentation / Articles
+
+- [Apache Kafka design](https://kafka.apache.org/42/design/design/) — documents partitions, logs, retention, and consumer groups for high-throughput append workloads.
+- [Apache Cassandra write path](https://cassandra.apache.org/doc/stable/cassandra/architecture/storage-engine.html) — explains commit logs, memtables, SSTables, and compaction trade-offs.
+- [AWS Well-Architected buffering and batching](https://docs.aws.amazon.com/wellarchitected/latest/framework/rel_mitigate_interaction_failure_buffering.html) — frames buffering, batching, backpressure, and bounded failure behavior.
+- [Google Cloud Pub/Sub flow control](https://cloud.google.com/pubsub/docs/flow-control-messages) — provides an operational example of bounding producer/consumer pressure.

@@ -1,0 +1,176 @@
+---
+type: lesson
+id: 10-02-sessions-and-tokens
+slug: sessions-and-tokens
+title: Sessions and Tokens
+description: Compare server-held sessions, bearer access tokens, and refresh mechanisms by their state, storage, revocation, and compromise behavior.
+module: security
+order: 2
+difficulty: core
+estimatedMinutes: 30
+prerequisites:
+  - 10-01-authentication-and-authorization
+  - 02-01-request-lifecycle
+  - 08-01-timeouts
+tags:
+  - sessions
+  - tokens
+  - cookies
+  - revocation
+  - rotation
+  - bearer
+objectives:
+  - Compare opaque server sessions with self-contained access tokens.
+  - Define secure storage, expiry, renewal, logout, revocation, and rotation behavior.
+  - Distinguish access tokens, refresh tokens, session identifiers, and CSRF protections.
+  - Analyze compromise blast radius and availability trade-offs at scale.
+relatedLessons:
+  - 10-03-jwt-tradeoffs
+  - 10-04-oauth-and-oidc
+  - 10-01-authentication-and-authorization
+  - 10-07-secrets-management
+---
+
+# Sessions and Tokens
+
+> A session or token carries authenticated context across requests; the important design is where state lives, how it is protected, and how quickly compromised access can be revoked.
+
+## Why This Exists
+
+HTTP requests do not remember a login by themselves. The naive approach stores a user ID in a browser cookie or accepts a long-lived bearer string with no expiry. Anyone who steals it can impersonate the user, and the service cannot distinguish logout, key rotation, or a revoked account from normal use. A single globally shared server session store can fix revocation but becomes a latency and availability dependency.
+
+Sessions and tokens make the state explicit. An opaque session ID points to server-side state; a self-contained token carries signed claims that a service can verify locally; a short-lived access token plus refresh/session state limits repeated credential exposure. Every option must specify the browser or service storage boundary, transport protection, expiry, rotation, revocation, and behavior during a state-store outage.
+
+## Mental Model
+
+```text
+login → credential proof → session/token issued
+request → transport protection → session/token validation → AuthZ
+logout/compromise → revoke state/key/chain → future requests denied
+```
+
+An access token is meant for a resource server and should be short-lived and audience-restricted. A refresh token or session cookie is a more durable credential used to obtain/continue access and therefore needs stronger storage, rotation, and replay detection. A bearer token grants use to whoever possesses it; sender-constrained tokens add proof that the requester controls a bound key.
+
+## How It Works
+
+### Opaque server session
+
+The browser receives a random, high-entropy session ID in a `Secure`, `HttpOnly`, appropriately scoped cookie. The server stores subject, tenant, authentication strength, expiry, and revocation state in a session store. Requests look up the session and authorize operations locally. Logout deletes or revokes the record; account compromise can invalidate all sessions for a subject.
+
+### Self-contained access token
+
+The issuer signs claims such as subject, issuer, audience, issued-at, expiry, scope, and token ID. Resource services verify signature and claims without a per-request session lookup. Revocation is harder: shorten expiry, maintain a denylist for high-risk tokens, rotate signing keys with overlap, or use an introspection/revocation channel. A token is not encrypted merely because it is encoded; sensitive claims require an encryption or data-minimization decision.
+
+### Refresh and rotation
+
+A client exchanges a valid refresh credential for a new short-lived access token. Rotating refresh tokens means the old one is invalidated and a replay can signal compromise. Store refresh/session credentials in a boundary suited to the client: browser cookies with CSRF protection for a web session, protected platform storage for a native app, and a secret-handling channel for service clients. Never put durable credentials in URLs or ordinary logs.
+
+Token validation must be explicit: expected issuer and audience, permitted algorithms/keys, time claims with bounded clock skew, and scopes. Authentication state and authorization policy can change while a token remains valid; decide which high-risk actions require fresh state or step-up authentication.
+
+## Example
+
+A web dashboard uses a short-lived access token for API calls and an `HttpOnly`, `Secure`, same-site refresh/session cookie. The API checks issuer, audience, expiry, and scopes at the resource service. On refresh, the server rotates the refresh credential and records its family; reuse of an invalidated member revokes the family and asks the user to sign in again. Logout revokes the server-side refresh/session state; already issued access tokens remain usable only until their short expiry unless a risk-sensitive denylist applies.
+
+If the session store is unavailable, the service cannot blindly create a new session or treat an absent lookup as anonymous success. It should fail closed for sensitive operations, use a bounded read-only fallback only where explicitly safe, and alert on the store failure. A stolen access token cannot be made harmless by deleting a browser cookie; the server-side revocation or expiry policy must address it.
+
+## Visualization We Eventually Want
+
+Simulate login, request validation, expiry, logout, refresh rotation, stolen-token replay, session-store outage, and signing-key rotation. Let the learner choose opaque sessions versus self-contained access tokens, TTLs, denylist availability, cookie flags, and refresh storage. Display per-request lookup cost, revocation delay, active sessions, replay detection, and which requests remain authorized after compromise.
+
+## Scaling Behavior
+
+Opaque sessions require a shared or region-local store, connection capacity, replication, and failover. Sticky routing hides some latency but reduces balancing flexibility and does not remove the store’s correctness problem. Tokens reduce per-request state reads but increase verification CPU, key distribution, claim staleness, and revocation complexity. Large access tokens increase header size and can hit proxy limits.
+
+Global sessions need a decision about replication lag and logout visibility across regions. Self-contained tokens can validate locally in each region but may remain valid after an account is disabled. Shorter TTLs reduce exposure but increase refresh traffic and sensitivity to clock skew. Separate audience and signing keys reduce the blast radius of a compromised verifier.
+
+## Failure Modes
+
+- **Cookie theft:** missing `Secure`/`HttpOnly`/same-site protections or XSS exposes the session credential.
+- **Bearer replay:** a copied token works from another device until expiry/revocation.
+- **Session fixation:** an attacker-known session survives authentication instead of being rotated.
+- **Refresh replay:** a stolen refresh token is reused after rotation and goes undetected.
+- **Stale authorization:** token scopes outlive a role removal or tenant offboarding.
+- **Store outage:** session lookup failure causes a login storm or unsafe fail-open behavior.
+- **Key rotation gap:** services reject legitimate tokens or accept an old compromised key indefinitely.
+- **Credential leakage:** tokens appear in URLs, logs, traces, error messages, or analytics.
+
+## Trade-offs
+
+Server sessions give fast revocation and small client credentials but add stateful lookup and availability coupling. Self-contained tokens give scalable local verification and cross-service propagation but make revocation and claim freshness harder. Very short TTLs narrow compromise windows but increase refresh load and user friction. Cookies fit browser sessions with built-in transport flags; authorization headers are convenient for APIs but require deliberate storage and replay protection.
+
+## Alternatives
+
+- **Introspection endpoint:** centralizes current token/session state; adds network latency and an availability dependency.
+- **Opaque one-time capability:** narrow, expiring operation authorization; useful for downloads or invitations but dangerous if leaked.
+- **Mutual TLS/service credentials:** strong service identity and sender binding; operationally heavier for user sessions.
+- **Long-lived API keys:** simple for controlled integrations, but broad blast radius and poor user-level revocation.
+
+## When to Use
+
+Use server sessions when immediate revocation, browser login, and dynamic policy matter more than stateless scale. Use short-lived access tokens when many resource services need local verification and the issuer/key boundary is well managed. Pair durable credentials with rotation and compromise detection.
+
+## When Not to Use
+
+Do not make a browser cookie a self-contained authorization database, issue long-lived bearer tokens by default, or put sensitive data in token claims merely to avoid a lookup. Avoid custom token formats that lack clear validation and revocation semantics.
+
+## Common Misconceptions
+
+- **“Stateless tokens have no state.”** Issuance, keys, revocation, refresh chains, and policy still require state somewhere.
+- **“Deleting the cookie logs out everywhere.”** It removes one client copy; stolen tokens may remain valid.
+- **“JWT/access token/refresh token are synonyms.”** JWT is a format; access/refresh describe credential roles.
+- **“HttpOnly prevents all session theft.”** It reduces script access, but transport, CSRF, XSS, device compromise, and server leaks still matter.
+- **“Short expiry solves revocation.”** It bounds exposure but may be too slow for high-risk compromise.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I choose opaque sessions for easy revocation and dynamic state, or short-lived access tokens for local cross-service verification. Durable refresh/session credentials are protected and rotated; resource services validate issuer, audience, expiry, and scope. I state logout and compromise behavior, store credentials in an appropriate boundary, and account for session-store availability, token staleness, and key rotation.
+
+### When to Introduce It
+
+Introduce sessions/tokens after identifying clients, trust boundaries, and revocation requirements. Ask whether the API needs local verification or immediate central state.
+
+### Common Follow-Ups
+
+- What happens to a stolen token after logout?
+- How do you rotate refresh tokens and detect replay?
+- What if the session store is unavailable?
+- Why separate access and refresh credentials?
+
+### Common Candidate Mistakes
+
+- Treating JWT as a complete session/revocation design.
+- Storing durable tokens in local storage or URLs without a threat analysis.
+- Omitting session fixation and refresh replay.
+- Failing open when state lookup fails.
+
+## Summary
+
+Sessions and tokens carry identity across requests; their security comes from boundaries, expiry, storage, rotation, and revocation—not from a format name. Choose stateful or self-contained credentials based on latency, availability, policy freshness, and compromise response.
+
+## Quiz Seeds
+
+1. What is the primary revocation advantage of an opaque session?
+2. Why can a stolen access token survive browser logout?
+3. How does refresh-token rotation reveal replay?
+4. What claims must a resource service validate before authorization?
+5. Why does a self-contained token still require operational state?
+6. What should a high-risk service do if session lookup is unavailable?
+7. Which storage/transport protections matter for browser session cookies?
+
+## Related Topics
+
+- [Authentication and Authorization](./authentication-and-authorization.mdx)
+- [JWT Trade-offs](./jwt-tradeoffs.mdx)
+- [OAuth and OIDC](./oauth-and-oidc.mdx)
+- [Secrets Management](./secrets-management.mdx)
+
+## References
+
+### Documentation / Articles
+
+- [Session Management Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html) — covers session identifiers, cookie protections, fixation, timeout, and lifecycle.
+- [OAuth 2.0 Security Best Current Practice (RFC 9700)](https://www.rfc-editor.org/rfc/rfc9700.html) — recommends token restriction, refresh rotation, sender constraints, and secure redirect flows.
+- [OAuth 2.0 Bearer Token Usage (RFC 6750)](https://www.rfc-editor.org/rfc/rfc6750.html) — defines bearer-token transport and its replay threat model.
+- [Digital Identity Guidelines: Authentication and Lifecycle Management (SP 800-63B)](https://pages.nist.gov/800-63-4/sp800-63b.html) — provides current guidance on authenticators, sessions, and reauthentication.

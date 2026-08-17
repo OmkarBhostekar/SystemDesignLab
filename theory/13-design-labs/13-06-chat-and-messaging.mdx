@@ -1,0 +1,212 @@
+---
+type: lesson
+id: 13-06-chat-and-messaging
+slug: chat-and-messaging
+title: Chat and Messaging System
+description: Design persistent conversations with ordered history, delivery state, presence, reconnects, and fanout without promising impossible global order.
+module: design-labs
+order: 6
+difficulty: advanced
+estimatedMinutes: 60
+prerequisites:
+  - 00-03-estimation
+  - 00-04-interview-framework
+  - 02-06-realtime-transports
+  - 06-05-ordering
+  - 06-06-delivery-semantics
+  - 07-01-clocks-and-ordering
+tags:
+  - chat
+  - websockets
+  - ordering
+  - presence
+  - delivery-receipts
+objectives:
+  - Separate durable message history from ephemeral connection and presence state.
+  - Define ordering, delivery, read, retry, and reconnect semantics per conversation.
+  - Partition conversations and coordinate fanout without requiring global ordering.
+  - Explain backpressure, offline delivery, attachment boundaries, and abuse controls.
+relatedLessons:
+  - 02-06-realtime-transports
+  - 06-05-ordering
+  - 06-06-delivery-semantics
+  - 08-10-multi-region-and-region-failover
+visualizationId: null
+quizId: null
+---
+
+# Chat and Messaging System
+
+> Real-time transport is an acceleration layer; durable conversation state, sequence semantics, and reconnect recovery are the actual correctness contract.
+
+## Problem Statement
+
+Design one-to-one and small-group chat. Connected users should see new messages quickly; offline users should receive them on reconnect. The system supports send, edit/delete policy, read receipts, presence, typing indicators, attachments by reference, and multi-device sessions. Ask whether ordering is global, per conversation, or per sender, and whether end-to-end encryption is required; this lab assumes server-readable metadata but not necessarily message content encryption.
+
+## Functional Requirements (Scoped)
+
+- Create conversations and send messages with a client-generated idempotency key.
+- Persist message history and return a cursor for pagination/reconnect.
+- Deliver to connected devices over WebSocket or equivalent; queue offline delivery.
+- Expose delivery/read state and best-effort presence/typing signals.
+- Reconnect with a cursor so clients replay missed messages without gaps or duplicates.
+- Handle attachment metadata while storing bytes in object storage, not in the message row.
+
+Out of scope: arbitrary public channels, full-text search, voice/video media, and global message order across unrelated conversations.
+
+## Non-Functional Requirements and Priorities
+
+| Priority | Requirement | Working target / question |
+| --- | --- | --- |
+| P0 | Durability | Accepted messages survive a node failure and are replayable from a cursor. |
+| P0 | Per-conversation order | Define a monotonic sequence or ordering token; no silent reorder within the guarantee. |
+| P0 | Reconnect correctness | A client can resume after disconnect without missing or duplicating logical messages. |
+| P1 | Interactive latency | p95 connected delivery under 200 ms in-region under normal load. |
+| P1 | Presence freshness | Presence is explicitly approximate and expires after heartbeat/TTL. |
+| P2 | Cost/privacy | Retention, encryption, and multi-device fanout are policy-driven. |
+
+## Estimation Prompts and Checked Example
+
+Ask for DAU, concurrent connections, messages/user/day, group-size distribution, payload size, read/write ratio, regions, and reconnect burst. Example:
+
+- 20M DAU × 40 messages/day = 800M messages/day → `≈9,259 messages/s` average; 5× peak is `≈46k/s`.
+- 5M simultaneous devices with one 8 KB message fanout to 2 devices average gives about `92k logical deliveries/s` at peak; network egress is `≈736 MB/s` payload (`92k × 8 KB`), before framing/TLS.
+- If each WebSocket connection needs 32 KB memory, 5M connections require `≈160 GB` across gateway processes before kernel buffers and headroom. This drives connection sharding and regional placement.
+- At 150 ms message-store service time and 46k writes/s, average in-flight write work is `≈6,900` (`46k × 0.15`).
+
+Sensitivity prompts: How large can groups get? Is history retained forever? Is delivery-to-all-devices required? What reconnect storm follows a regional restart?
+
+## API Design
+
+```http
+POST /v1/conversations/{conversationId}/messages
+Idempotency-Key: msg-deviceA-00042
+{
+  "clientMessageId":"deviceA-00042","body":"hello",
+  "attachmentIds":[]
+}
+```
+
+Return `201 {messageId, conversationSeq, createdAt}` after durable append. Repeating the same `(senderDevice, clientMessageId)` returns the original message; a conflicting body returns `409`. `GET /messages?after=cursor&limit=...` is cursor-based; cursor expiry returns `410 CursorExpired` with a fresh snapshot path. `POST /read-receipts` is idempotent and monotonic by sequence.
+
+WebSocket frames carry `connectionId`, conversation sequence, and ack cursor. A stale/auth-invalid cursor returns `401/403`; malformed frames `400`; server backpressure may close with a documented retryable code. A lost send response is resolved by idempotency lookup, not another logical message. Provider/device push fallback is asynchronous and uses the notification lab's semantics.
+
+## Data Model, Access Paths, and Ownership
+
+```text
+conversations(conversation_id PK, type, participants_version, created_at)
+messages(conversation_id, conversation_seq, message_id, sender_id,
+         client_message_id, body_ref, state, created_at,
+         PRIMARY KEY(conversation_id, conversation_seq),
+         UNIQUE(sender_device_id, client_message_id))
+device_cursors(user_id, device_id, conversation_id, delivered_seq, read_seq)
+presence(user_id, device_id, region, connection_id, expires_at)
+```
+
+The conversation service owns membership, message ordering, and history. Connection gateways own sockets and ephemeral subscriptions; presence has TTL and is not a durable user fact. A partition/actor can own one conversation's sequencer, or a database conditional counter can allocate `conversation_seq`. Attachment bytes belong to object storage with an ACL reference.
+
+## Progressive Architecture: Naive → Bottleneck → Improvement → New Trade-off
+
+1. **Naive:** clients poll a relational message table. It is durable and simple, but frequent polling wastes work and offline/realtime latency is poor.
+2. **Bottleneck/failure:** add WebSocket gateways and broadcast each message synchronously to every device. Gateway memory, reconnect storms, large groups, and a slow device block the send path; a gateway restart loses only ephemeral sockets but may lose delivery state if it is not durable.
+3. **Improvement:** append durably by conversation, publish an event, fan out to connection gateways through a broker, persist device cursors, and replay from a history cursor after reconnect. Isolate presence/typing into TTL pub/sub.
+4. **New trade-off:** event fanout and cursor state are eventually consistent; a message can be durable before every device sees it, and group hot spots need special ownership. Per-conversation ordering may require a single sequencer/partition and limits write parallelism for hot rooms.
+
+Reference architecture:
+
+```text
+Client ↔ regional connection gateway ↔ subscription/pubsub
+  └→ Message API → conversation store/log → fanout workers → gateways
+                                  ├→ device cursor/inbox
+                                  └→ notification fallback / attachment store
+```
+
+The durable log/store defines replay; gateways are disposable accelerators. A conversation's event key preserves local order; unrelated conversations may interleave freely.
+
+## Bottlenecks and Concurrency / Consistency
+
+Hot groups, gateway connection memory/file descriptors, broker fanout, sequence allocation, reconnect spikes, and history pagination are limits. Allocate one sequence per conversation via a partition owner or transactional conditional increment; never use client timestamps as authoritative order. Deduplicate sends with the client key before emitting fanout. Delivery and read receipts are monotonic (`max(previous, receivedSeq)`), while presence is last-write/TTL best effort. A membership change needs a version so a stale gateway cannot deliver to a removed participant.
+
+## Failure Analysis
+
+- **Gateway crash:** clients reconnect with last cursor; durable history fills the gap.
+- **Broker lag:** messages remain durable but interactive delivery latency rises; bound backlog and surface queued status.
+- **Duplicate fanout:** device sequence/cursor deduplicates frames.
+- **Slow device:** per-connection buffers are bounded; disconnect and replay later instead of blocking a conversation.
+- **Region loss:** route reconnects to another region; decide whether the conversation owner fails over or temporarily accepts read-only traffic.
+- **Out-of-order cross-region writes:** reject/redirect to the owning sequencer, or expose a weaker per-sender order explicitly.
+
+## Security
+
+Authenticate every socket and authorize membership at send, subscribe, and history read. Rotate tokens and close sockets on revocation; limit group size, message rate, attachment type/size, and abuse reports. Encrypt transport and stored content; if E2EE is required, make search/moderation/server-side fanout guarantees explicit limitations. Do not leak presence or message metadata across tenants; redact message bodies from logs and verify attachment signed URLs.
+
+## Observability
+
+Measure active connections, reconnect rate, heartbeat expiry, send/durable-append latency, interactive delivery p50/p95/p99, fanout queue age, per-conversation hotness, sequence conflicts, duplicate sends/frames, cursor replay size, offline backlog, gateway buffer drops, and regional failover time. Trace a message ID from API append to device ack; sample body-free spans only. Alert on gap/replay failures and reconnect storms, not merely connection count.
+
+## Explicit Trade-offs and Alternatives
+
+- **Polling vs WebSocket/SSE:** polling is simpler and firewall-friendly but wasteful; persistent transport lowers latency but needs connection lifecycle and reconnect design.
+- **Single conversation sequencer vs timestamp order:** sequencer gives deterministic order but hot-room serialization; timestamps are cheap but not a consistency guarantee.
+- **Push fanout vs pull history:** push improves online UX but stores fanout/cursors; pull reduces writes but increases reconnect/read load.
+- **Durable inbox vs ephemeral gateway delivery:** inbox enables replay/offline, at cost of storage and GC.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+“I append each message durably under a per-conversation sequence and use WebSocket gateways only for low-latency delivery. Events are at-least-once, so device cursors and client message IDs make sends and frames idempotent; reconnect is a cursor replay, not a best-effort resubscribe. Presence is TTL-based and approximate, while membership and history are authoritative. I would ask whether order is per conversation and how large groups can become.”
+
+### When to Introduce It
+
+Introduce persistent connections when latency and online fanout justify them; introduce a durable log/cursor when reconnect or offline delivery must be correct. Add a per-conversation sequencer only when the ordering requirement demands it.
+
+### Common Follow-Ups
+
+- How does reconnect avoid a missing message?
+- What if a client sends twice after a timeout?
+- How do you handle a 100k-member group?
+- What does presence mean after a gateway partition?
+
+### Common Candidate Mistakes
+
+Calling WebSockets durable storage, using timestamps as strict order, letting slow connections block a send, and claiming “delivered” when only a gateway accepted a frame.
+
+## Summary
+
+Keep durable conversation history and ephemeral transport state separate. Define order and receipt boundaries, use cursors/idempotency for reconnect and retries, and isolate hot groups and presence from the message commit path.
+
+## Quiz Seeds
+
+1. Why is a WebSocket not a message store?
+2. Which key deduplicates a client send after a lost response?
+3. How does a cursor prevent gaps after reconnect?
+4. Why can global message ordering be unnecessary and expensive?
+5. What happens to presence during a gateway partition?
+6. Which resource dominates 5M persistent connections?
+7. How would you keep a slow device from blocking a hot group?
+8. Why must read receipts be monotonic?
+
+## Related Topics
+
+- [Real-time transports](../02-networking/realtime-transports.mdx) — WebSocket/SSE/polling choices.
+- [Ordering](../06-messaging/ordering.mdx) — sequence and partition semantics.
+- [Delivery semantics](../06-messaging/delivery-semantics.mdx) — durable/replay guarantees.
+- [Multi-region failover](../08-reliability/multi-region-and-region-failover.mdx) — reconnect and ownership trade-offs.
+
+## References
+
+### Documentation / Articles
+
+- [RFC 6455: The WebSocket Protocol](https://www.rfc-editor.org/rfc/rfc6455.html) — defines the transport handshake/framing boundary; it does not provide durable message semantics.
+- [MDN WebSocket API](https://developer.mozilla.org/en-US/docs/Web/API/WebSocket) — documents browser lifecycle/backpressure caveats relevant to client behavior.
+- [Redis Pub/Sub](https://redis.io/docs/latest/develop/pubsub/) — illustrates ephemeral fanout semantics and why durable replay needs a different mechanism.
+- [NATS JetStream consumers](https://docs.nats.io/nats-concepts/jetstream/consumers) — provides a durable cursor/ack model for comparison with gateway delivery.
+
+### Papers
+
+- [Kafka: a Distributed Messaging System for Log Processing](https://notes.stephenholiday.com/Kafka.pdf) — grounds partitioned append logs and consumer offsets for durable replay.
+
+## Future Visualization / Workspace Spec
+
+Simulate clients, gateways, one hot conversation, a durable append log, fanout, reconnect cursors, presence TTL, and a slow device. Controls should inject gateway crash, broker lag, duplicate send, out-of-order arrival, large-group skew, and region failover. Show conversation sequence, client cursor, duplicate suppression, connection memory, queue age, and “durable/delivered/read” state separately. The workspace should support Client, Gateway, Conversation Owner, Log/DB, Pub/Sub, Presence, and Notification nodes with labeled order/consistency claims.

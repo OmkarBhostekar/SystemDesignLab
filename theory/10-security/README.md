@@ -1,6 +1,6 @@
 # Module 10 — Security for System Design
 
-**Status:** Scaffold only. Architecture-focused security lessons are not yet authored.
+**Status:** Theory complete (9/9 lessons). Interactive visualizations, structured quizzes, and application wiring remain future work.
 
 ## Purpose
 
@@ -38,5 +38,4 @@ Authentication, authorization, sessions/tokens, JWT trade-offs, TLS, secrets, an
 
 ## Authoring boundary
 
-This scaffold does not endorse a particular identity product or token format. Future content must state the threat model, trust boundary, compromise/revocation behavior, and operational trade-offs for each choice.
-
+The nine canonical lessons stay architecture-focused and vendor-independent: each states threat assumptions, trust boundaries, compromise/revocation behavior, and operational trade-offs. Interactive visualizations and structured quizzes remain future work; the Markdown lessons are the current source of truth.

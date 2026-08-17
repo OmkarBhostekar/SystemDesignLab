@@ -1,0 +1,176 @@
+---
+type: lesson
+id: 09-04-sli-slo-and-sla
+slug: sli-slo-and-sla
+title: SLI, SLO, and SLA
+description: Turn user expectations into measured indicators, internal reliability objectives, and explicit external commitments.
+module: observability
+order: 4
+difficulty: core
+estimatedMinutes: 30
+prerequisites:
+  - 09-03-golden-signals
+  - 01-05-availability
+  - 01-06-reliability
+  - 00-02-requirements
+tags:
+  - sli
+  - slo
+  - sla
+  - reliability
+  - objectives
+objectives:
+  - Distinguish an SLI measurement from an SLO target and an SLA commitment.
+  - Define event, good-event, window, and eligibility rules for a user-facing SLI.
+  - Calculate an error budget and explain why 100% objectives are usually counterproductive.
+  - Connect SLO misses to product, capacity, and reliability decisions without hiding scope.
+relatedLessons:
+  - 09-05-error-budgets
+  - 09-06-alerting
+  - 09-03-golden-signals
+  - 01-04-percentiles-tail-latency
+---
+
+# SLI, SLO, and SLA
+
+> An SLI measures a user-relevant behavior, an SLO sets the target for that measurement, and an SLA is an externally negotiated consequence when the service misses a commitment.
+
+## Why This Exists
+
+“The service is reliable” is not a design requirement. A team can report 99.99% host uptime while users see failed checkouts, slow searches, or jobs that complete hours late. The naive design monitors whatever is easiest to collect and calls its best number an availability guarantee. It fails because the metric boundary, denominator, and consequence are unclear.
+
+SLIs, SLOs, and SLAs create a shared language. The indicator is evidence, the objective is an engineering target, and the agreement is a customer/business commitment that may include credits or other remedies. A good objective is intentionally measurable and tied to a decision; it is not a promise that every request is perfect.
+
+## Mental Model
+
+```text
+user journey → define events and good events → SLI = good / eligible
+                                      target → SLO = SLI ≥ target
+                                      contract → SLA = commitment + consequence
+```
+
+For an availability SLI, define eligible requests and good responses. For a latency SLI, define a threshold and measure the fraction under it. For a queue, define whether the message is delivered or completed within a freshness window. The same system may have separate objectives for interactive reads, writes, and background processing.
+
+An SLO is not simply a dashboard line. Its window (rolling 28 days, calendar month, or another period), aggregation, exclusions, and ownership determine what behavior counts. The source of measurement should be trusted and as close to the user boundary as practical, while avoiding client populations that cannot produce stable evidence without explanation.
+
+## How It Works
+
+1. Start with a user journey and requirement: “a checkout request returns a valid confirmation within 2 seconds.”
+2. Define events, good events, eligibility, and the measurement boundary. Decide how cancellations, invalid input, retries, and planned maintenance are classified.
+3. Choose a target that balances user value, cost, and achievable capacity. A latency SLO may be “99% of eligible requests under 2 s,” not “average under 2 s.”
+4. Compute the SLI from complete counters or distributions and publish the numerator, denominator, window, and exclusions.
+5. Use the SLO to guide alerts, rollout policy, capacity, and investment. Keep the SLA separate if it has legal or financial consequences.
+
+An error budget is `1 - SLO` for the relevant good-event proportion. A 99.9% monthly availability objective permits 0.1% of eligible time/events to be bad—about 43.2 minutes in a 30-day illustrative month, before deciding which exclusions apply. A 99% latency objective permits 1% of eligible requests above the threshold. The arithmetic is simple; the classification is the design work.
+
+## Example
+
+For a file-sync API, define two objectives:
+
+| Journey | SLI | Illustrative SLO | Decision it informs |
+| --- | --- | --- | --- |
+| Upload accepted | eligible uploads with durable acknowledgement / eligible uploads | 99.9% in 28 days | storage durability and API capacity |
+| File visible | uploads visible in all required indexes within 60 s / eligible uploads | 99% per rolling week | indexing workers and queue capacity |
+
+The SLA for an enterprise plan may promise 99.5% upload availability and service credits, while the internal SLO is 99.9% to leave room for operational risk. A failed client request due to malformed input is excluded from the availability denominator only if the contract clearly defines it as ineligible; silently excluding all 4xx responses to make the number look good destroys trust.
+
+## Visualization We Eventually Want
+
+Let the learner define event and good-event filters, latency thresholds, eligibility exclusions, and a rolling window over a stream of request outcomes. Plot SLI, SLO line, consumed budget, and SLA consequences. Presets should show a latency regression with unchanged availability, an async freshness miss, and a denominator bug that makes an SLO appear healthy. A control should switch measurement from server to synthetic user boundary and reveal differing results.
+
+## Scaling Behavior
+
+Large fleets need consistent instrumentation and aggregation across regions, versions, tenants, and workload classes. A single global SLO can hide a small region or tier that fails completely; segment when user impact or contract differs, then avoid inventing dozens of objectives that no team can act on. At high request volume, counters and histograms are more economical than storing every event, but sampling must not change the denominator without a documented estimator.
+
+Asynchronous systems need an explicit clock: time-to-accept, time-to-start, time-to-complete, and freshness are different indicators. A service can meet an HTTP acceptance SLO while violating the user's completion promise. Multi-region services may need region-specific objectives plus a global customer objective that reflects failover behavior.
+
+## Failure Modes
+
+- **Server-only measurement:** edge timeouts, DNS failures, and client-visible errors disappear.
+- **Denominator manipulation:** exclude difficult requests or retries without a stable policy.
+- **Average latency objective:** hides a small population of timeouts and tail harm.
+- **One SLO for unlike workloads:** batch and interactive users receive an unusable average.
+- **SLA mistaken for SLO:** an external credit contract dictates an engineering target too directly or too late.
+- **Unmeasured business correctness:** a 200 response is counted good even when the order was not applied.
+- **Objective overload:** dozens of SLOs create alert fatigue and no prioritization.
+
+## Trade-offs
+
+Stricter objectives improve predictability but require redundancy, headroom, testing, and operating cost. Loose objectives permit faster iteration but may hide real user harm. Client-side measurement is user-centric but noisy and affected by environment; server-side measurement is controlled but can miss network and edge failures. Exclusions make an objective interpretable only when they are explicit; broad exclusions make it meaningless.
+
+## Alternatives
+
+- **Availability-only target:** adequate for a simple internal endpoint, insufficient for latency-sensitive or async journeys.
+- **Raw uptime:** useful for infrastructure capacity reporting, not a complete user SLI.
+- **Business KPI alone:** captures outcomes such as orders completed but may react too slowly to operational damage.
+- **Per-request guarantees:** useful for a tightly bounded API, but often expensive and harder to reason about than a population objective.
+
+## When to Use
+
+Use SLOs when a service has multiple stakeholders, a meaningful reliability trade-off, or a need to prioritize releases and capacity. Start with one or two user journeys and define their event semantics before adding dashboards.
+
+## When Not to Use
+
+Do not promise precision the measurement cannot support. A prototype or one-off script may use a simple success count. Do not define an SLA before the service can measure the behavior consistently and explain its operational response.
+
+## Common Misconceptions
+
+- **“SLO means uptime.”** It can measure latency, freshness, correctness, durability, or another user-relevant behavior.
+- **“SLA and SLO are synonyms.”** An SLA is an external commitment with consequences; an SLO is an internal operating target.
+- **“99.99% is always better than 99.9%.”** The extra reliability may cost more than users value and leave no room for safe change.
+- **“A 200 is a good event.”** The business result must satisfy the contract, not just the transport status.
+- **“One global number proves fairness.”** Region, tenant, or workload segmentation may be required to expose harm.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I begin with a user journey, define eligible and good events, then measure an SLI at the right boundary. An SLO sets a target over an explicit window, while an SLA is an external commitment and consequence. I use the resulting error budget to prioritize releases and reliability work, keep async completion and tail latency visible, and avoid denominator exclusions that make the number look healthy.
+
+### When to Introduce It
+
+Introduce SLOs when the design discussion reaches “how reliable or fast must it be?” or when teams need a data-driven release/capacity policy.
+
+### Common Follow-Ups
+
+- What is the SLI denominator and what is excluded?
+- How would you measure an asynchronous completion promise?
+- Why not set a 100% SLO?
+- How do an SLA and internal SLO differ for enterprise customers?
+
+### Common Candidate Mistakes
+
+- Quoting “five nines” without a user journey.
+- Measuring only server uptime.
+- Ignoring p99 or freshness in favor of averages.
+- Treating every 4xx response as either automatically good or bad.
+
+## Summary
+
+Define the user behavior first. An SLI is the measurement, an SLO is its target and window, and an SLA is an external commitment with consequences. State denominators, exclusions, async completion, and tail behavior explicitly; then use the objective to drive engineering decisions.
+
+## Quiz Seeds
+
+1. What must be defined before calculating an availability SLI?
+2. How much illustrative downtime does a 99.9% monthly objective allow in 30 days?
+3. Why can a server-side SLI overstate user availability?
+4. Give an SLI for a job that must complete within 60 seconds.
+5. Why is an SLA not simply a stricter SLO?
+6. How can excluding all 4xx responses hide a product failure?
+7. When should one service have separate objectives for interactive and batch traffic?
+
+## Related Topics
+
+- [Golden Signals](./golden-signals.mdx)
+- [Error Budgets](./error-budgets.mdx)
+- [Actionable Alerting](./alerting.mdx)
+- [Availability](../01-foundations/availability.mdx)
+
+## References
+
+### Documentation / Articles
+
+- [Service Level Objectives](https://sre.google/sre-book/service-level-objectives/) — defines SLIs, SLOs, SLAs, error budgets, and user-oriented measurement.
+- [Implementing SLOs](https://sre.google/workbook/implementing-slos/) — gives practical guidance for selecting indicators, targets, and policy.
+- [Observability primer](https://opentelemetry.io/docs/concepts/observability-primer/) — distinguishes reliability, SLIs, and user-facing behavior.
+- [Service Level Terminology](https://www.rfc-editor.org/rfc/rfc2330.html) — provides an IETF framework for service performance measurement terminology.

@@ -1,0 +1,209 @@
+---
+type: lesson
+id: 13-19-ride-hailing-and-nearby-drivers
+slug: ride-hailing-and-nearby-drivers
+title: Ride-Hailing and Nearby Drivers
+description: Design regional location ingestion, geospatial lookup, dispatch, real-time state, pricing, and failure recovery for a ride request.
+module: design-labs
+order: 19
+difficulty: deep-dive
+estimatedMinutes: 85
+prerequisites:
+  - 00-03-estimation
+  - 00-04-interview-framework
+  - 02-06-realtime-transports
+  - 04-09-partitioning-and-sharding
+  - 06-03-pub-sub-and-topics
+  - 07-01-clocks-and-ordering
+  - 08-02-retries
+  - 08-10-multi-region-and-region-failover
+tags:
+  - ride-hailing
+  - geospatial
+  - dispatch
+  - realtime
+  - regional-failover
+objectives:
+  - Separate high-rate ephemeral location/presence from durable trip and payment state.
+  - Design geospatial candidate lookup, reservation/dispatch leases, and rider/driver updates.
+  - Estimate location bandwidth, grid load, dispatch latency, and reconnect/failover bursts.
+  - Make stale location, duplicate assignment, safety, privacy, and regional failure explicit.
+relatedLessons:
+  - 02-06-realtime-transports
+  - 04-09-partitioning-and-sharding
+  - 06-03-pub-sub-and-topics
+  - 07-01-clocks-and-ordering
+  - 08-10-multi-region-and-region-failover
+visualizationId: null
+quizId: null
+---
+
+# Ride-Hailing and Nearby Drivers
+
+> Dispatch combines ephemeral geospatial state with a durable trip state machine: stale location is acceptable, double assignment is not.
+
+## Problem Statement
+
+Design a ride-hailing backend where drivers send location/availability updates, riders request a trip, the service finds nearby eligible drivers, offers a ride, and tracks the trip in real time. Regions may fail; devices disconnect; GPS updates can arrive late or out of order. Pricing, safety, payment, and maps are separate boundaries. Ask whether dispatch optimizes ETA, price, vehicle class, or fairness; this lab assumes a regional nearest/eligible candidate policy.
+
+## Functional Requirements (Scoped)
+
+- Driver go-online/offline, heartbeat, location update, and availability state.
+- Rider quote/request/cancel and durable trip lifecycle (`requested → offered → accepted → arriving → in_progress → completed`).
+- Search nearby eligible drivers and send an offer with an expiry/lease.
+- Stream rider/driver trip updates; recover from reconnect with a trip cursor/snapshot.
+- Record trip events, pricing/payment handoff, safety/admin controls, and reconciliation.
+
+Out of scope: full map routing, surge ML, autonomous dispatch optimization, and global exact nearest-neighbor ordering.
+
+## Non-Functional Requirements and Priorities
+
+| Priority | Requirement | Working target / question |
+| --- | --- | --- |
+| P0 | No double assignment | One driver/trip offer can be accepted once under a fencing/lease rule. |
+| P0 | Safety/privacy | Location is authorized, minimized, and not exposed after trip/consent bounds. |
+| P0 | Trip durability | Durable state/events survive gateway/region failure and are auditable. |
+| P1 | Dispatch latency | p95 candidate/offer decision under 500 ms in a healthy region. |
+| P1 | Location freshness | Candidate lookup rejects location older than a configured threshold. |
+| P2 | Regional resilience | Reconnect/read-only/failover policy is explicit for active trips. |
+
+## Estimation Prompts and Checked Example
+
+Ask for online drivers, rider/driver location interval, update size, ride requests, grid density, candidate radius, and regional failure rate. Example:
+
+- 1M online drivers × one 2 KB location update every 5 s = `200k updates/s`; payload ingress is `≈400 MB/s ≈3.2 Gb/s` before protocol/encryption.
+- 100k ride requests/hour → `≈28 requests/s`; a 10× event peak is `≈278/s`. If each request fans out to 10 candidates, offers are `≈2,780/s` peak.
+- A 5-minute location TTL for 1M drivers retains at most 1M current records; 10 historical points/driver would be 20M KB-scale records, so history belongs in a separate stream/store.
+- If dispatch takes 300 ms and 278 requests/s peak, about `83` requests are in-flight (`278 × 0.3`); candidate RPC fanout and offer expiries add work.
+
+## API Design
+
+```http
+POST /v1/drivers/{id}/locations
+{"lat":19.076,"lon":72.877,"accuracyM":8,"observedAt":"...","seq":441}
+```
+
+Location updates are idempotent by `(driverId, sessionId, seq)`; older sequence/timestamp updates are ignored, not applied backward. `POST /v1/rides` with an idempotency key creates one trip/quote. `POST /rides/{id}:accept` requires an offer ID/fencing token and returns `409 OfferExpiredOrTaken` for a race. `GET /rides/{id}` and `GET /rides/{id}/events?cursor=` support reconnect; expired cursor returns a snapshot.
+
+Return `400` for invalid coordinates/time, `401/403` for identity/scope, `409` for state/offer conflicts, `429` for location/ride abuse, and `503` when no regional dispatch owner can make a safe decision. A timed-out accept is resolved by trip/offer status, not a new accept key. Driver heartbeat expiry marks location unavailable; it does not silently complete a trip.
+
+## Data Model, Access Paths, and Ownership
+
+```text
+drivers(driver_id PK, status, vehicle_class, region, session_id, version)
+driver_presence(driver_id PK, cell_id, lat/lon, observed_seq, expires_at, lease)
+trips(trip_id PK, rider_id, driver_id, state, region, quote_version, version)
+offers(offer_id PK, trip_id, driver_id, state, fencing_token, expires_at)
+trip_events(trip_id, seq, event_id, type, actor, observed_at,
+            PRIMARY KEY(trip_id, seq))
+```
+
+The presence/geospatial service owns ephemeral latest location and cell membership; trip service owns durable state/events; dispatch owns offers/leases; payment/safety own their workflows. A spatial index (geohash/H3/S2-like cells) finds candidates, then authoritative presence/eligibility filters stale/offline drivers. Historical location is a privacy-controlled analytics stream, not the live lookup store.
+
+## Progressive Architecture: Naive → Bottleneck → Improvement → New Trade-off
+
+1. **Naive:** poll a relational table for all nearby drivers on each ride request and send a synchronous offer. Location writes and spatial scans overload the database; concurrent riders can offer the same driver.
+2. **Bottleneck/failure:** add a geospatial index and WebSockets, but treat index membership as current and accept offers without a lease. Stale GPS and gateway races create impossible ETAs/double assignments.
+3. **Improvement:** ingest location into regional cell shards with TTL/sequence, use pub/sub for updates, select candidates from a local index, and reserve driver/trip with a short fencing lease before sending an offer. Persist trip events and replay on reconnect.
+4. **New trade-off:** cell indexes are eventually fresh and may miss a nearby driver; leases/dispatch retries add latency and can leave a driver temporarily unavailable. Strong durable trip state is prioritized over perfect location freshness.
+
+Reference architecture:
+
+```text
+Driver devices → regional location gateway → cell/presence shards (TTL)
+Rider → Trip API → dispatch/candidate service → offer lease + pub/sub → driver
+                         └→ trip DB/event log → rider/driver gateways → payment/safety
+```
+
+The region owns active dispatch for a cell/trip; failover fences the old owner before reassignment.
+
+## Bottlenecks and Concurrency / Consistency
+
+Location ingress, hot cells/stadiums, candidate RPC fanout, offer/accept races, gateway connections, trip event ordering, and region failover dominate. Presence updates are last-sequence-wins with TTL and bounded clock skew; trip events are durable per-trip ordered transitions. Accept atomically claims an offer/driver with fencing token and trip version. A stale location may be excluded; it must never be treated as available merely because a cache says so. Pricing/ETA snapshots carry versions and may be recomputed.
+
+## Failure Analysis
+
+- **Location gateway outage:** devices reconnect/route region; dispatch uses only fresh presence and degrades candidate radius.
+- **Stale/out-of-order GPS:** sequence/session/observed time filters; expose freshness and accuracy.
+- **Two riders offer same driver:** atomic offer/driver lease returns one winner; loser retries candidates.
+- **Driver accepts but response lost:** trip/offer status lookup and idempotent transition show the winner.
+- **Hot cell:** adaptive cell subdivision, per-cell quotas, bounded candidate fanout, and queueing.
+- **Trip gateway crash:** event cursor/snapshot restores view; durable trip state continues.
+- **Region loss:** fence old dispatch epoch, select a new regional owner, preserve active-trip read/communications, and reconcile duplicate offers.
+- **Payment/maps outage:** trip can be pending/completed with explicit provider status; do not mutate trip from guessed result.
+
+## Security
+
+Authenticate device sessions, bind driver/rider identity, and authorize location/trip visibility by relationship and consent. Encrypt location in transit/at rest, retain precise history minimally, and expose coarse/blurred data to analytics. Protect dispatch/admin APIs, rate-limit fake GPS/location floods and ride abuse, verify payment/safety webhooks, and audit state overrides. Prevent tenant/operator cross-region location leakage.
+
+## Observability
+
+Track location QPS/bytes/freshness/sequence drops, online driver count, cell skew, candidate count/latency, offer acceptance/expiry/conflict, dispatch queue age, trip state age, gateway connections/reconnects, event gaps, failover epoch, ETA/quote version, and privacy/access denials. Trace trip/offer/driver session IDs without raw coordinates in high-cardinality labels; sample geospatial spans. Alert on double-assignment invariant, stale-location spike, hot cells, and failover fencing lag.
+
+## Explicit Trade-offs and Alternatives
+
+- **Polling DB vs geospatial index:** polling is simple but cannot handle location rate; index is fast but eventually fresh.
+- **Push offer vs pull matching:** push lowers match latency but needs lease/fanout; pull can be simpler but wastes candidate polling.
+- **Single regional owner vs active-active dispatch:** single owner simplifies assignment; active-active lowers failover latency but needs fencing/conflict resolution.
+- **Exact route ETA vs cell distance:** exact routes improve quality but add provider latency/cost; coarse distance is resilient and can be refined after match.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+“I keep latest driver location in regional TTL cell shards and durable trip state/events in a trip service. Dispatch uses fresh candidates, then atomically claims a driver/trip offer with a short fencing lease before push; accept is idempotent and race-safe. WebSockets/presence are ephemeral, so reconnect uses event cursors/snapshots. A regional owner/epoch prevents duplicate assignment, while location freshness and privacy are explicit.”
+
+### When to Introduce It
+
+Introduce spatial indexing when location updates/nearby queries dominate, and leases when multiple riders can target one driver. Introduce durable event/cursor state for active-trip recovery, not for every transient GPS point.
+
+### Common Follow-Ups
+
+- How do you prevent double assignment?
+- What if the driver's location is 30 seconds old?
+- How do drivers reconnect after a region failure?
+- Which data is ephemeral versus durable?
+
+### Common Candidate Mistakes
+
+Treating the spatial index as truth, storing every GPS point in the trip transaction, accepting without a fencing token, and exposing precise location after the relationship ends.
+
+## Summary
+
+Use TTL/sequence-based presence for fast approximate lookup and durable versioned trip state for correctness. Claim assignment atomically, make reconnect/retry safe, isolate hot cells, and fence regional owners before failover.
+
+## Quiz Seeds
+
+1. Calculate location ingress for 1M drivers updating every 5 seconds at 2 KB.
+2. Why is latest location not a durable trip fact?
+3. What does an offer fencing token protect?
+4. How should an out-of-order location update be handled?
+5. Why can a hot stadium cell overload a spatial shard?
+6. What is the reconnect source of truth for a trip?
+7. What does a regional epoch prevent during failover?
+8. Which privacy policy applies to historical GPS versus live dispatch?
+
+## Related Topics
+
+- [Real-time transports](../02-networking/realtime-transports.mdx) — socket/update delivery.
+- [Partitioning and sharding](../04-databases/partitioning-and-sharding.mdx) — cells/regions/skew.
+- [Pub/sub and topics](../06-messaging/pub-sub-and-topics.mdx) — fanout of ephemeral updates.
+- [Clocks and ordering](../07-distributed-coordination/clocks-and-ordering.mdx) — sequence/timestamp limits.
+- [Multi-region failover](../08-reliability/multi-region-and-region-failover.mdx) — ownership/fencing.
+
+## References
+
+### Documentation / Articles
+
+- [H3: A Hexagonal Hierarchical Geospatial Indexing System](https://h3geo.org/docs/) — documents a production geospatial cell/index model and hierarchy.
+- [RFC 6455: WebSocket Protocol](https://www.rfc-editor.org/rfc/rfc6455.html) — grounds persistent driver/rider update transport boundaries.
+- [PostGIS spatial indexing](https://postgis.net/workshops/postgis-intro/indexing.html) — explains spatial index access paths and bounding-box filtering.
+- [Google SRE: Handling Overload](https://sre.google/sre-book/handling-overload/) — supports hot-cell isolation and overload shedding.
+
+### Papers
+
+- [S2 Geometry: An Engineering Approach to Geometric Computing](https://s2geometry.io/devguide/s2cell_hierarchy) — provides an alternative hierarchical cell model and trade-offs.
+
+## Future Visualization / Workspace Spec
+
+Simulate driver GPS updates, TTL/sequence filtering, cell shards, rider requests, candidate search, offer lease/accept races, reconnect cursors, hot-cell skew, and regional failover. Controls should vary update interval, stale threshold, cell size, candidate radius, dispatch latency, duplicate accepts, gateway loss, and epoch fencing. Show location freshness, cell load, candidate latency, offer states, double-assignment attempts, trip event order, active sockets, and failover state. Workspace nodes should include Driver, Location Gateway, Cell Index, Trip Service, Dispatch, Pub/Sub, Rider/Driver Gateway, and Payment/Safety.

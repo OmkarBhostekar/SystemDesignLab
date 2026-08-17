@@ -1,0 +1,173 @@
+---
+type: lesson
+id: 09-05-error-budgets
+slug: error-budgets
+title: Error Budgets
+description: Convert an SLO’s allowed unreliability into a measurable burn rate and a shared policy for releases, risk, and recovery work.
+module: observability
+order: 5
+difficulty: advanced
+estimatedMinutes: 30
+prerequisites:
+  - 09-04-sli-slo-and-sla
+  - 08-07-load-shedding-and-graceful-degradation
+  - 08-10-multi-region-and-region-failover
+tags:
+  - error-budgets
+  - burn-rate
+  - slo
+  - release-policy
+  - risk
+objectives:
+  - Calculate budget remaining and burn rate from an SLO and observed bad events.
+  - Use short and long windows to distinguish fast incidents from slow budget erosion.
+  - Design release and operational policies that consume budget intentionally.
+  - Explain why budgets require trustworthy measurement, ownership, and a recovery path.
+relatedLessons:
+  - 09-04-sli-slo-and-sla
+  - 09-06-alerting
+  - 08-08-disaster-recovery
+  - 08-10-multi-region-and-region-failover
+---
+
+# Error Budgets
+
+> An error budget is permission to fail within an agreed SLO, turned into a control loop that balances shipping change with restoring reliability.
+
+## Why This Exists
+
+Product teams want to release features; reliability work wants to reduce risk. Without a shared measure, the argument becomes “move faster” versus “be safer.” The naive policy either freezes all change to chase an impossible 100% target or ships continuously and treats every incident as an exception. Neither approach prices risk.
+
+An error budget is the allowed bad-event fraction over an SLO window. If the SLO is 99.9% good events, the budget is 0.1%. A release, incident, migration, or dependency outage spends budget when it causes eligible bad events. The budget is not a goal to exhaust; it is a feedback signal for choosing how much risk remains acceptable.
+
+## Mental Model
+
+```text
+SLO target ──> allowed bad events (budget)
+observations ──> budget consumed ──> burn rate
+                                      ├─ normal change
+                                      ├─ slow/restricted change
+                                      └─ freeze + restore reliability
+```
+
+If the allowed bad fraction is `B` and the observed bad fraction in a window is `E`, the approximate burn rate is `E / B`. A burn rate of 1 spends the entire budget at the planned window rate. A burn rate of 10 would spend a 30-day budget in roughly 3 days if it persisted; an incident burn rate is often much higher and needs a shorter detection window.
+
+The policy belongs to the service team and product stakeholders. It should say which changes are blocked, what emergency/security fixes are exempt, who can override, and how recovery work earns confidence. “Freeze releases” without a runbook can push unsafe work into manual paths rather than improve reliability.
+
+## How It Works
+
+1. Select an SLO with a complete numerator/denominator and a known window.
+2. Compute the total budget and a continuously updated remaining amount.
+3. Calculate burn over at least two windows: a short window catches rapid incidents, while a long window catches chronic erosion without paging on every blip.
+4. Define thresholds and policy actions: normal release, canary/extra review, pause risky changes, or incident response.
+5. Attribute spend to releases, dependencies, regions, and workload classes when evidence supports it; do not delay mitigation while waiting for perfect blame.
+6. After recovery, record the cause and prevention work. Resetting a calendar budget does not erase unresolved risk.
+
+For a 99.9% 30-day availability objective, the illustrative budget is 43.2 minutes. A 10-minute outage consumes about 23% of that budget. If the service then experiences a 1% bad-event rate for 5 minutes, the short-window burn is severe even if the month-to-date number still looks acceptable. Alerting on both windows avoids reacting too late or paging for a tiny blip.
+
+## Example
+
+An API has a 99.9% good-request SLO and a deployment canary introduces a 2% error rate for 6 minutes. The error-budget controller pauses the rollout, routes traffic back, and opens a reliability task. A security patch may still ship under an emergency policy, but it receives a smaller canary and explicit owner approval. A future feature release is allowed after the service returns to a safe burn rate and the team has addressed the regression.
+
+For a queue freshness SLO, a blocked consumer spends budget even while HTTP acceptance remains healthy. The policy may slow producers, allocate workers, or disable optional enrichment rather than freeze unrelated UI releases. Budget scope must match the user promise.
+
+## Visualization We Eventually Want
+
+Provide a timeline of good/bad events, SLO window, budget remaining, and burn rate at two configurable windows. Controls should inject a short outage, a chronic 0.05% degradation, a failed canary, and a dependency incident. Let the learner choose policies for normal, caution, and freeze states, then display release actions, recovery tasks, and how attribution uncertainty affects confidence without hiding spend.
+
+## Scaling Behavior
+
+At high volume, event-based budgets can make small percentages statistically stable, while low-volume services may need longer windows or minimum event counts to avoid overreacting to one request. Segment by region or tier only when each segment has sufficient traffic and a distinct user promise. Aggregate budgets across dependencies carefully: a downstream budget is not automatically the product's SLO budget.
+
+Large organizations need policy interfaces, ownership, and auditability. Automated gates should fail safe (pause a rollout) but not turn a telemetry outage into an unjustified freeze; health of the measurement pipeline is itself observable. Budget forecasts can incorporate planned launches, migrations, and seasonal traffic but should not replace observed evidence.
+
+## Failure Modes
+
+- **Untrusted denominator:** budget appears healthy because failed or timed-out users were excluded.
+- **Month-to-date only:** a short severe incident is diluted by a long history of good behavior.
+- **Alerting on every spend:** small expected burn creates noise and teams ignore the policy.
+- **No recovery policy:** a freeze has no owner, exit criteria, or way to restore capacity.
+- **Blame before mitigation:** time is lost debating which dependency should pay while users suffer.
+- **Calendar reset illusion:** a new window hides unresolved systematic risk.
+- **Budget across unlike contracts:** one global number masks a failing region or tenant.
+
+## Trade-offs
+
+Budgets make reliability and delivery comparable, but they require agreement, trustworthy measurement, and organizational follow-through. Strict automated gates reduce release risk but can block valuable fixes during telemetry errors or rare events. Long windows provide stable signals but delay feedback; short windows react quickly but need smoothing and multi-window confirmation. Attribution improves accountability but can encourage teams to game boundaries.
+
+## Alternatives
+
+- **Hard availability gate:** simple and predictable for a critical API, but ignores severity and may block all change.
+- **Risk review without a budget:** useful for early prototypes, but subjective and hard to compare.
+- **Incident-only postmortems:** necessary but too late to guide routine release decisions.
+- **Capacity-based release gating:** protects known resource limits, but does not capture user-visible correctness or dependency failure.
+
+## When to Use
+
+Use error budgets when a team owns an SLO and routinely balances releases, migrations, and reliability investment. Make the policy explicit before the first incident and tune thresholds from observed workload.
+
+## When Not to Use
+
+Do not automate budget gates around a noisy or unowned SLI. A low-volume experiment may need a qualitative risk review until it has enough traffic to produce meaningful evidence. Never use a budget to justify knowingly unsafe behavior (“we still have budget”) when a security or data-integrity risk is immediate.
+
+## Common Misconceptions
+
+- **“The budget is acceptable failure we should spend.”** It is a risk allowance and a feedback mechanism, not a quota.
+- **“Burn rate equals error rate.”** Burn is normalized by the allowed budget and depends on the window.
+- **“A freeze means do no work.”** Emergency fixes and reliability restoration need a defined path.
+- **“Only outages spend budget.”** Latency, freshness, rejected work, and incorrect results can be bad events.
+- **“Budget resets erase reliability debt.”** The next window can start at zero while the underlying cause remains.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> For an SLO of 99.9%, the 0.1% complement is an error budget. I track remaining budget and burn rate over short and long windows: fast burn pauses risky releases and triggers incident response, while slow burn guides reliability investment. The policy defines exceptions and recovery criteria, and it depends on a trustworthy user-facing SLI, including async freshness and correctness where relevant.
+
+### When to Introduce It
+
+Introduce an error budget after agreeing on an SLO and before discussing release velocity, canaries, or a reliability-versus-feature trade-off.
+
+### Common Follow-Ups
+
+- How do you calculate burn rate?
+- Why use multiple windows?
+- What if the metrics pipeline is down?
+- Which releases are allowed during a budget freeze?
+
+### Common Candidate Mistakes
+
+- Quoting a budget without a denominator or window.
+- Using month-to-date spend as the only alert.
+- Freezing changes without a recovery owner.
+- Treating a dependency’s budget as proof of product impact.
+
+## Summary
+
+An error budget turns an SLO into an operational control loop. Compute the allowed bad events, monitor short/long burn, and make release, mitigation, and recovery policy explicit. The mechanism works only when the SLI is user-relevant and the organization honors the decisions it enables.
+
+## Quiz Seeds
+
+1. What is the budget fraction for a 99.9% SLO?
+2. A 30-day budget is 43.2 minutes and an incident lasts 10 minutes. Approximately what fraction is spent?
+3. Why do short and long burn windows complement each other?
+4. What should happen to a risky canary during rapid budget burn?
+5. How can an async freshness SLO spend budget while HTTP availability remains high?
+6. Why must telemetry-pipeline health be considered before an automated release freeze?
+7. Why is “we still have budget” not a sufficient response to a security incident?
+
+## Related Topics
+
+- [SLI, SLO, and SLA](./sli-slo-and-sla.mdx)
+- [Actionable Alerting](./alerting.mdx)
+- [Disaster Recovery](../08-reliability/disaster-recovery.mdx)
+- [Multi-Region and Region Failover](../08-reliability/multi-region-and-region-failover.mdx)
+
+## References
+
+### Documentation / Articles
+
+- [Embracing Risk](https://sre.google/sre-book/embracing-risk/) — explains error budgets as a shared, data-driven risk mechanism.
+- [Service Level Objectives](https://sre.google/sre-book/service-level-objectives/) — defines the relationship between SLO violation rate and budget.
+- [Implementing SLOs](https://sre.google/workbook/implementing-slos/) — discusses practical SLO policy and monitoring choices.
+- [Alerting on SLOs](https://sre.google/workbook/alerting-on-slos/) — explains multi-window burn-rate alerting patterns.

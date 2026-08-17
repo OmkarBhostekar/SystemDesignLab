@@ -1,0 +1,188 @@
+---
+type: lesson
+id: 11-10-geospatial-indexing
+slug: geospatial-indexing
+title: Geospatial Indexing
+description: Answer nearby and bounded-area queries by mapping coordinates into cells while handling skew, distance accuracy, and movement.
+module: building-blocks
+order: 10
+difficulty: advanced
+estimatedMinutes: 40
+prerequisites:
+  - 01-03-latency-vs-throughput
+  - 02-07-api-design-interviews
+  - 04-06-database-indexes
+  - 04-09-partitioning-and-sharding
+  - 05-02-local-and-distributed-cache
+tags:
+  - geospatial
+  - nearby-search
+  - geohash
+  - quadtree
+  - grid-index
+objectives:
+  - Explain grid, geohash, and quadtree cell ownership for nearby queries.
+  - Design candidate-cell expansion followed by exact distance filtering.
+  - Handle boundary misses, density skew, moving objects, stale locations, and hot cells.
+  - Choose a storage/index strategy from update rate, radius, accuracy, and region shape.
+relatedLessons:
+  - 04-09-partitioning-and-sharding
+  - 04-06-database-indexes
+  - 11-09-realtime-presence
+  - 11-04-search-autocomplete
+---
+
+# Geospatial Indexing
+
+> Nearby search is usually a two-stage operation: use cells to find a bounded candidate set, then calculate exact distance and apply business filters.
+
+## Why This Exists
+
+Finding all drivers, stores, or devices within five kilometers by scanning every coordinate is `O(N)` per request. A normal scalar index on latitude alone misses the relationship between two dimensions and the shape of a circle. The naive “sort by latitude” approach also produces many false candidates and poor behavior near the poles or dateline.
+
+The improvement maps latitude/longitude into spatial cells. A query finds its cell and neighboring cells, retrieves candidates, then computes exact distance. The new trade-off is cell-resolution tuning, boundary expansion, density skew, update cost, stale locations, and a second filter/ranking step.
+
+## Mental Model
+
+```text
+point ─> cell code ─> candidate cells ─> candidate points ─> exact distance/rank
+```
+
+| Structure | Ownership intuition | Strength | Cost |
+| --- | --- | --- | --- |
+| Fixed grid | Latitude/longitude buckets | Simple, predictable neighbors | Density skew and boundary artifacts |
+| Geohash | Recursive rectangular cells encoded as a string | Prefixes identify nearby-ish regions; easy partition keys | Adjacent cells can have dissimilar prefixes; rectangles are approximate |
+| Quadtree | Recursively split dense regions | Adapts to density and supports local refinement | More complex updates/partitioning and imbalance |
+| Space-filling curve (such as Hilbert) | Map 2D locality into 1D order | Useful ordered storage/partitioning | Neighbor ranges and shape handling are nontrivial |
+
+No cell code means “within radius.” Two points on opposite sides of a cell boundary can be close, and two points in one large cell can be far apart. Always query enough neighboring cells and apply a proper geographic distance function (for example, a spherical approximation appropriate to the radius).
+
+## How It Works
+
+Choose a cell resolution from the query radius and density. For a small radius, a fine grid limits candidates; for a large radius, expand to more cells or use multiple resolutions. A fixed grid can hash `(latBucket, lonBucket)` to shards. A geohash can use a prefix as the partition key, but neighbor lookup must include adjacent prefixes. A quadtree recursively splits cells whose point count/update rate exceeds a threshold.
+
+For each query:
+
+1. Validate coordinates and normalize longitude/dateline rules.
+2. Select the smallest useful resolution and enumerate intersecting cells.
+3. Read candidate points from those cells, respecting freshness/visibility.
+4. Compute exact distance and filter to the requested radius; sort/limit by distance or business score.
+5. Retry or widen the search when candidate capacity is exhausted, while bounding work and latency.
+
+Moving objects require remove/insert or versioned updates. A location update must not leave one driver in two cells or remove a newer position because updates arrived out of order. Use a monotonic position version/time from a trusted ingestion path and let stale locations expire.
+
+## Example
+
+A ride service receives 50,000 driver updates/s and must find the nearest available drivers within 3 km. The naive API scans all drivers and computes distances. The first improvement uses a 500 m grid, writes each driver to one cell, queries the center plus neighboring cells, then exact-filters.
+
+Downtown has 20 times the rural density, so one cell becomes hot and candidate lists are large. A quadtree splits dense cells; a multi-resolution geohash lets the query choose finer cells in cities and coarser cells in sparse areas. A driver update can race a query; each record carries a version and last-observed time. The result may contain a driver who moved 2 seconds ago, so dispatch revalidates availability and location before assigning a ride. The trade-off is more write churn and a query that may widen across several cells under skew.
+
+## Visualization We Eventually Want
+
+Build a **Nearby Query Cell Explorer**. Controls should include map extent, point density/skew, cell resolution, geohash precision, quadtree split threshold, update rate, query radius, stale-location TTL, shard count, and one hot cell failure. Show cells/partitions, candidate cells, exact distance circles, false candidates, boundary expansion, query fanout, write movement, stale points, and p50/p99 latency. Presets should include a city/rural contrast, a cell-boundary query, a moving-driver race, and dateline crossing. An accessible result table should list cell, age, exact distance, and reason for inclusion/exclusion.
+
+## Scaling Behavior
+
+Read work is candidate count plus exact distance cost; write work is location update rate and cell movement. Uniform point density can scale with partitions, but cities, venues, and highways create hot cells. Split or salt dense cells, route by region, and protect a query from scanning an unbounded candidate list.
+
+Fine cells reduce candidates but increase cell metadata, neighbor enumeration, and updates. Coarse cells reduce metadata but amplify query work. Multi-resolution indexes add storage/consistency cost. For global systems, partition by region and use a local owner for frequent updates; cross-region queries should be explicit rather than silently fan out worldwide.
+
+Cache stable venue/store queries, not rapidly moving driver positions unless the freshness budget allows it. A location service should expose age and accuracy; GPS noise and network delay are part of the result contract.
+
+## Failure Modes
+
+- **Boundary miss:** only the center cell is queried and nearby points in adjacent cells disappear.
+- **Candidate explosion:** a dense cell or too-large radius overwhelms one query.
+- **Hot cell:** all updates for a venue/city route to one partition.
+- **Stale/out-of-order update:** an old position overwrites a new one.
+- **Dateline/pole bug:** coordinate normalization creates huge or wrong ranges.
+- **Approximation overclaim:** cell proximity is presented as exact distance.
+- **Shard failure:** a region returns incomplete nearby results without a clear partial policy.
+- **Privacy leak:** precise location is shared beyond authorization/retention policy.
+
+Use neighboring cells, exact filtering, adaptive resolution, versioned updates, stale TTLs, bounded candidate budgets, coordinate tests, partial-result labels, and location privacy controls.
+
+## Trade-offs
+
+Spatial cells reduce query work but add false candidates and tuning. Fixed grids are easy to operate but skew badly; quadtrees adapt but complicate ownership. A geospatial database index can provide mature geometry predicates at higher resource cost; an in-memory location store is fast but needs durability/recovery boundaries. Exact distance improves correctness at CPU cost.
+
+## Alternatives
+
+- **Database spatial index (R-tree/GiST):** choose for moderate data, rich geometry predicates, and transactional storage.
+- **Geohash/grid in a key-value store:** choose for simple nearby point queries and high update rate.
+- **Quadtree/k-d tree:** choose for adaptive density or in-memory/static datasets.
+- **Nearest-neighbor service:** choose when ranking/traffic/network distance dominates Euclidean geometry.
+- **Precomputed regions/tiles:** choose for static venue maps or coarse discovery where exact distance is unnecessary.
+
+## When to Use
+
+Use spatial indexing when nearby/bounded-area queries are frequent enough that full scans are too slow and a cell/candidate model fits the accuracy/freshness contract. Estimate point/update/query density first.
+
+## When Not to Use
+
+Do not build a custom quadtree for a small table already served by a spatial index. Do not claim nearest-by-road from straight-line distance. Do not use stale precise locations for safety-critical dispatch without revalidation.
+
+## Common Misconceptions
+
+- **“Same geohash prefix means nearest.”** It means same approximate cell; exact distance and neighboring cells are required.
+- **“More precision always improves performance.”** It can multiply metadata and neighbor reads.
+- **“One fixed cell size works globally.”** Density and radius vary by region.
+- **“The index answer is the assignment truth.”** Availability/location must be revalidated before a critical action.
+- **“A location update is a simple overwrite.”** Version/order/expiry matter for moving entities.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I map points to grid/geohash/quadtree cells, query the center and every intersecting neighbor, then exact-filter and rank candidates. Resolution follows query radius and density; dense cells split or shard. Updates carry versions and expire, because moving locations can arrive out of order. I define hot-cell handling, dateline/pole correctness, stale-age/privacy, bounded candidate work, and a final revalidation before dispatch.
+
+### When to Introduce It
+
+Introduce it when nearby or bounded-area queries are a measured bottleneck and the workload has a clear radius, update, and accuracy contract.
+
+### Common Follow-Ups
+
+- How do you handle points on cell boundaries?
+- What cell size and why?
+- How do cities/hot cells differ from rural areas?
+- How do out-of-order driver updates behave?
+- Is nearest by distance or by travel time?
+
+### Common Candidate Mistakes
+
+They query one geohash, skip exact distance, ignore density/hot cells, or claim a spatial index can guarantee current availability.
+
+## Summary
+
+Spatial indexing narrows candidates; it does not make geometry exact by itself. Choose an adaptive resolution, enumerate neighbors, exact-filter, version/expire moving points, and cap skew/fanout. Treat location age, accuracy, privacy, and dispatch revalidation as first-class requirements.
+
+## Quiz Seeds
+
+1. Why must a geohash query include neighboring cells?
+2. Compare fixed grids and quadtrees under city/rural skew.
+3. What does exact distance filtering protect against?
+4. How should an out-of-order driver update be handled?
+5. Why can very fine cells increase operational cost?
+6. Which index would you choose for rich polygon predicates?
+7. What happens at the international dateline if longitude normalization is wrong?
+8. Why must dispatch revalidate a nearby-driver result?
+
+## Related Topics
+
+- [Partitioning and sharding](../04-databases/partitioning-and-sharding.mdx) handles spatial ownership and hot cells.
+- [Database indexes](../04-databases/database-indexes.mdx) frames the index cost model.
+- [Real-time presence](./realtime-presence.mdx) shares TTL and moving-session semantics.
+- [Search autocomplete](./search-autocomplete.mdx) illustrates candidate retrieval versus ranking.
+
+## References
+
+### Documentation / Articles
+
+- [PostGIS spatial indexing](https://postgis.net/docs/using_postgis_dbmanagement.html) — documents spatial indexes and bounding-box/exact geometry filtering in a database.
+- [Redis geospatial commands](https://redis.io/docs/latest/develop/data-types/geospatial/) — provides a production point-radius/bounding-box API and exposes its operation complexity.
+- [GeoJSON specification (RFC 7946)](https://www.rfc-editor.org/rfc/rfc7946.html) — defines coordinate order and geometry representation needed for interoperable APIs.
+- [S2 Geometry overview](https://s2geometry.io/devguide/s2cell_hierarchy) — explains hierarchical spherical cells as an alternative to planar grids/geohashes.
+
+### Papers
+
+- [The quadtree and related hierarchical data structures](https://www.sigmod.org/publications/dblp/db/journals/csur/Samet84.html) — gives the original spatial decomposition intuition and density-adaptive trade-offs.

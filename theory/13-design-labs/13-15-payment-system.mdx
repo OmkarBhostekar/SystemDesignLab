@@ -1,0 +1,214 @@
+---
+type: lesson
+id: 13-15-payment-system
+slug: payment-system
+title: Payment System
+description: Design a payment workflow with an append-only ledger, idempotent commands, provider ambiguity, reconciliation, and auditable recovery.
+module: design-labs
+order: 15
+difficulty: deep-dive
+estimatedMinutes: 80
+prerequisites:
+  - 00-03-estimation
+  - 00-04-interview-framework
+  - 04-04-acid-and-transactions
+  - 04-14-concurrency-control
+  - 06-06-delivery-semantics
+  - 07-08-transactional-outbox
+  - 08-08-disaster-recovery
+tags:
+  - payments
+  - ledger
+  - idempotency
+  - reconciliation
+  - recovery
+objectives:
+  - Distinguish payment commands, provider state, immutable ledger entries, and read projections.
+  - Make authorization/capture/refund operations duplicate-safe across retries and webhooks.
+  - Reconcile internal records with providers and surface unknown outcomes without guessing.
+  - Explain financial invariants, auditability, security boundaries, and disaster recovery.
+relatedLessons:
+  - 04-04-acid-and-transactions
+  - 04-14-concurrency-control
+  - 06-06-delivery-semantics
+  - 07-08-transactional-outbox
+  - 08-08-disaster-recovery
+visualizationId: null
+quizId: null
+---
+
+# Payment System
+
+> A payment system is an auditable state machine backed by an immutable ledger; provider responses, retries, webhooks, and reconciliation must never turn an ambiguous network outcome into a duplicate charge.
+
+## Problem Statement
+
+Design a payment service that accepts a merchant's payment intent, authorizes or captures through an external provider, records fees/refunds, and exposes status. A client can retry after a timeout; a provider can accept a charge but lose the response; webhooks can arrive late, duplicated, or out of order. The system must preserve financial records and support daily reconciliation and operator repair. Ask whether the service is a gateway, merchant-of-record, or internal wallet; this lab assumes it owns a merchant-facing ledger but delegates card movement to providers.
+
+## Functional Requirements (Scoped)
+
+- Create a payment intent with amount, currency, merchant/customer, and idempotency key.
+- Authorize/capture, cancel, refund, and record provider/webhook events.
+- Expose a stable status API with `pending`, `authorized`, `captured`, `failed`, `unknown`, `refunded`, and dispute states.
+- Append balanced ledger entries for money movement/fees; derive merchant/customer balances as projections.
+- Reconcile internal intents/ledger with provider reports and support auditable corrections.
+
+Out of scope: card-network protocol implementation, fraud-model training, multi-currency FX pricing, and holding raw PAN/card data.
+
+## Non-Functional Requirements and Priorities
+
+| Priority | Requirement | Working target / question |
+| --- | --- | --- |
+| P0 | Financial correctness | No duplicate capture; every posted ledger transaction balances in its currency. |
+| P0 | Auditability | Append-only history identifies actor, command, provider ID, and reversal/correction reason. |
+| P0 | Recovery | Unknown provider outcomes reconcile without manual database edits. |
+| P1 | Availability | Intent/status reads remain available; capture may become pending during provider outage. |
+| P1 | Security/compliance | Minimize PCI scope, protect PII, verify webhooks, and enforce merchant isolation. |
+| P2 | Latency | p95 intent creation under 300 ms; provider completion may be asynchronous. |
+
+## Estimation Prompts and Checked Example
+
+Ask for payment intents/day, capture/refund ratio, average amount/ledger rows, provider latency/rate limits, webhook volume, retention, and reconciliation window. Example:
+
+- 10M payment intents/day → `≈116 intents/s`; 10× peak is `≈1,157/s`.
+- If 70% capture, 10% refund, and each command creates 4 ledger rows (gross, fee, net, reserve/release), peak ledger row rate is `1,157 × (1 + .7 + .1) × 4 ≈8,329 rows/s` before webhook/audit rows.
+- At 2 KB immutable event/ledger record, one day is `≈1.44 TB` logical (`8,329 × 2 KB × 86,400`); actual average/peak and compact encoding must be measured.
+- A provider p99 of 5 s at 1,157/s implies `≈5,785` in-flight provider calls. A 60 s unknown/reconciliation window at 1% timeout creates `≈694` cases/day at the peak rate; keep a separate queue and operator SLO.
+
+Sensitivity prompts: Is capture synchronous? What is the required RPO? Are amounts integer minor units? How long are chargebacks/refunds retained? Which external report is authoritative when records disagree?
+
+## API Design
+
+```http
+POST /v1/payment-intents
+Idempotency-Key: order-42-payment-v3
+{"merchantId":"m_7","amountMinor":1999,"currency":"USD",
+ "captureMethod":"automatic","orderId":"order-42"}
+```
+
+Return `201` with a stable `paymentIntentId` and state after durable intent/ledger reservation; `202` may represent provider processing. Reuse of the same key/request hash returns the original result; a different request returns `409 IdempotencyKeyConflict`. `POST /payment-intents/{id}:capture`, `:cancel`, and `:refund` each require a distinct operation key and legal state/version. `GET` exposes provider-independent state plus `unknownSince`/next reconciliation time.
+
+Return `400` for invalid amount/currency, `403` for merchant scope, `409` for state conflict, `422` for business decline, `429` for merchant quota, and `503` when the service cannot durably accept the command. A timeout after a provider call creates `unknown`, then status query/webhook/reconciliation uses the same provider idempotency key. Webhooks are authenticated, deduplicated by provider event ID, and applied in event-time/state-order rules; they are not blindly trusted to override a later known state.
+
+## Data Model, Access Paths, and Ownership
+
+```text
+payment_intents(intent_id PK, merchant_id, order_id, amount_minor,
+  currency, state, version, provider, provider_intent_id UNIQUE,
+  created_at, unknown_since)
+operations(operation_id PK, intent_id, type, idempotency_key UNIQUE,
+  request_hash, state, result_ref, created_at)
+ledger_transactions(tx_id PK, currency, status, created_at, source_operation)
+ledger_entries(entry_id PK, tx_id, account_id, direction, amount_minor,
+  currency, account_version)
+provider_events(provider_event_id PK, provider, event_type, payload_ref,
+  observed_at, applied_at)
+reconciliation_cases(case_id PK, intent_id/provider_id, reason, state,
+  last_checked_at, owner, resolution_event_id)
+```
+
+The payment service owns intent/operation state and ledger append; provider adapters own credentials and external IDs; reconciliation owns comparison/case workflow; merchant/order services consume status events but cannot rewrite the ledger. A transaction appends balanced entries and outbox event atomically. Reads use projections/aggregates rebuilt from the ledger; never update a balance without the underlying entry.
+
+## Progressive Architecture: Naive → Bottleneck → Improvement → New Trade-off
+
+1. **Naive:** order service calls provider and marks `paid` from the HTTP response. Retries double-charge, provider ambiguity is hidden, and there is no auditable internal money record.
+2. **Bottleneck/failure:** add an idempotency table and synchronous provider retry. It prevents some duplicates, but holding a request open through provider uncertainty limits capacity and still lacks independent reconciliation/ledger history.
+3. **Improvement:** persist payment intent/operation, use provider idempotency, append balanced ledger entries on known transitions, publish via outbox, process webhooks/status asynchronously, and run periodic reconciliation against provider reports.
+4. **New trade-off:** statuses become `pending/unknown`, and merchant funds may be reserved until evidence arrives. Ledger immutability requires reversal/correction entries and operational tools; synchronous “paid” UX is sacrificed for financial correctness.
+
+Reference architecture:
+
+```text
+Merchant/Order → Payment API → intent + operation DB → provider adapter
+                                  ├→ provider (idempotency key)
+                                  ├→ ledger + outbox → status consumers
+                                  └→ webhook/status inbox → reconciliation worker/report
+```
+
+The ledger is append-only and double-entry by currency; a projection can be rebuilt. Reconciliation is a normal path, not an emergency SQL script.
+
+## Bottlenecks and Concurrency / Consistency
+
+Provider quotas/latency, intent-operation uniqueness, ledger serialization per account/currency, webhook bursts, reconciliation scans, and projection rebuild are limits. One operation key can be claimed once; concurrent capture/refund commands use a state version/conditional transition. Ledger entries are immutable; corrections are compensating transactions. Webhook/event ordering uses provider event IDs and a state machine, not arrival time alone. At-least-once outbox/consumer delivery is safe because operation/event IDs are unique.
+
+## Failure Analysis
+
+- **Timeout after provider acceptance:** mark unknown, query/report by provider ID, then capture/reverse/reconcile with same key.
+- **Duplicate API request:** idempotency record returns the original status/result; mismatched payload is conflict.
+- **Webhook duplicate/out-of-order:** inbox dedupe + legal state transitions; retain raw event for audit.
+- **Ledger DB commit succeeds, status event lost:** outbox replay updates order/merchant projections.
+- **Projection drift:** rebuild from ledger and compare balances; no direct balance edits.
+- **Provider report mismatch:** open a reconciliation case, freeze risky automated action, and record resolution entry.
+- **Region/database loss:** restore ledger with RPO, fence writers, replay outbox/projections, and reconcile before enabling captures.
+
+## Security
+
+Use hosted/tokenized payment data to minimize PCI scope; never log PAN/CVV. Authenticate merchant/customer APIs, authorize merchant-account ownership, verify webhook signatures/timestamps, and enforce idempotency-key entropy/retention. Encrypt PII and secrets, rotate provider credentials, audit every operator correction/refund, segregate ledger writes, and rate-limit card-testing/merchant abuse. Make amounts integer minor units and verify currency/merchant context at every boundary.
+
+## Observability
+
+Track intent/operation states, provider request/response latency and errors, idempotency replays/conflicts, unknown age/count, webhook lag/duplicates, ledger transaction balance checks, projection lag/drift, reconciliation match/mismatch rate and age, refunds/chargebacks, capture success, and provider quota. Trace operation/provider/event IDs without payment data; logs must carry audit actor and reason. Alert on any unbalanced transaction, unknown-age SLO breach, or reconciliation drift.
+
+## Explicit Trade-offs and Alternatives
+
+- **Synchronous capture vs pending workflow:** synchronous is simpler UX; pending is safer under provider uncertainty.
+- **Double-entry ledger vs mutable balance:** ledger is auditable/rebuildable; projections are faster but need verification.
+- **Provider-as-source vs internal ledger:** provider reports prove external movement; internal ledger proves merchant-account obligations; reconciliation joins them.
+- **Strong serializable account writes vs sharded append:** stronger isolation simplifies balances but limits throughput; partition by account/currency with deterministic ordering.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+“I separate payment commands, provider state, and an append-only double-entry ledger. Every operation has an idempotency key and provider key; a timeout becomes `unknown` until status/webhook/reconciliation proves the outcome. Ledger transitions are immutable and balanced, while order/merchant balances are projections updated through an outbox. Operators resolve mismatches with compensating entries, never by editing history.”
+
+### When to Introduce It
+
+Introduce a ledger as soon as the service owns money movement/audit, and reconciliation whenever a provider or asynchronous webhook is involved. Introduce pending/unknown states instead of stretching synchronous timeouts.
+
+### Common Follow-Ups
+
+- What if the provider charged but your DB timed out?
+- How do you make refunds idempotent?
+- Why double-entry instead of one balance column?
+- Which system wins a reconciliation mismatch?
+
+### Common Candidate Mistakes
+
+Marking paid from an HTTP 200 alone, retrying unknown captures, mutating ledger rows, logging card data, and treating reconciliation as a manual afterthought.
+
+## Summary
+
+Financial correctness comes from durable operation identity, provider idempotency, an immutable balanced ledger, and reconciliation. Make unknown outcomes and compensating entries first-class; projections and order events are derived views, not the financial source of truth.
+
+## Quiz Seeds
+
+1. Why is a lost provider response not proof that a charge failed?
+2. What is the invariant of a balanced ledger transaction?
+3. Which key deduplicates a capture retry and which deduplicates a webhook?
+4. Why is `paid` a projection/state transition rather than a provider HTTP result?
+5. What should happen when a provider report disagrees with internal intent state?
+6. Estimate in-flight provider calls at 1,157/s and 5 s p99.
+7. Why are ledger corrections reversals rather than updates?
+8. What data must never enter logs?
+
+## Related Topics
+
+- [ACID and transactions](../04-databases/acid-and-transactions.mdx) — ledger/operation atomicity.
+- [Concurrency control](../04-databases/concurrency-control.mdx) — state transitions and duplicate commands.
+- [Delivery semantics](../06-messaging/delivery-semantics.mdx) — webhooks/outbox boundaries.
+- [Transactional outbox](../07-distributed-coordination/transactional-outbox.mdx) — reliable status publication.
+- [Disaster recovery](../08-reliability/disaster-recovery.mdx) — ledger restore and fencing.
+
+## References
+
+### Documentation / Articles
+
+- [Stripe idempotent requests](https://docs.stripe.com/api/idempotent_requests) — documents result replay and idempotency-key conflict behavior.
+- [Stripe webhooks](https://docs.stripe.com/webhooks) — describes signature verification, retries, and asynchronous event delivery.
+- [PCI DSS](https://www.pcisecuritystandards.org/standards/pci-dss/) — primary compliance boundary for payment-card data handling.
+- [ISO 4217 currency codes](https://www.iso.org/iso-4217-currency-codes.html) — grounds currency identity and minor-unit assumptions.
+
+## Future Visualization / Workspace Spec
+
+Create a payment state/ledger simulator with intent, operation key, provider accept/timeout, webhook reorder, capture/refund, outbox, double-entry postings, projection, and reconciliation. Controls should vary provider latency/errors, duplicate client commands, webhook delay, ledger failure, report mismatch, and region restore. Show state transitions, balanced debit/credit totals, unknown age, idempotency hits, webhook inbox, reconciliation cases, and compensating entries. Canvas nodes should include Merchant, Payment API, Operation DB, Provider, Ledger, Outbox, Webhook Inbox, Projection, and Reconciler.

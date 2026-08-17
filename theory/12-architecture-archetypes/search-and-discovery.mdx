@@ -1,0 +1,185 @@
+---
+type: lesson
+id: 12-06-search-and-discovery
+slug: search-and-discovery
+title: Search and Discovery Systems
+description: Turn source data into fresh, ranked, filterable discovery views with ingestion, indexes, caches, and spatial/prefix access paths.
+module: architecture-archetypes
+order: 6
+difficulty: core
+estimatedMinutes: 40
+prerequisites:
+  - 04-01-data-modeling-from-access-patterns
+  - 04-06-database-indexes
+  - 05-03-cache-aside
+  - 06-06-delivery-semantics
+  - 07-09-change-data-capture
+  - 11-04-search-autocomplete
+  - 11-05-full-text-search
+  - 11-10-geospatial-indexing
+tags:
+  - search
+  - discovery
+  - indexing
+  - ranking
+  - freshness
+  - geospatial
+objectives:
+  - Decompose discovery into ingestion, candidate retrieval, filtering, ranking, and delivery.
+  - Choose lexical, prefix, structured, geo, or semantic indexes from query shape.
+  - Design freshness, reindexing, cache, authorization, and partial-result behavior.
+  - Explain why search is a read model and how architecture changes with corpus/query/latency constraints.
+relatedLessons:
+  - 11-04-search-autocomplete
+  - 11-05-full-text-search
+  - 11-10-geospatial-indexing
+  - 12-01-read-heavy
+  - 05-07-cache-stampede
+---
+
+# Search and Discovery Systems
+
+> Discovery is a pipeline from source truth to candidates to ranked, policy-checked results; the right index follows the query shape and freshness contract.
+
+## Why This Exists
+
+“Search” can mean prefix suggestions, exact filters, full-text relevance, nearby stores, semantic similarity, or a combination. The naive design sends every query to one transactional database and sorts results there. It works for a small catalog but couples user-facing latency to source writes, cannot rank language well, and becomes expensive when filters/fanout multiply.
+
+The improvement creates a purpose-built read model and composes candidate indexes: prefix/trie, inverted terms, structured fields, geospatial cells, or vector/semantic candidates. The new trade-offs are asynchronous freshness, duplicated index data, ranking evaluation, reindex/migration, cache invalidation, and authorization boundaries.
+
+## Mental Model
+
+```text
+source updates ─> durable ingestion ─> indexes ─> candidate retrieval
+                                                   └> filter/policy/rank ─> page
+```
+
+Separate:
+
+1. **Ingestion:** how source changes reach the index, including delete and replay.
+2. **Candidate retrieval:** which documents/objects are plausible matches.
+3. **Filtering:** tenant, availability, price, time, geo, policy, and ACL predicates.
+4. **Ranking:** relevance, distance, freshness, popularity, or business rules.
+5. **Delivery:** pagination, cache, partial results, and source validation.
+
+Combining indexes can reduce candidate work, but not every index shares the same update/freshness semantics. A search result should carry enough version/age metadata to debug why it differs from source state.
+
+## How It Works
+
+Write canonical entities to an authoritative store and publish versioned changes via outbox/CDC. Indexers build lexical, prefix, structured, and geo fields. Queries retrieve candidates, apply inexpensive filters early, score a bounded set, and return a stable cursor. A cache can store popular public queries keyed by index version, filters, locale, and policy scope.
+
+For a mutable catalog, build a new index version beside the old one, catch up changes, validate counts/sample queries, and switch readers atomically. A result may be stale; checkout, authorization, and availability must validate against the source. If one shard is slow, return a documented partial result or fail within a budget; waiting indefinitely for perfect ranking harms p99.
+
+## Example
+
+A marketplace supports “red running shoes near me under ₹10,000,” 50,000 QPS, and seller updates every second. The naive database query combines text, numeric, and geo predicates on the primary. Search latency rises with seller writes.
+
+The improved system ingests product versions into an inverted/prefix index, structured price/availability fields, and geo cells. Query candidate retrieval intersects text and geo cells, filters price, ranks relevance/distance, and caches popular public searches for a short index version. Product detail and checkout read current seller/stock state.
+
+When inventory changes rapidly, the index may show an item that is sold out. The result carries a freshness indicator and a final availability check. A new analyzer build runs side by side; if ranking quality or recall regresses, readers switch back to the previous version. The trade-off is extra storage/ingestion and imperfect immediacy in exchange for predictable discovery latency.
+
+## Visualization We Eventually Want
+
+Build a **Discovery Pipeline Decision Lab**. Controls should include corpus size, update/delete rate, query mix (prefix/text/filter/geo), candidate selectivity, ranking cost, index lag, shard count, cache hit rate, and one failed shard. Show ingestion lag, candidate counts by index, filter/rank time, shard fanout/merge p99, stale result age, cache keys, partial results, and reindex progress. Scenarios should compare a small SQL catalog, a full-text catalog, a geo-heavy marketplace, and a fast-changing inventory feed.
+
+## Scaling Behavior
+
+Index storage grows with fields, postings, positions, geo metadata, replicas, and versions. Query cost depends on candidate selectivity and shard fanout more than corpus size alone. Hot prefixes/terms/locations need per-key isolation and bounded ranking. Ingestion capacity must handle writes plus backfills/reindex.
+
+Freshness is a lag distribution from source commit to searchable version. Caches reduce repeated query work but must include policy/index version; broad invalidation can stampede. Structured filters may be better served by source/read replicas when corpus is modest and strong freshness dominates.
+
+## Failure Modes
+
+- **Lost/out-of-order update:** stale or deleted results persist.
+- **Analyzer/schema mismatch:** old/new shards rank incompatibly.
+- **Hot term/prefix/cell:** one query key overwhelms a shard.
+- **Shard partial failure:** result set is incomplete or tail-latency-bound.
+- **Unauthorized cache/result:** tenant/ACL filters are bypassed.
+- **Deep pagination:** offset scans grow without bound.
+- **Inventory drift:** discovery claims availability that source denies.
+- **Reindex regression:** new version lowers recall/precision or doubles cost.
+
+Use versioned events, idempotent index updates, tombstones, scoped caches, cursors/search-after, partial-result policy, query budgets, sample/quality validation, and source checks for critical decisions.
+
+## Trade-offs
+
+Purpose-built indexes improve discovery latency/relevance while adding duplicate storage and asynchronous consistency. Combining lexical/geo/prefix indexes improves recall/selectivity but complicates updates and query planning. Caches lower cost but stale policy/data risk. Partial results protect p99 but can hide relevant candidates unless labeled/observable.
+
+## Alternatives
+
+- **Transactional database indexes:** choose for modest, structured, strong-freshness catalogs.
+- **Dedicated inverted index:** choose for full-text/relevance and large corpus.
+- **Prefix table/trie:** choose for keystroke autocomplete.
+- **Spatial index:** choose for nearby/bounded geometry.
+- **Vector/semantic retrieval:** choose for conceptual similarity, paired with exact policy filters.
+- **Offline recommendation/batch:** choose when freshness is hours and personalized ranking can be precomputed.
+
+## When to Use
+
+Use this archetype when users explore a large or changing corpus with text, filters, ranking, prefix, or geo constraints. Start from query mix and freshness, not a product name.
+
+## When Not to Use
+
+Do not build a search cluster for a small exact lookup table. Do not use a stale discovery index as inventory, authorization, or payment truth. Do not combine every index type before measuring query shape.
+
+## Common Misconceptions
+
+- **“Search is one index.”** Candidate retrieval and ranking may use several structures.
+- **“Freshness means no lag.”** Measure and expose source-to-index lag.
+- **“A result cache is safe globally.”** Policy, tenant, locale, and index version belong in the key.
+- **“Geo cell equals distance.”** Neighbor expansion and exact filtering remain necessary.
+- **“Partial results are always wrong.”** A bounded, labeled partial answer may be preferable to a timeout.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I decompose discovery into durable ingestion, candidate retrieval, filtering, ranking, and delivery. Prefix, inverted, structured, geo, or semantic indexes match different query shapes. The index is a read model with measured lag, versioned reindex/cutover, scoped caches, and partial-result policy; source checks protect inventory/ACL correctness. I estimate candidate selectivity, shard fanout, ranking tail, hot terms/cells, and update rate before choosing the architecture.
+
+### When to Introduce It
+
+Introduce it when query language/filters, corpus size, or discovery latency exceed a transactional index path, and state the source/freshness boundary.
+
+### Common Follow-Ups
+
+- Which index handles each query component?
+- How do deletes and reindexing work?
+- What happens if one shard is slow?
+- How stale can inventory/search be?
+- Why cache this query and how is authorization scoped?
+
+### Common Candidate Mistakes
+
+They name Elasticsearch without an ingestion path, ignore analyzer/version migration, cache unscoped results, or conflate search relevance with source correctness.
+
+## Summary
+
+Discovery architecture follows query shape and change rate. Build versioned, replayable read models; bound candidates/ranking/fanout; scope caches and policy; and keep correctness-critical decisions on authoritative state. Change the index composition as workload constraints change.
+
+## Quiz Seeds
+
+1. Which stages belong between source commit and a search response?
+2. How does a geo filter complement a text inverted index?
+3. Why must search deletes be replayable tombstones?
+4. What dimensions belong in a public query-cache key?
+5. How should a slow shard affect response behavior?
+6. Why should checkout revalidate an indexed result?
+7. When is a database index preferable to a search cluster?
+8. What metrics show a reindex improved correctness without hiding latency cost?
+
+## Related Topics
+
+- [Full-text search](../11-building-blocks/full-text-search.mdx) details inverted indexing.
+- [Search autocomplete](../11-building-blocks/search-autocomplete.mdx) details prefix lookup/ranking.
+- [Geospatial indexing](../11-building-blocks/geospatial-indexing.mdx) details nearby candidates.
+- [Read-heavy systems](./read-heavy.mdx) frames caching and replica evolution.
+
+## References
+
+### Documentation / Articles
+
+- [Apache Lucene index file formats](https://lucene.apache.org/core/3_6_2/fileformats.html) — grounds term/postings/stored-field mechanics.
+- [Elasticsearch near real-time search](https://www.elastic.co/guide/en/elasticsearch/reference/current/near-real-time.html) — documents refresh visibility and index freshness.
+- [PostGIS spatial indexing](https://postgis.net/docs/using_postgis_dbmanagement.html) — shows structured/geo candidate filtering in a source database.
+- [Unicode normalization (UAX #15)](https://unicode.org/reports/tr15/) — supports consistent text keys across clients/languages.
+- [Apache Kafka design](https://kafka.apache.org/42/design/design/) — supports durable update ingestion, partitions, and replay.

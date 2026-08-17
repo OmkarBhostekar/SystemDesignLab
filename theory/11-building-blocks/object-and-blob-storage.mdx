@@ -1,0 +1,182 @@
+---
+type: lesson
+id: 11-07-object-and-blob-storage
+slug: object-and-blob-storage
+title: Object and Blob Storage
+description: Store large immutable payloads outside transactional rows with metadata, multipart transfer, integrity checks, and controlled access.
+module: building-blocks
+order: 7
+difficulty: advanced
+estimatedMinutes: 45
+prerequisites:
+  - 02-07-api-design-interviews
+  - 04-08-replication
+  - 04-09-partitioning-and-sharding
+  - 05-09-multi-layer-caching
+  - 06-09-backpressure
+  - 08-09-backups-rpo-rto
+tags:
+  - object-storage
+  - blob-storage
+  - multipart-upload
+  - checksums
+  - signed-urls
+objectives:
+  - Separate object metadata, bytes, ownership, and lifecycle from an OLTP record.
+  - Design resumable multipart uploads with checksums, limits, cleanup, and idempotent completion.
+  - Explain signed URL scope/expiry, CDN delivery, replication, and delete/version semantics.
+  - Estimate bandwidth, storage, metadata, and recovery costs for large objects.
+relatedLessons:
+  - 04-08-replication
+  - 08-09-backups-rpo-rto
+  - 05-09-multi-layer-caching
+  - 06-09-backpressure
+---
+
+# Object and Blob Storage
+
+> Keep large bytes on a durable object path and keep transactional metadata small, authoritative, and explicit about visibility and lifecycle.
+
+## Why This Exists
+
+Putting a 500 MB video or document directly in an application database makes row backups, replication, connection usage, and transactional queries carry payload work they do not need. A naive file server stores bytes on one host, loses them on disk failure, and forces application servers to proxy every byte.
+
+The improvement uses an object store or blob tier for bytes and a database for metadata: owner, object key, size, checksum, content type, state, retention, and access policy. Clients upload/download directly through scoped URLs or a gateway. The new trade-offs are eventual metadata/byte visibility, multipart state, integrity verification, lifecycle cleanup, egress cost, and authorization complexity.
+
+## Mental Model
+
+```text
+metadata DB: object_id, owner, key, size, checksum, state, policy
+                         │
+client ── signed request ─┴─> object store ─> CDN/download path
+```
+
+The metadata row is a state machine (`initiated → uploading → complete → deleted/expired`). The byte store is not automatically transactionally coupled to it. A client may upload bytes and lose the completion request, or metadata may commit while an upload fails. Reconciliation and idempotent completion are part of the design.
+
+## How It Works
+
+For a small upload, the API can create an object key, authorize a single PUT, verify size/checksum, and mark metadata complete. Large or unreliable uploads use multipart:
+
+1. Create an upload session with owner, expected size/type, checksum algorithm, expiry, and maximum parts.
+2. Return scoped part URLs or a gateway token; clients upload parts in parallel and can retry a part by number.
+3. Record part numbers, sizes, checksums/ETags, and upload expiry.
+4. Complete only when all expected parts and the full/object checksum pass validation; atomically mark metadata complete.
+5. Abort or garbage-collect abandoned parts.
+
+Part checksums protect each transfer, but a multipart ETag is not necessarily the MD5 of the entire object. Use an explicit full-object checksum when the integrity contract needs it. A signed URL should constrain object key, method, headers/content type, byte range or part, tenant, and expiry. It is a bearer capability: anyone who obtains it can use it until it expires, so avoid logging it and keep lifetime short.
+
+After completion, a CDN can cache immutable/versioned objects. If keys are mutable, cache invalidation and authorization become coupled; prefer immutable keys plus a metadata pointer for versions. Replication and durability are separate from availability: document the region, recovery point, and delete/version policy.
+
+## Example
+
+A drive service stores 10 TB/month of user files and sees mobile clients that lose connectivity. The naive API streams every byte through app servers and stores metadata and blobs in one SQL database. App bandwidth and connection pools saturate during video uploads; a database backup becomes enormous.
+
+The improved flow creates an upload session in SQL, gives the client 16 MB part URLs, and lets it retry failed parts directly to blob storage. Each part has a checksum; completion validates the ordered part list and full size. A worker scans abandoned sessions after 24 hours. Downloads use short-lived signed URLs to an immutable key and a CDN for public/shareable content; private access is checked before signing.
+
+If the client loses the completion response, it retries with the same upload session and receives the existing object state. If metadata says complete but the object is missing in a region, the service marks it unavailable and restores from a replica/back-up policy rather than silently returning an empty file. The trade-off is another state machine, cleanup workers, and explicit egress/security costs.
+
+## Visualization We Eventually Want
+
+Build an **Object Upload Timeline**. Controls should include object size, part size/count, client bandwidth, parallelism, packet loss, checksum mismatch, upload expiry, metadata failure, store region failure, CDN hit rate, and signed URL lifetime. Show bytes in flight, part retries, checksum results, metadata states, abandoned storage, completion races, download latency, and egress. Presets should include a mobile disconnect, a duplicate completion, a corrupt part, a leaked URL, and a region outage. Provide an accessible state table alongside the timeline.
+
+## Scaling Behavior
+
+Data bandwidth is `objects × average size × operation rate`; a 10 TB/month ingest is about 3.9 MB/s average before peak, retries, replication, and overhead. Size for peak client concurrency and egress, not only average storage. Multipart parts reduce retry cost but add metadata and completion calls; very small parts create millions of records/requests, while very large parts waste bandwidth after failure.
+
+Metadata is usually the hot transactional path and can be indexed/partitioned by owner, object ID, and lifecycle state. Blob bytes need placement, replication, erasure coding, tiering, and lifecycle policies. CDN/cache keys must include content version and access scope; never let a private response be shared under a public cache key.
+
+## Failure Modes
+
+- **Partial upload leak:** abandoned parts consume storage indefinitely.
+- **Checksum gap:** corrupted bytes are accepted because only transport success was checked.
+- **Completion race:** two clients complete or abort the same session inconsistently.
+- **Metadata/blob split:** row says complete but bytes are missing, or bytes exist without a row.
+- **Signed URL leakage:** a bearer URL is logged, copied, or valid too long.
+- **Path/key traversal:** client controls a storage key outside its tenant namespace.
+- **CDN privacy leak:** cache ignores authorization or version scope.
+- **Region/replica lag:** a failover serves an older or deleted object.
+- **Egress surprise:** downloads cost more than storage and compute.
+
+Use server-generated keys, authenticated session ownership, checksums, idempotent state transitions, cleanup/abort jobs, object-versioning or immutable keys, scoped URLs, cache controls, lifecycle budgets, and restore drills.
+
+## Trade-offs
+
+Direct transfer removes application bandwidth and improves resumability but exposes a capability and makes metadata/bytes eventually coupled. Multipart increases resilience but adds sessions/parts/cleanup. Replication improves durability and recovery but costs bytes and write bandwidth. CDN lowers origin load and latency but adds invalidation, privacy, and egress complexity. A database blob column simplifies transactions for small objects but scales poorly for large payloads and backup/replication paths.
+
+## Alternatives
+
+- **Database large-object column:** choose for small objects requiring one local transaction and simple backup semantics.
+- **Filesystem/NFS:** choose for a controlled single-region internal workload where POSIX semantics matter; plan redundancy.
+- **Content-addressed store:** choose for deduplication and immutable artifacts; metadata still needs authorization and garbage collection.
+- **Peer-to-peer/client sync:** choose for offline collaboration, with conflict and trust protocols beyond blob storage.
+- **Streaming service:** choose when bytes are transformed or delivered continuously rather than stored as objects.
+
+## When to Use
+
+Use object storage for large, immutable or versioned payloads, high fan-out downloads, resumable transfers, or independent durability/lifecycle needs. Define metadata authority, access scope, checksum, and retention.
+
+## When Not to Use
+
+Do not add an object tier for tiny transactional values where a row/column keeps atomicity and is cheaper. Do not give clients unrestricted bucket access or use a signed URL as authorization beyond its bounded capability.
+
+## Common Misconceptions
+
+- **“HTTP 200 means the bytes are correct.”** Checksum validation is a separate integrity guarantee.
+- **“Multipart ETag is the file MD5.”** It may be a composite identifier, not a full-object digest.
+- **“A signed URL is a permission system.”** It is a time-limited bearer capability; authorization must happen before issuing it.
+- **“Object storage and metadata commit atomically.”** They usually do not without an explicit protocol.
+- **“CDN cache makes private content safe.”** Scope cache keys and headers to authorization/version.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I keep object metadata and authorization in a transactional store and stream large bytes directly to durable object storage. For unreliable large uploads I use expiring multipart sessions, per-part and full-object checksums, idempotent completion, and cleanup of abandoned parts. Downloads use scoped signed URLs and immutable versioned keys behind a CDN when appropriate. I define metadata/blob reconciliation, replication, lifecycle, privacy, egress, and recovery rather than calling “S3” the design.
+
+### When to Introduce It
+
+Introduce it when payload size, fan-out, resumability, backup, or app-server bandwidth makes row/file-server storage a bottleneck.
+
+### Common Follow-Ups
+
+- How do you resume an interrupted upload?
+- What happens when completion times out?
+- How do you verify integrity and clean abandoned parts?
+- Can users revoke a signed URL?
+- What does deletion mean across replicas and caches?
+
+### Common Candidate Mistakes
+
+They proxy bytes through stateless services, omit checksums and cleanup, treat signed URLs as permanent authorization, or ignore metadata/blob reconciliation and egress cost.
+
+## Summary
+
+Object systems are two coupled state machines: metadata authority and byte durability. Multipart/checksum protocols make transfers resumable and trustworthy; signed URLs make delivery scalable but bearer-like. Include lifecycle, reconciliation, privacy, replication, and cost in the architecture.
+
+## Quiz Seeds
+
+1. Why should large clients upload directly to the blob tier?
+2. What state must a multipart session record?
+3. Why is a multipart ETag not necessarily an MD5 of the full object?
+4. How should a service handle a lost completion response?
+5. What prevents abandoned parts from becoming permanent storage leaks?
+6. Which constraints should a signed URL encode?
+7. Why prefer immutable versioned keys behind a CDN?
+8. What consistency issue exists between metadata and blob bytes?
+
+## Related Topics
+
+- [Replication](../04-databases/replication.mdx) frames durability and replica lag.
+- [Backups, RPO, and RTO](../08-reliability/backups-rpo-rto.mdx) turns blob durability into recovery objectives.
+- [Multi-layer caching](../05-caching/multi-layer-caching.mdx) covers CDN and cache placement.
+- [Backpressure](../06-messaging/backpressure.mdx) limits upload/download work.
+
+## References
+
+### Documentation / Articles
+
+- [Amazon S3 multipart upload overview](https://docs.aws.amazon.com/AmazonS3/latest/userguide/mpuoverview.html) — documents upload sessions, parts, completion, retries, and cleanup responsibilities.
+- [Amazon S3 checking object integrity](https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity-upload.html) — explains full-object versus composite checksums and why ETags are not always MD5.
+- [Amazon S3 presigned URLs](https://docs.aws.amazon.com/AmazonS3/latest/userguide/using-presigned-url.html) — grounds signed URLs as time-limited bearer capabilities with method/expiry constraints.
+- [HTTP range requests (RFC 9110)](https://www.rfc-editor.org/rfc/rfc9110.html) — defines byte-range delivery useful for resumable downloads and media segments.
+- [Google Cloud Storage resumable uploads](https://cloud.google.com/storage/docs/resumable-uploads) — shows a vendor-independent session/resume alternative and its failure semantics.

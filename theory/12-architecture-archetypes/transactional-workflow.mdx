@@ -1,0 +1,182 @@
+---
+type: lesson
+id: 12-05-transactional-workflow
+slug: transactional-workflow
+title: Transactional Workflows
+description: Coordinate multi-step business state with local transactions, idempotency, durable side effects, retries, and compensation.
+module: architecture-archetypes
+order: 5
+difficulty: core
+estimatedMinutes: 45
+prerequisites:
+  - 04-04-acid-and-transactions
+  - 04-05-transaction-isolation
+  - 06-07-idempotent-consumers
+  - 07-07-saga-pattern
+  - 07-08-transactional-outbox
+  - 08-02-retries
+  - 11-03-distributed-scheduler
+tags:
+  - workflows
+  - transactions
+  - saga
+  - idempotency
+  - compensation
+objectives:
+  - Identify which invariants belong in one local transaction and which cross service boundaries.
+  - Evolve a synchronous workflow into an orchestrated/event-driven process without losing state clarity.
+  - Design idempotent commands, outbox events, retries, timeouts, compensation, and reconciliation.
+  - Explain user-visible intermediate states and the limits of distributed exactly-once claims.
+relatedLessons:
+  - 07-07-saga-pattern
+  - 07-08-transactional-outbox
+  - 04-05-transaction-isolation
+  - 11-03-distributed-scheduler
+  - 11-08-notification-system
+---
+
+# Transactional Workflows
+
+> A workflow is a durable state machine coordinating local transactions and external effects; it is not one giant distributed transaction by default.
+
+## Why This Exists
+
+Booking a room, placing an order, or provisioning a subscription touches multiple owners: inventory, payment, fulfillment, and notifications. The naive synchronous request calls each service and returns success only if all respond. A timeout after payment succeeds leaves the client unsure; holding database locks across network calls creates contention and long failure windows.
+
+The improvement keeps each local transaction short, records workflow state and idempotency keys, and uses an orchestrator or event choreography for the cross-service steps. A saga compensates or reconciles when later work fails. The new trade-off is intermediate states, compensation that may not perfectly undo an effect, retries/duplicates, and operational recovery work.
+
+## Mental Model
+
+```text
+command ─> workflow state ─> local step + outbox ─> next step
+              │                    │
+              ├─ timeout/retry ────┘
+              ├─ compensate
+              └─ reconcile/manual review
+```
+
+First list invariants: “a seat is sold at most once,” “captured payment matches one order,” or “inventory cannot be negative.” Then assign each invariant an owner and transaction boundary. A local ACID transaction can enforce one owner’s invariant. A saga coordinates a sequence but cannot make all external effects atomic.
+
+## How It Works
+
+Persist a workflow instance with a state/version and a stable command ID. Each step uses an idempotency key and writes its local state plus an outbox event atomically. The orchestrator advances only after a durable result, with deadlines and retry policy. State transitions use compare-and-set/version checks so duplicate callbacks cannot move the workflow backward.
+
+For failure, classify the step: retry transient failure, compensate a reversible reservation, reconcile an ambiguous external payment, or route to human review. A timeout is not proof of failure; the worker should query provider state when possible. Expose states such as `pending_payment`, `reserved`, `confirmed`, `cancelled`, and `manual_review` rather than pretending the request is synchronously binary.
+
+2PC can provide an atomic commit across cooperating resource managers, but it holds prepare state and couples availability/latency to a coordinator. Sagas are often more resilient but rely on application-level compensation. The choice is a requirement trade-off, not a pattern contest.
+
+## Example
+
+An order reserves inventory, authorizes payment, creates fulfillment, and sends confirmation. The naive API performs four synchronous calls. Payment succeeds, fulfillment times out, and a client retry creates a second order or charge.
+
+The improved design creates an order with a client idempotency key, reserves inventory in a local transaction, emits an outbox event, and orchestrates payment/fulfillment with step keys. A payment timeout queries provider status. If payment fails, inventory reservation expires or is released; if fulfillment fails after capture, the workflow retries or issues a refund/compensation. Confirmation is a notification, not the source of order truth.
+
+The new trade-off is that a user may observe `payment_authorized` for seconds before fulfillment confirms. Inventory and payment systems need reconciliation dashboards for stuck/ambiguous workflows. A stronger requirement—never overbook a seat—may use a single transactional inventory owner and a reservation lease rather than trying to make every service globally serializable.
+
+## Visualization We Eventually Want
+
+Build a **Workflow State-Machine Lab**. Controls should include step latency, timeout, retry/backoff, duplicate callback, provider ambiguity, compensation success/failure, concurrency, and coordinator crash. Show workflow state/version, local commits, outbox events, idempotency keys, locks/reservations, external outcomes, compensation, and manual review. Presets should include payment timeout-after-success, inventory race, duplicate client command, and coordinator failover. Learners should step through transitions and see why “exactly once” is not inferred from a successful retry.
+
+## Scaling Behavior
+
+Workflow state grows with active instances, step history, idempotency retention, and audit needs. Partition by workflow/tenant and archive completed histories. Orchestrator throughput must handle callbacks and timers; use durable queues and bounded concurrent steps. A hot inventory entity may serialize throughput even if the workflow service scales horizontally.
+
+Retries can multiply downstream load; budget attempts and use backoff/jitter. Timer/scheduler capacity matters for reservations and compensation. Cross-service fanout and status reads should be asynchronous or aggregated rather than held in a request timeout.
+
+## Failure Modes
+
+- **Lost command:** client receives no response and retries without an idempotency key.
+- **Partial commit:** local state commits but event publication fails.
+- **Duplicate step:** retry/callback repeats an effect.
+- **Ambiguous provider outcome:** timeout occurs after an external success.
+- **Compensation failure:** undo is unavailable or not exact.
+- **State regression:** an old callback overwrites a newer workflow version.
+- **Lease expiry:** reservation expires while a payment/fulfillment step continues.
+- **Stuck workflow:** no timer, owner, or reconciliation path advances it.
+
+Use outbox, idempotency, versioned transitions, provider status queries, bounded retries, durable timers, reservation/fencing tokens, and operational repair tools. Log correlation IDs without logging secrets or payment details.
+
+## Trade-offs
+
+Local transactions plus sagas preserve service ownership and availability but expose intermediate states and compensation complexity. 2PC gives a stronger commit boundary for compatible resources but increases blocking and coupling. Orchestration centralizes visibility/ordering; choreography reduces a central coordinator but can become implicit and hard to debug. Synchronous paths simplify user feedback while raising tail latency and failure coupling.
+
+## Alternatives
+
+- **Single database transaction:** choose when all invariants and data can live under one owner.
+- **2PC:** choose only for cooperating resource managers where blocking/coordination cost is acceptable.
+- **Saga orchestration:** choose for explicit multi-step recovery and observability.
+- **Saga choreography:** choose for loosely coupled event reactions with disciplined ownership/versioning.
+- **Human-assisted reconciliation:** choose when rare ambiguity is safer to review than automatically compensate.
+
+## When to Use
+
+Use this archetype when a business command spans state owners, external side effects, retries, or long waits. Name invariants, state transitions, idempotency, and compensation before drawing services.
+
+## When Not to Use
+
+Do not split a local invariant into a saga merely to use microservices. Do not claim compensation restores the exact prior state for money, reservations, or external side effects without proof.
+
+## Common Misconceptions
+
+- **“Saga equals distributed transaction.”** It coordinates and compensates; it does not provide atomic commit.
+- **“Timeout means the step failed.”** The result may be unknown; query/reconcile when possible.
+- **“Outbox gives exactly once globally.”** It protects local state/event publication; consumers/providers still retry.
+- **“Compensation is rollback.”** It is a new business action that may fail or have side effects.
+- **“The API must block until every step completes.”** Durable intermediate states can improve availability and clarity.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I identify each invariant’s owner and keep local transactions short. A workflow record with versioned states and client/step idempotency keys drives an orchestrated saga; outboxes make local events durable, retries handle transient failures, and compensation/reconciliation handle partial or ambiguous outcomes. I expose intermediate status and never call external effects exactly-once without a provider contract. If all invariants fit one database, I keep one transaction instead.
+
+### When to Introduce It
+
+Introduce it when one command crosses transaction boundaries or includes long-running/retryable external effects.
+
+### Common Follow-Ups
+
+- Which invariant is local and which is distributed?
+- What if payment times out after success?
+- How are duplicate callbacks handled?
+- When is 2PC preferable?
+- What does the user see while the workflow is pending?
+
+### Common Candidate Mistakes
+
+They draw a giant synchronous call chain, omit idempotency/outbox, call compensation rollback, or use a saga where one local transaction would be simpler.
+
+## Summary
+
+Workflows are durable state machines around local transactions and uncertain external effects. Name invariants and owners, persist transitions/events, make retries idempotent, compensate/reconcile explicitly, and expose intermediate states. The architecture should evolve when constraints change, not from a pattern label.
+
+## Quiz Seeds
+
+1. Which invariant should stay in the inventory owner?
+2. Why is a timeout not proof that payment failed?
+3. What does the outbox protect, and what does it not protect?
+4. How does a workflow version prevent an old callback from regressing state?
+5. When would one local transaction beat a saga?
+6. Why is compensation not the same as rollback?
+7. What should happen to a reservation while payment is ambiguous?
+8. What operational data identifies a stuck workflow?
+
+## Related Topics
+
+- [Saga pattern](../07-distributed-coordination/saga-pattern.mdx) details compensation.
+- [Transactional outbox](../07-distributed-coordination/transactional-outbox.mdx) protects event publication.
+- [Idempotent consumers](../06-messaging/idempotent-consumers.mdx) handles duplicate steps.
+- [Distributed scheduler](../11-building-blocks/distributed-scheduler.mdx) supports timers/recovery.
+
+## References
+
+### Documentation / Articles
+
+- [AWS Prescriptive Guidance: Saga pattern](https://docs.aws.amazon.com/prescriptive-guidance/latest/cloud-design-patterns/saga.html) — explains orchestration/choreography and compensating actions with explicit trade-offs.
+- [Stripe idempotent requests](https://docs.stripe.com/api/idempotent_requests) — grounds retry-safe command APIs and ambiguous external outcomes.
+- [Temporal durable execution](https://docs.temporal.io/workflows) — demonstrates durable workflow state, timers, retries, and recovery semantics.
+- [PostgreSQL transactions](https://www.postgresql.org/docs/current/tutorial-transactions.html) — provides the local transaction baseline before crossing service boundaries.
+
+### Papers
+
+- [Sagas](https://dl.acm.org/doi/10.1145/38713.38742) — the original paper introducing long-lived transactions and compensating subtransactions.

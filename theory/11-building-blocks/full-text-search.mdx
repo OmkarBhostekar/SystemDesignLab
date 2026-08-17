@@ -1,0 +1,182 @@
+---
+type: lesson
+id: 11-05-full-text-search
+slug: full-text-search
+title: Full-Text Search
+description: Build and query an inverted index while balancing ingestion durability, ranking quality, freshness, and operational cost.
+module: building-blocks
+order: 5
+difficulty: advanced
+estimatedMinutes: 45
+prerequisites:
+  - 04-01-data-modeling-from-access-patterns
+  - 04-06-database-indexes
+  - 05-03-cache-aside
+  - 06-06-delivery-semantics
+  - 07-09-change-data-capture
+tags:
+  - full-text-search
+  - inverted-index
+  - ranking
+  - indexing-pipeline
+  - freshness
+objectives:
+  - Explain how an inverted index maps terms to documents and why tokenization changes results.
+  - Design a durable source-to-index ingestion path with replay, versions, and freshness measurement.
+  - Compare relevance, filtering, pagination, sharding, and cache strategies.
+  - Identify partial-index, schema, backfill, and query-tail failure modes.
+relatedLessons:
+  - 11-04-search-autocomplete
+  - 04-06-database-indexes
+  - 07-09-change-data-capture
+  - 06-07-idempotent-consumers
+---
+
+# Full-Text Search
+
+> Search is a read model built for language and relevance, not a secondary `LIKE` clause on the transactional database.
+
+## Why This Exists
+
+An OLTP database is excellent at finding a record by a known key or indexed equality/range predicate. A full-text query such as “wireless headphones with noise cancellation under $200” needs tokenization, stemming, field weights, phrase/proximity behavior, filters, and ranking across many documents. The naive design scans text columns or adds many ad-hoc indexes, consuming primary CPU and still producing poor relevance.
+
+The improvement builds a search-specific read model from durable source data. The new trade-off is asynchronous freshness, a second storage/index lifecycle, ranking complexity, reindex cost, and the possibility that search and the source disagree temporarily.
+
+## Mental Model
+
+```text
+document ─> analyze/tokenize ─> term ─> postings(docIDs, positions, fields)
+query    ─> same analyzer ─> postings intersection/union ─> score/filter/top K
+```
+
+An inverted index stores a dictionary of terms and a postings list for each term. The postings may include document IDs, term frequency, positions, and field information. A query combines lists, applies filters and scoring, then fetches stored fields or source records. Indexing the full document and storing a source copy are separate choices; storing only enough fields can reduce index size while keeping a canonical database as authority.
+
+Tokenization is part of the data contract. Case, punctuation, language, stemming, synonyms, and analyzers decide whether a query matches. Changing an analyzer can require a full reindex, so version analyzers and mappings.
+
+## How It Works
+
+Write the canonical document first, then publish an event or change-data-capture record. An indexer consumes it idempotently, transforms it with the versioned analyzer, and writes a document version. Deletes are events too; a tombstone must be retained long enough for lagging consumers and replays. A periodic reconciliation compares source versions with index versions.
+
+```text
+OLTP commit ─> outbox/CDC ─> durable stream ─> indexer ─> shard replica
+      │                                      └─ retry/DLQ/replay
+      └─ source remains authority
+```
+
+Search shards partition documents or terms. Document partitioning keeps a document's fields together but makes every broad query fan out; term partitioning can route terms but complicates multi-term queries. Search results should use a stable sort key and a cursor/search-after scheme instead of deep offset pagination, whose cost grows with skipped matches.
+
+Ranking may start with term-frequency/inverse-document-frequency and field boosts, then add freshness, business rules, or learned models. Do not let ranking work make the query tail unbounded; cap candidates and expose a fallback when a shard is slow.
+
+## Example
+
+An e-commerce catalog has 100 million products and receives 5,000 queries/s. The naive API sends text predicates to the primary product database. A sale causes query CPU and replication lag to rise, delaying writes. The improvement streams product changes into a sharded inverted index, caches popular query/filter combinations, and returns source fields from the index with a version marker.
+
+A product price changes at 12:00, but the index applies at 12:00:03. Search can show a slightly stale price; checkout must re-read the authoritative store and validate price/stock. During a reindex, build version 42 beside version 41, replay changes after the snapshot, verify counts/checksums, then atomically switch readers. The cost is double index storage and a cutover plan, but it prevents a partial schema migration from serving inconsistent fields.
+
+## Visualization We Eventually Want
+
+Build a **Search Pipeline and Query Lab**. Controls should include document rate, update/delete rate, event lag, analyzer version, shard count, query term frequency, fan-out, cache hit rate, ranking cost, and one failed shard. Show source/index version lag, postings-list sizes, candidate counts, per-shard latency, merge tail, stale/deleted hits, retry/DLQ backlog, and reindex progress. Scenarios should include a hot term, a schema migration, a poison document, and a slow shard. A query trace should show tokenization, postings operations, scoring, and final top-K.
+
+## Scaling Behavior
+
+Index size includes terms, postings, positions, stored fields, replicas, and segment/compaction overhead. Writes create new segments or updates and later merge; heavy update/delete workloads can consume I/O even when query QPS is stable. Shard by document ID or tenant, but test query fan-out and skew. A single popular term creates large postings and ranking work; filter early and cache stable candidates.
+
+Ingestion capacity must absorb source change rate plus backfill. Provision replay bandwidth separately from foreground query load. Search freshness is a measurable lag distribution, not a promise that all writes are immediately visible. Cache only queries whose authorization, filters, index version, and freshness policy are in the key.
+
+## Failure Modes
+
+- **Dropped event:** source commit succeeds but no index event exists.
+- **Duplicate/out-of-order event:** a late older version overwrites newer indexed content.
+- **Poison document:** one malformed record blocks a partition.
+- **Partial reindex:** mixed analyzers or mappings produce inconsistent results.
+- **Slow/missing shard:** fan-out query waits for a tail or returns incomplete results.
+- **Stale delete:** removed/private data remains searchable.
+- **Deep offset:** pagination work grows with page number and causes tail latency.
+- **Ranking abuse:** popularity or synonyms create irrelevant or unsafe results.
+
+Use an outbox/CDC, idempotent version checks, dead-letter and replay tooling, immutable versioned indexes, bounded query timeouts, partial-result policy, tombstones, and source-of-truth validation for critical fields.
+
+## Trade-offs
+
+An inverted index makes language queries fast but duplicates data and introduces freshness lag. Rich positions and stored fields improve relevance/response speed while consuming disk. More shards increase parallelism but multiply fan-out and merge tail. Query caches lower cost but are invalidated by updates, permissions, and analyzer versions. A managed engine reduces implementation burden but does not remove indexing semantics or capacity planning.
+
+## Alternatives
+
+- **Database text index:** choose for modest corpus/query load and strong transactional freshness.
+- **Materialized search table:** choose for a small set of exact prefixes/filters with predictable SQL access.
+- **External search engine:** choose for high-scale text, faceting, relevance, or typo tolerance.
+- **Vector/semantic retrieval:** choose when conceptual similarity matters; retain lexical filters and evaluate recall/latency.
+- **Offline batch search:** choose when freshness is hours or days and query cost can be precomputed.
+
+## When to Use
+
+Use an inverted index when query language, corpus size, relevance, or search isolation exceeds what the transactional store can serve. State the freshness SLA and authoritative fields.
+
+## When Not to Use
+
+Do not add a search cluster for a handful of exact lookups. Do not use search results as the source of truth for inventory, authorization, payment, or other correctness-critical decisions.
+
+## Common Misconceptions
+
+- **“The index is always current.”** Ingestion is asynchronous unless proven otherwise; measure lag.
+- **“Search is just a database index.”** Tokenization, postings, ranking, and shard fan-out change the workload.
+- **“At-least-once indexing creates duplicates.”** Stable document IDs and versioned upserts make replay safe.
+- **“A reindex can happen in place.”** Versioned side-by-side builds make rollback and consistency tractable.
+- **“More shards always reduce latency.”** Query fan-out and merge tails can dominate.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I keep the transactional database authoritative, publish durable change events, and build a versioned inverted-index read model. The index tokenizes documents, stores term postings, scores/filter candidates, and returns bounded top-K results. I define freshness lag, idempotent/out-of-order updates, deletes, shard fan-out, partial-result policy, cache keys, and side-by-side reindexing. Search accelerates discovery; checkout and authorization still validate the source.
+
+### When to Introduce It
+
+Introduce it when text predicates, relevance, corpus size, or query isolation make OLTP scans/indexes an observed bottleneck.
+
+### Common Follow-Ups
+
+- How does a source write reach the index?
+- What happens when an event is lost or duplicated?
+- How do you reindex after changing analyzers?
+- What consistency does a price/search result promise?
+- How do you control query fan-out and ranking tail latency?
+
+### Common Candidate Mistakes
+
+They omit the ingestion path, treat the index as authoritative, say “eventual consistency” without a lag metric, or ignore deletes and reindex cutover.
+
+## Summary
+
+Full-text search is a durable, replayable read model. Its hard boundaries are analysis semantics, freshness, ranking cost, shard fan-out, and reindexing. Keep correctness-critical reads on the source and make stale/partial search behavior explicit.
+
+## Quiz Seeds
+
+1. What does a postings list contain, and why might positions be stored?
+2. Why must delete events be durable tombstones?
+3. How does an analyzer change force a reindex?
+4. Why is search freshness a distribution rather than a single number?
+5. What happens if one shard is slow during a fan-out query?
+6. Why should checkout validate an indexed product price against the source?
+7. How does an outbox or CDC reduce lost index updates?
+8. Compare document and term partitioning for a multi-term query.
+
+## Related Topics
+
+- [Search autocomplete](./search-autocomplete.mdx) specializes the prefix access pattern.
+- [Change data capture](../07-distributed-coordination/change-data-capture.mdx) carries source updates into the index.
+- [Idempotent consumers](../06-messaging/idempotent-consumers.mdx) makes replayed index events safe.
+- [Database indexes](../04-databases/database-indexes.mdx) provides the OLTP baseline.
+
+## References
+
+### Documentation / Articles
+
+- [Apache Lucene index file formats](https://lucene.apache.org/core/3_6_2/fileformats.html) — explains documents, terms, postings, stored fields, and the inverted-index representation.
+- [Elasticsearch near real-time search](https://www.elastic.co/guide/en/elasticsearch/reference/current/near-real-time.html) — documents refresh visibility and why “indexed” is not identical to immediately searchable.
+- [PostgreSQL full-text search](https://www.postgresql.org/docs/current/textsearch.html) — provides a transactional-store baseline for dictionaries, parsing, ranking, and when an external index may be warranted.
+- [Apache Kafka design](https://kafka.apache.org/42/design/design/) — grounds durable event retention, partitions, replay, and consumer-group ingestion choices.
+
+### Papers
+
+- [The Anatomy of a Large-Scale Hypertextual Web Search Engine](https://research.google/pubs/the-anatomy-of-a-large-scale-hypertextual-web-search-engine/) — an original description of indexing and ranking concerns in a large search system.

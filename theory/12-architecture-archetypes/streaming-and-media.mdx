@@ -1,0 +1,181 @@
+---
+type: lesson
+id: 12-07-streaming-and-media
+slug: streaming-and-media
+title: Streaming and Media Systems
+description: Deliver large or continuous media through object storage, manifests, segments, CDNs, and bitrate-aware clients.
+module: architecture-archetypes
+order: 7
+difficulty: advanced
+estimatedMinutes: 45
+prerequisites:
+  - 01-03-latency-vs-throughput
+  - 01-04-percentiles-tail-latency
+  - 02-03-tcp-vs-udp
+  - 05-09-multi-layer-caching
+  - 06-09-backpressure
+  - 08-10-multi-region-and-region-failover
+  - 11-07-object-and-blob-storage
+  - 12-01-read-heavy
+tags:
+  - streaming
+  - media
+  - cdn
+  - object-storage
+  - bitrate
+  - manifests
+objectives:
+  - Distinguish on-demand, live, interactive, and upload/transcode media workload shapes.
+  - Evolve from direct origin serving to segmented objects, manifests, CDN, and multi-bitrate delivery.
+  - Estimate sustained bandwidth, storage, egress, origin fanout, and startup/tail latency.
+  - Explain segment duration, cacheability, backpressure, regional failure, and content protection trade-offs.
+relatedLessons:
+  - 11-07-object-and-blob-storage
+  - 05-09-multi-layer-caching
+  - 06-09-backpressure
+  - 08-10-multi-region-and-region-failover
+  - 02-03-tcp-vs-udp
+---
+
+# Streaming and Media Systems
+
+> Media architecture is sustained byte delivery plus control metadata: store and transform large objects, then distribute cacheable segments close to viewers while adapting to network conditions.
+
+## Why This Exists
+
+Serving a 2 GB video directly from one application server works for a demo and fails when 10,000 viewers request it: origin bandwidth, connections, and regional latency multiply. A live stream adds continuously arriving data, startup latency, and a moving edge. Interactive voice/video has a different shape again: low latency and jitter matter more than cacheability.
+
+The improvement separates ingest, metadata/manifests, media objects/segments, transcoding, and delivery. On-demand media is segmented and cached through a CDN; live media produces rolling segments and manifests; interactive media may use a real-time transport rather than HTTP object delivery. The new trade-offs are storage/egress cost, cache invalidation, encoding delay, bitrate ladders, regional failover, and content protection.
+
+## Mental Model
+
+```text
+upload/live ingest ─> durable source ─> transcode/package ─> segments + manifest
+                                                                    │
+viewer ─ manifest ─> CDN edge ─ cache miss ─> origin/object store ──┘
+```
+
+Separate payload and control paths. The manifest tells a client which representations/segments exist; segments carry bytes and should usually be immutable/versioned. The client measures throughput/buffer and chooses a bitrate. A CDN serves repeated segment requests, while origin capacity should not scale linearly with viewers.
+
+## How It Works
+
+For on-demand video, upload a source object, transcode into a bitrate/resolution ladder, segment it, generate a manifest, and publish metadata atomically enough that clients never see a manifest pointing to missing segments. Use immutable segment names and versioned manifests so CDN caches remain safe.
+
+For live, ingest creates segments continuously. A sliding manifest exposes the recent window; segment availability and encoder/origin delay define end-to-end latency. CDN caching of the newest segment is shorter and more sensitive to origin bursts. Backpressure, dropped frames, or quality reduction may preserve continuity.
+
+A CDN should authenticate access at the manifest/token layer and scope signed URLs/cookies; do not expose an unrestricted origin. Origin shield/peer cache and multi-region replicas reduce thundering misses. DRM/encryption/license services are separate control dependencies; encrypting bytes does not itself authorize playback.
+
+## Example
+
+A video platform has 1 million daily viewers, a 5 Mb/s average stream, and a live launch with 100,000 concurrent viewers. Direct origin serving would require roughly 500 Gb/s at the launch (100,000 × 5 Mb/s), before overhead. A CDN with 95% segment cache hit ratio leaves about 5,000 origin-equivalent streams during steady state, though a new live segment can cause a synchronized miss.
+
+The architecture stores originals in object storage, transcodes asynchronously, publishes HLS/DASH-like manifests and immutable segments, and uses a CDN. The client adapts bitrate from throughput/buffer. A regional origin failure shifts to replicated objects/CDN; a manifest service remains a smaller control-plane dependency. If the live encoder falls behind, the system lowers rendition, drops nonessential frames, or increases latency according to product policy.
+
+The new trade-off is startup/transcode delay, egress cost, CDN invalidation/versioning, and a larger operational pipeline. Interactive video calls should not copy this architecture wholesale: their latency/jitter and per-session routing requirements are different.
+
+## Visualization We Eventually Want
+
+Build a **Media Delivery and Bitrate Lab**. Controls should include viewer count, bitrate ladder, segment duration, cache hit ratio, origin bandwidth, CDN regions, startup buffer, network throughput/jitter/loss, encoder delay, live window, and origin failure. Show manifest/segment requests, cache hits/misses, origin fanout, buffer level, selected bitrate, rebuffer events, startup latency, egress bytes/cost, and failover. Presets should compare on-demand replay, live launch, low-bandwidth mobile, and interactive-call constraints.
+
+## Scaling Behavior
+
+Sustained bandwidth dominates: viewers × bitrate × concurrency, plus protocol/encoding overhead. Storage includes originals, renditions, segments, replicas, and retention. Segment duration trades request count/startup latency against cacheability and live latency. Smaller segments reduce latency but increase request/origin metadata and CDN churn.
+
+CDN hit ratio and regional demand determine origin load. A popular release can cause a cache miss storm at publication; prewarm known objects or use origin shield. Live newest segments have lower reuse than old on-demand segments. Transcoding is CPU/GPU-heavy and should be queued with backpressure; output explosion is proportional to renditions × duration.
+
+## Failure Modes
+
+- **Origin thundering herd:** many edges miss a new segment together.
+- **Missing segment/manifest race:** client receives control metadata before bytes are ready.
+- **Encoder/transcoder lag:** live latency grows or renditions diverge.
+- **CDN/region outage:** origin traffic and latency surge during failover.
+- **Slow viewer:** buffer drains, causing rebuffer or excessive server state.
+- **Bitrate ladder mismatch:** client chooses a rendition the network cannot sustain.
+- **Signed URL/DRM failure:** playback fails despite available bytes.
+- **Storage lifecycle mistake:** a manifest points to expired segments.
+- **Egress cost spike:** a viral object bypasses cache or traffic shifts regions.
+
+Use immutable/versioned objects, manifest readiness checks, cache/origin shielding, prewarming, bounded transcoder queues, adaptive bitrate, regional replicas, signed token scopes, lifecycle validation, and cost telemetry.
+
+## Trade-offs
+
+CDN caching lowers origin cost/latency but adds invalidation and provider dependence. Smaller segments lower live latency but raise request and cache overhead. More renditions improve adaptation but multiply transcode/storage/egress. Multi-region improves failover but costs replication and control-plane complexity. HTTP segment delivery is cache-friendly; interactive transports trade cacheability for latency/jitter.
+
+## Alternatives
+
+- **Direct object download:** choose for low concurrency or non-streaming files.
+- **Progressive HTTP download:** choose for simple on-demand media with modest adaptation needs.
+- **HLS/DASH-style adaptive segments:** choose for broad internet delivery and CDN caching.
+- **WebRTC/interactive media:** choose for sub-second interactive calls/games.
+- **Single-region origin + CDN:** choose when RTO/latency/business geography do not justify multi-region storage.
+- **Managed media pipeline:** choose when encoding/packaging complexity exceeds product differentiation, while retaining workload estimates.
+
+## When to Use
+
+Use this archetype when payloads are large or continuous and delivery bandwidth/latency dominate. Classify on-demand, live, upload/transcode, and interactive paths separately.
+
+## When Not to Use
+
+Do not use a CDN segment design for transactional APIs or interactive calls that need sub-second state exchange. Do not assume “media” means one bitrate, one region, or one retention window.
+
+## Common Misconceptions
+
+- **“CDN solves origin scale completely.”** Cache misses, new live segments, and regional failure still hit origin.
+- **“More bitrate is always better.”** It raises bandwidth/rebuffer risk on constrained clients.
+- **“A manifest is the media.”** It is control metadata pointing to versioned segments.
+- **“Streaming and video calls are the same.”** On-demand/live segment delivery differs from interactive low-latency sessions.
+- **“Signed URLs provide DRM.”** They limit capability; encryption/license policy is separate.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I separate ingest, metadata/manifests, transcoding, immutable media segments, and delivery. On-demand segments are CDN-cacheable; live manifests/segments use a rolling window and bounded latency; interactive media may need a different transport. I estimate viewers × bitrate, origin/cache hit ratio, segment/request overhead, encoding/storage/egress cost, and regional failover. Adaptive bitrate, origin shielding, signed access, lifecycle checks, and backpressure handle real-world failures.
+
+### When to Introduce It
+
+Introduce it after clarifying media type, concurrency, bitrate, startup/live-latency target, retention, geography, and whether interaction is required.
+
+### Common Follow-Ups
+
+- What is cached and what is immutable?
+- How do you handle a viral launch/cache miss storm?
+- How does a client choose bitrate?
+- What changes for live versus on-demand?
+- How does regional origin failure affect cost and latency?
+
+### Common Candidate Mistakes
+
+They draw a CDN without estimating sustained bandwidth, omit packaging/transcode/backpressure, conflate WebRTC with on-demand HTTP, or ignore segment/manifest races and egress cost.
+
+## Summary
+
+Media systems are bandwidth pipelines with a small control plane. Segment/version payloads, cache them near viewers, adapt to network conditions, and plan ingest/transcode/storage/egress/failover separately. Change the design when the workload shifts from replay to live or interactive.
+
+## Quiz Seeds
+
+1. What sustained bandwidth does 100,000 viewers at 5 Mb/s require?
+2. Why are immutable segments easier to cache than mutable objects?
+3. How does segment duration affect latency and request overhead?
+4. What happens to origin load when a new live segment misses at every edge?
+5. Why do more renditions multiply storage and transcoding work?
+6. Which path changes most for interactive video calls?
+7. How should a manifest avoid pointing at missing segments?
+8. What controls protect a transcoder from ingest bursts?
+
+## Related Topics
+
+- [Object and blob storage](../11-building-blocks/object-and-blob-storage.mdx) handles durable payloads/multipart transfers.
+- [Multi-layer caching](../05-caching/multi-layer-caching.mdx) explains CDN/origin placement.
+- [Backpressure](../06-messaging/backpressure.mdx) bounds ingest/transcode pipelines.
+- [TCP versus UDP](../02-networking/tcp-vs-udp.mdx) frames transport trade-offs.
+
+## References
+
+### Documentation / Articles
+
+- [HTTP Live Streaming (RFC 8216)](https://datatracker.ietf.org/doc/html/rfc8216) — specifies playlists, media segments, and live/on-demand delivery behavior.
+- [MPEG-DASH standard overview](https://www.iso.org/standard/79329.html) — anchors adaptive segment/manifest delivery as a standards-based alternative.
+- [Amazon CloudFront caching](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/Introduction.html) — documents edge caching, origin behavior, and distribution concerns.
+- [Amazon S3 multipart upload](https://docs.aws.amazon.com/AmazonS3/latest/userguide/mpuoverview.html) — grounds large-object ingest and resumability.
+- [WebRTC overview (W3C)](https://www.w3.org/TR/webrtc/) — distinguishes interactive real-time media/data constraints from cacheable HTTP segments.

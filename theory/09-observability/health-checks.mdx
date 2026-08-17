@@ -1,0 +1,171 @@
+---
+type: lesson
+id: 09-07-health-checks
+slug: health-checks
+title: Liveness, Readiness, and Dependency Health
+description: Separate process survival from traffic eligibility and dependency capability so probes support safe routing and recovery.
+module: observability
+order: 7
+difficulty: core
+estimatedMinutes: 28
+prerequisites:
+  - 09-03-golden-signals
+  - 03-04-health-checks-and-failover
+  - 08-05-circuit-breaker
+  - 08-07-load-shedding-and-graceful-degradation
+tags:
+  - health-checks
+  - liveness
+  - readiness
+  - dependency-health
+  - failover
+objectives:
+  - Distinguish liveness, readiness, startup, and dependency health semantics.
+  - Design bounded probes that do not create a cascading failure or restart loop.
+  - Use readiness for traffic routing while preserving diagnostics for degraded dependencies.
+  - Connect probe outcomes to load balancers, deployment rollouts, and graceful degradation.
+relatedLessons:
+  - 03-04-health-checks-and-failover
+  - 09-06-alerting
+  - 08-05-circuit-breaker
+  - 08-07-load-shedding-and-graceful-degradation
+---
+
+# Liveness, Readiness, and Dependency Health
+
+> A liveness probe asks whether a process should be restarted; readiness asks whether it should receive traffic; dependency health asks what capability is currently available.
+
+## Why This Exists
+
+A load balancer needs to stop routing to an instance that cannot serve requests. A deployment system also needs to wait for startup, migrations, and warm caches. The naive design exposes one `/health` endpoint that pings every dependency and restarts or removes an instance whenever any check fails. It turns a temporary database outage into a fleet-wide restart storm and erases the distinction between “process alive” and “feature unavailable.”
+
+Health signals are control inputs, not merely dashboard decoration. Liveness should be conservative: restart only when the process cannot make progress and a restart is likely to help. Readiness should be contract-specific: remove an instance from a pool when it cannot safely serve the class of traffic. Dependency checks should report capability, latency, and freshness without making the probe itself a new load path.
+
+## Mental Model
+
+```text
+startup probe ──> process initialized?
+liveness probe ─> process can make progress? ──no─> restart policy
+readiness probe ─> safe to receive traffic? ──no─> drain/remove from pool
+dependency health ─> which features/dependencies are usable? ──> degrade/failover
+```
+
+These states are not interchangeable. A service can be alive but not ready while warming a cache. It can be ready for reads but not writes because its primary database is unavailable. A dependency can be degraded while the service remains ready if optional recommendations are disabled. Encode capability or endpoint-specific readiness rather than one binary “all green” bit when the product supports graceful degradation.
+
+## How It Works
+
+1. During startup, a startup check allows initialization longer than steady-state liveness; it prevents a slow but healthy process from being killed repeatedly.
+2. Liveness checks a cheap local invariant: event loop progress, worker heartbeat, or ability to complete a bounded internal operation. It should not depend on the database or another service unless the process truly cannot recover without it.
+3. Readiness checks whether this instance can accept the relevant traffic: configuration loaded, listener bound, capacity available, and required dependencies reachable within a short budget. It can fail during graceful drain before shutdown.
+4. Dependency health runs separately, with caching, timeouts, and circuit semantics. Expose which dependency or capability is degraded and the last successful check, rather than blocking all probes on one slow call.
+5. The router/load balancer uses readiness with hysteresis or consecutive successes/failures so a transient blip does not flap traffic. The deployment controller uses readiness to gate rollout and drain connections before termination.
+
+Probe endpoints should be authenticated or isolated when they reveal topology, avoid returning secrets, and be rate-limited like any other endpoint. A probe response must be bounded in time and work; it should not perform an unbounded full-database scan or call every downstream on each load-balancer tick.
+
+## Example
+
+An order service has `/health/live`, `/health/ready`, and an internal dependency status. Liveness checks the process supervisor and worker heartbeat. Readiness requires configuration and the orders database connection pool to have capacity, but not the optional recommendation service. If inventory is unavailable, readiness for `POST /orders` becomes false or the route returns a clear degraded response according to the contract; `GET /orders` may remain ready.
+
+During a rolling deployment, the new instance passes startup, then readiness after migrations and connection warming. On shutdown it first fails readiness, drains active requests, and only then exits. If the database has a 30-second outage, dependency health reports degraded and a circuit/fallback protects the service; liveness remains healthy, so all instances are not restarted into the same outage.
+
+## Visualization We Eventually Want
+
+Show a fleet, router, service, database, and optional dependency with independent probe states. Controls should inject startup delay, process deadlock, dependency timeout, connection-pool exhaustion, probe interval, failure threshold, and drain time. Display routed traffic, restart count, readiness flaps, dependency status, and user outcomes. Compare one all-dependencies probe with separated liveness/readiness/capability probes to reveal restart amplification.
+
+## Scaling Behavior
+
+Probe frequency multiplied by instance count and dependency count becomes real traffic. Cache dependency status for a short bounded interval, add jitter to probe schedules, and use local health signals for high-frequency liveness. Large fleets need aggregated health and regional routing policies; one slow region should not make every global instance unready.
+
+Readiness can be multidimensional: separate pools for reads/writes, premium tenants, or queue workers. However, too many states complicate routers and rollout logic. Prefer a small set of explicit capabilities with documented fallback behavior. Probe results are eventually consistent control signals; routers should tolerate stale health for a bounded interval and provide a safe default.
+
+## Failure Modes
+
+- **Dependency-coupled liveness:** a database outage restarts every instance and deepens the outage.
+- **Readiness flapping:** one transient timeout repeatedly adds/removes capacity.
+- **False readiness:** the endpoint returns healthy while the worker queue or connection pool is exhausted.
+- **Probe amplification:** every load balancer poll performs expensive downstream work.
+- **Startup/restart loop:** initialization is slower than liveness timeout and never completes.
+- **Drain race:** traffic continues after readiness is false, causing dropped requests.
+- **Information leak:** public health output reveals dependency names, versions, or sensitive state.
+- **Single binary status:** optional dependency failure disables unrelated critical paths.
+
+## Trade-offs
+
+Aggressive liveness restarts can recover deadlocks quickly but risk synchronized loss of capacity. Conservative liveness preserves a degraded process for diagnosis. Strict readiness protects user experience but may remove too much capacity during a partial dependency outage. Dependency-aware readiness improves routing but couples the service to health semantics and can create probe load. Rich health details aid debugging but need access control and redaction.
+
+## Alternatives
+
+- **Passive health from real requests:** reflects true user behavior and avoids probe traffic, but detects failure only after harm.
+- **Synthetic black-box checks:** measures an external journey and catches routing/TLS issues; slower and less precise for internal state.
+- **Service mesh or load-balancer checks:** centralize routing policy, but application semantics still need an owner.
+- **Lease/heartbeat expiry:** useful for workers and stream consumers; not a substitute for endpoint readiness.
+
+## When to Use
+
+Use separate startup, liveness, readiness, and dependency signals whenever instances are restarted, routed, or rolled out automatically. Define what each state permits and how the service degrades when an optional capability is unavailable.
+
+## When Not to Use
+
+Do not add a liveness probe that merely mirrors every dependency, and do not use a health endpoint as a security or business correctness proof. A static process may need only an external synthetic check; a stateful worker needs explicit lease and backlog health.
+
+## Common Misconceptions
+
+- **“Unready means broken.”** It can mean intentionally draining or temporarily unable to serve one capability.
+- **“Liveness should check the database.”** A process can often remain alive and serve fallback/read-only work during a dependency outage.
+- **“A passing probe means users are healthy.”** Probes can be shallow, stale, or disconnected from real traffic.
+- **“More dependency checks are safer.”** They add load and can turn one failure into a cascade.
+- **“Readiness removes all in-flight requests immediately.”** Drain and connection semantics must be designed.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I separate startup, liveness, and readiness. Liveness is cheap and local so a dependency outage does not restart the fleet; readiness controls traffic eligibility and drain; dependency health reports capability and drives fallback or failover. Probes are bounded, hysteretic, access-controlled, and tested against startup delay, deadlock, dependency timeout, and probe amplification.
+
+### When to Introduce It
+
+Introduce these checks when the design uses load balancing, automatic restart, rolling deployment, failover, or graceful degradation.
+
+### Common Follow-Ups
+
+- What if the database is down but the service can serve cached reads?
+- How do you prevent readiness flapping?
+- Why not use one `/health` endpoint?
+- How do you drain traffic before termination?
+
+### Common Candidate Mistakes
+
+- Restarting on any dependency failure.
+- Making probes expensive or unauthenticated.
+- Omitting startup and drain behavior.
+- Treating a binary probe as proof of end-to-end user success.
+
+## Summary
+
+Health checks are control loops. Keep liveness local and conservative, use readiness for traffic and drain, and model dependency capability separately with bounded probes and fallback decisions. Avoid restart cascades and make routing behavior explicit.
+
+## Quiz Seeds
+
+1. What should liveness prove that readiness does not?
+2. Why can a dependency outage leave liveness healthy?
+3. How does a startup probe prevent restart loops?
+4. What mechanism reduces readiness flapping?
+5. Why should a probe avoid querying every downstream dependency synchronously?
+6. How can reads remain ready while writes are not?
+7. What race must be handled after readiness turns false during shutdown?
+
+## Related Topics
+
+- [Health Checks and Failover](../03-traffic-and-services/health-checks-and-failover.mdx)
+- [Actionable Alerting](./alerting.mdx)
+- [Circuit Breaker](../08-reliability/circuit-breaker.mdx)
+- [Load Shedding and Graceful Degradation](../08-reliability/load-shedding-and-graceful-degradation.mdx)
+
+## References
+
+### Documentation / Articles
+
+- [Liveness, Readiness, and Startup Probes](https://kubernetes.io/docs/concepts/configuration/liveness-readiness-startup-probes/) — documents distinct probe semantics and restart/readiness behavior.
+- [Monitoring Distributed Systems](https://sre.google/sre-book/monitoring-distributed-systems/) — discusses monitoring signals and the danger of relying on shallow checks.
+- [Circuit Breaker](https://martinfowler.com/bliki/CircuitBreaker.html) — explains using failure state to stop calls while preserving recovery behavior.
+- [Alerting](https://prometheus.io/docs/practices/alerting/) — reinforces symptom-based monitoring and metamonitoring.

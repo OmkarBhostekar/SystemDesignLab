@@ -1,0 +1,195 @@
+---
+type: lesson
+id: 11-01-rate-limiter
+slug: rate-limiter
+title: Rate Limiter
+description: Admit work at a deliberate rate while making burst, fairness, placement, and failure behavior explicit.
+module: building-blocks
+order: 1
+difficulty: core
+estimatedMinutes: 40
+prerequisites:
+  - 02-07-api-design-interviews
+  - 03-06-api-gateway
+  - 04-14-concurrency-control
+  - 05-02-local-and-distributed-cache
+  - 06-09-backpressure
+tags:
+  - rate-limiting
+  - admission-control
+  - token-bucket
+  - fairness
+  - abuse-prevention
+objectives:
+  - Compare fixed-window, sliding-window, token-bucket, and leaky-bucket behavior for a stated workload.
+  - Choose a rate-limit key, response contract, and placement that match fairness and failure requirements.
+  - Explain why a local limiter can disagree across instances and how a distributed limiter changes the cost model.
+  - Estimate burst capacity, storage traffic, and the consequences of fail-open versus fail-closed behavior.
+relatedLessons:
+  - 08-07-load-shedding-and-graceful-degradation
+  - 05-08-hot-keys
+  - 06-09-backpressure
+---
+
+# Rate Limiter
+
+> A rate limiter is an admission policy: it decides which work may enter a constrained system, at what average rate, and with what burst or fairness promise.
+
+## Why This Exists
+
+Without a limit, one tenant, bot, or retrying client can consume all worker threads, database connections, or provider quota. A naive API simply accepts every request and lets the downstream queue or timeout become the limiter. That gives the busiest caller the largest share and makes overload visible only after expensive work has started.
+
+The improvement is to reject or delay work before the scarce resource is exhausted. A good design states the identity being protected (user, API key, IP, tenant, route, or resource), the allowed average rate, the allowed burst, and what the caller should do after rejection. The new trade-off is state, coordination, clock/expiry behavior, and the possibility of rejecting useful work during a dependency incident.
+
+HTTP `429 Too Many Requests` is a useful protocol signal, but it does not prescribe how requests are counted or who is identified. The limiter still needs a business policy and an overload policy.
+
+## Mental Model
+
+Think of a limiter as a meter at a door:
+
+```text
+request + identity ──> policy state ──> admit ──> expensive work
+                              └──────> reject / retry-after
+```
+
+The four common algorithms answer different questions:
+
+| Algorithm | Rule | Strength | Characteristic failure or cost |
+| --- | --- | --- | --- |
+| Fixed window | Count requests in each wall-clock window | Tiny state and simple counters | Boundary burst: two windows can be consumed back-to-back |
+| Sliding-window log | Keep timestamps and count the last interval | Accurate history and smooth boundary | Memory and cleanup grow with request rate |
+| Sliding-window counter | Blend current and previous bucket counts | Bounded state and smoother than fixed | An approximation near the boundary |
+| Token bucket | Refill tokens at rate `r`, cap at `B`; each request spends tokens | Explicit average rate and burst capacity | Requires atomic refill/spend and careful time handling |
+| Leaky bucket | Queue/emit at a fixed drain rate | Smooth downstream work | Adds waiting, queue capacity, and queue-overflow policy |
+
+Token bucket is often the clearest interview model: `tokens = min(B, tokens + elapsed × r)`, then admit only if enough tokens remain. It allows a bounded burst of `B` while preserving long-run rate `r`. A leaky bucket is a traffic shaper when work should leave at a steady rate; it is not automatically a better rejection limiter.
+
+## How It Works
+
+For a local limiter, store policy state in the process and update it atomically. For a distributed limiter, the check-and-update must be one logical operation at a shared owner. A Redis script, a partitioned counter service, or a gateway with sticky ownership can provide that boundary; a read followed by a write can race and admit too much.
+
+```text
+client ─> edge/gateway ─> limiter owner(key) ─> service
+                           │
+                           └─ count/tokens with atomic update
+```
+
+The key is a product decision. A per-IP limit can protect against anonymous abuse but punishes NATs. A per-user limit is fairer after authentication but leaves login and token endpoints exposed. A tenant limit protects noisy neighbors; a per-route or weighted-cost limit protects expensive endpoints. Multi-dimensional limits (for example, tenant plus endpoint) need a deterministic order and a clear error when any dimension is exhausted.
+
+When rejecting, return a bounded response body and, where useful, `Retry-After`. Do not make every rejected request perform expensive authentication or database work. Never trust a client-supplied identity header without a trusted gateway boundary.
+
+## Example
+
+An image API allows 100 requests/s per API key with a burst of 200. Token bucket state is partitioned by API key and route. One key sends 200 requests in the first second: all can pass if the bucket was full, then only 100 tokens/s replenish. A second key gets its own budget, so one customer cannot consume another's allowance.
+
+The naive fixed window counts 100 requests from `12:00:59.9` and 100 from `12:01:00.1`, allowing 200 in 200 ms. Sliding-window counting removes that sharp boundary but costs more state. A leaky queue can smooth image transformations to 100/s, yet it must cap queue age and tell callers whether they are waiting or rejected. If the limiter's shared store is unavailable, fail-open preserves availability but exposes the service; fail-closed preserves the budget but can turn a limiter outage into a global outage. A common compromise is local emergency limits plus a short, observable fail-open window for low-risk routes.
+
+## Visualization We Eventually Want
+
+Build a **Limiter Laboratory** with a request timeline and one panel per algorithm. Controls should include arrival rate, number of identities, limit rate, burst size, window length, cost per request, number of gateway instances, shared-store latency/failure, and fail-open/fail-closed mode. Show admitted, rejected, queued, token balance, boundary bursts, per-identity fairness, store operations, p50/p99 decision latency, and downstream queue depth. Presets should include a synchronized window boundary, one abusive tenant, a hot shared key, and a limiter-store partition. A text event log and a step button should make the admission decision inspectable without relying on animation.
+
+## Scaling Behavior
+
+State is proportional to active limit keys and retention, not just total users. Expire idle keys, bound cardinality, and protect the limiter store itself from a key-cardinality attack. A single hot key can overload one partition even when aggregate limiter capacity looks adequate; shard by key or use hierarchical limits carefully.
+
+Local limiters have low latency and survive a shared-store outage, but an eight-instance fleet can admit roughly eight times a nominal limit unless traffic is sticky or budgets are divided. A centralized limiter gives a global view at the cost of a network hop, hot partitions, and another dependency. A hierarchical design uses a local coarse guard plus a shared per-tenant budget; its accounting is approximate unless every admission is serialized.
+
+Rate is not concurrency. A request that takes 10 seconds can pass a 100 requests/s limiter and still exhaust workers. Combine rate limits with concurrency caps, timeouts, and backpressure when service time is variable.
+
+## Failure Modes
+
+- **Window boundary burst:** fixed windows admit a surprising cluster at the boundary.
+- **Non-atomic update:** concurrent callers both observe the same remaining budget.
+- **Clock jump:** wall-clock changes refill or expire state incorrectly; use a monotonic elapsed time where possible.
+- **Hot key:** one tenant maps to one overloaded limiter partition.
+- **Store partition:** gateways disagree or all reject depending on policy.
+- **Retry amplification:** clients retry `429` immediately and multiply decision traffic.
+- **Key spoofing/cardinality attack:** an attacker creates identities until state or authentication is exhausted.
+- **Queue expiry:** leaky-bucket requests wait past their useful deadline.
+
+Mitigate with atomic scripts/CAS, bounded TTLs, jittered client retry guidance, per-tenant metrics, admission cost limits, circuit breakers around the store, and explicit degraded mode. Measure both limiter decisions and the downstream saturation it is meant to prevent.
+
+## Trade-offs
+
+Smoother algorithms consume more state or CPU. Central coordination improves global fairness but adds latency and a failure boundary. Fail-open protects availability but weakens abuse protection; fail-closed protects capacity but makes the policy dependency critical. A limiter can protect a service while harming user experience if it ignores request cost, priority, or tenant entitlements.
+
+## Alternatives
+
+- **Concurrency limit:** choose when in-flight work, not arrivals per second, is the bottleneck.
+- **Load shedding:** choose when the service is already unhealthy and low-priority work must be dropped quickly.
+- **Quota/budget ledger:** choose for monthly or daily entitlements; it needs durable accounting rather than a short-rate algorithm.
+- **Queue with backpressure:** choose when work can wait and eventual completion is more valuable than immediate rejection.
+- **Provider quota:** use as a second boundary, never assume an internal limiter replaces a third-party quota.
+
+## When to Use
+
+Introduce a limiter when clients are untrusted, a dependency has a hard quota, tenants need fairness, or overload must be stopped before expensive work. State the key, algorithm, rate, burst, response, and degraded mode.
+
+## When Not to Use
+
+Do not add a global fixed limit to a tiny private service with no shared bottleneck. Do not use rate limiting to hide an under-provisioned service when queueing or capacity planning is the real fix. Do not promise exact global fairness from independent local counters.
+
+## Common Misconceptions
+
+- **“A limiter controls load perfectly.”** It controls the metric it counts; request cost and concurrency may still overload the service.
+- **“Token bucket and leaky bucket are interchangeable.”** One permits bounded bursts; the other shapes output through a queue.
+- **“A `429` tells clients when to retry exactly.”** It is a signal; retry timing and budget remain part of the contract.
+- **“A distributed cache automatically makes a distributed limiter correct.”** The check and mutation must be atomic and scoped.
+- **“Fail-open is always safer.”** It preserves availability while potentially violating a security or provider quota.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I start by naming the protected identity, endpoint cost, average rate, burst, and rejection contract. Token bucket makes burst and refill explicit; sliding windows give smoother history; leaky bucket shapes queued work. A local limiter is fast but per-instance, while a distributed limiter needs an atomic shared update and adds a dependency. I also define store failure, hot keys, retries, and whether rate or concurrency is the real bottleneck.
+
+### When to Introduce It
+
+Introduce it after clarifying tenant fairness, abuse risk, provider quotas, or a measured overload path—not as a decorative gateway box.
+
+### Common Follow-Ups
+
+- How do multiple gateway instances share a limit?
+- What happens if the limiter store is down?
+- How do you rate-limit expensive requests differently?
+- Why is a token bucket preferable to a fixed window here?
+- How do clients learn when to retry?
+
+### Common Candidate Mistakes
+
+Candidates often omit the key and burst semantics, count with a non-atomic read/write, or confuse rate with concurrency. They may also claim a centralized store gives unlimited scale without planning partitions and failover.
+
+## Summary
+
+Choose the algorithm from the required burst and smoothness, not its name. Make identity, cost, atomicity, placement, response, and degraded mode explicit. A limiter is useful only when its own state path remains safer and cheaper than the work it rejects.
+
+## Quiz Seeds
+
+1. Why can a fixed window admit nearly two windows of traffic in a short interval?
+2. A token bucket has refill rate 10/s and capacity 50. What is the largest immediate burst from a full bucket?
+3. Why can eight local limiters each configured for 100/s admit far more than 100/s globally?
+4. When is a leaky bucket preferable to a token bucket?
+5. What must be atomic in a shared-store limiter?
+6. Would a rate limiter prevent overload from 100 requests that each run for 60 seconds? What additional control is needed?
+7. Compare fail-open and fail-closed behavior during limiter-store failure for a public payment endpoint.
+8. Which key would you choose for a multi-tenant API and what abuse does it leave open?
+
+## Related Topics
+
+- [Load shedding and graceful degradation](../08-reliability/load-shedding-and-graceful-degradation.mdx) complements admission control under active overload.
+- [Hot keys](../05-caching/hot-keys.mdx) explains skew in shared state.
+- [Backpressure](../06-messaging/backpressure.mdx) covers downstream queue protection.
+- [API design interviews](../02-networking/api-design-interviews.mdx) frames the response contract.
+
+## References
+
+### Documentation / Articles
+
+- [RFC 6585: Additional HTTP Status Codes](https://www.rfc-editor.org/rfc/rfc6585.html) — defines `429 Too Many Requests`, its meaning, and the optional `Retry-After` hint.
+- [Envoy global rate limiting](https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/other_features/global_rate_limiting.html) — documents a gateway-side distributed rate-limit boundary and its failure considerations.
+- [NGINX request rate limiting](https://nginx.org/en/docs/http/ngx_http_limit_req_module.html) — provides a concrete leaky-bucket-style implementation and its burst/delay controls.
+- [Redis rate limiter patterns](https://redis.io/docs/latest/develop/use-cases/rate-limiter/) — shows atomic counter/token approaches and makes the shared-state cost visible.
+
+### Papers
+
+- [An analysis of rate control in computer networks](https://dl.acm.org/doi/10.1145/75159.75161) — grounds token/leaky-bucket reasoning in traffic shaping rather than a vendor recipe.

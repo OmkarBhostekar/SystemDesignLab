@@ -1,0 +1,217 @@
+---
+type: lesson
+id: 13-05-notification-service
+slug: notification-service
+title: Notification Service
+description: Design durable, preference-aware multi-channel delivery with provider failures, retries, deduplication, and user-visible status.
+module: design-labs
+order: 5
+difficulty: advanced
+estimatedMinutes: 55
+prerequisites:
+  - 00-03-estimation
+  - 00-04-interview-framework
+  - 06-01-sync-vs-async
+  - 06-07-idempotent-consumers
+  - 08-02-retries
+  - 08-03-exponential-backoff-and-jitter
+tags:
+  - notifications
+  - fanout
+  - provider-failures
+  - retries
+  - deduplication
+objectives:
+  - Separate notification intent, preference evaluation, delivery attempts, and provider adapters.
+  - Design at-least-once workflows whose user-visible effects are duplicate-safe.
+  - Estimate fanout, queue capacity, provider rate limits, and retention.
+  - Choose channel ordering and degradation behavior when providers or preferences are unavailable.
+relatedLessons:
+  - 06-06-delivery-semantics
+  - 06-08-dead-letter-queues
+  - 07-08-transactional-outbox
+  - 08-04-retry-storms-and-cascading-failures
+visualizationId: null
+quizId: null
+---
+
+# Notification Service
+
+> A notification system is a durable intent pipeline, not a loop that calls an email provider: preferences, retries, provider quotas, and duplicate user effects all need an explicit boundary.
+
+## Problem Statement
+
+Design a service that sends transactional and optional marketing notifications by email, SMS, push, or in-app inbox. Producers submit an event such as “payment captured” or “comment mentioned you.” Users choose channel preferences and quiet hours. Providers can time out, throttle, duplicate, or accept a message without returning a response. The candidate must preserve critical notifications without spamming users or turning a provider outage into a producer outage.
+
+## Functional Requirements (Scoped)
+
+- Accept a typed notification intent with recipient, template/data, priority, deduplication key, and expiry.
+- Resolve user/tenant preferences, quiet hours, consent, locale, and channel fallback.
+- Schedule immediate or delayed delivery; retry transient provider failures with bounded backoff.
+- Record attempt and final status; expose status/query and a user-facing inbox for selected events.
+- Support cancellation/suppression before delivery and operator replay of safe failures.
+
+Out of scope: template authoring UI, arbitrary message content from untrusted callers, marketing segmentation, and an exactly-once guarantee from the service to every external provider.
+
+## Non-Functional Requirements and Priorities
+
+| Priority | Requirement | Working target / question |
+| --- | --- | --- |
+| P0 | Critical durability | Accepted transactional intents are not silently lost; define retention and replay. |
+| P0 | Duplicate safety | A retry does not send the same critical effect twice when the provider supports a key; otherwise surface the residual risk. |
+| P0 | Isolation | Marketing spikes cannot starve password resets or fraud alerts. |
+| P1 | Timeliness | p95 critical delivery under 30 s outside provider incidents; delayed notifications have explicit SLA. |
+| P1 | Compliance | Consent, unsubscribe, data retention, and audit records are enforceable. |
+| P2 | Cost | Batch low-priority sends and avoid storing full payloads longer than necessary. |
+
+## Estimation Prompts and Checked Example
+
+Ask for active users, intents/day, average channels per intent, template/payload size, provider quotas, retry rate, and peak event multiplier. Illustrative assumptions:
+
+- 5M DAU produce 8 notification intents/day → 40M intents/day, or `≈463 intents/s` average; a 10× peak is `≈4,630/s`.
+- Average 1.4 channels/intent gives `56M delivery jobs/day ≈648 jobs/s`; if a launch doubles channel fanout, workers need about `1,300 jobs/s` before retries.
+- At 2 KB job metadata and 7-day retry/audit retention, `56M × 2 KB × 7 ≈784 GB` logical event/attempt data before indexes/replicas. Separate payload blobs or template IDs can reduce this.
+- If 3% of jobs retry twice, one day's attempted provider calls are `56M + (56M × 0.03 × 2) = 59.36M`; capacity must use calls, not accepted intents.
+
+Ask whether provider limits are global or per sender and whether a critical path may fall back from push to email. Provider quota is a hard bottleneck even if internal workers are plentiful.
+
+## API Design
+
+```http
+POST /v1/notification-intents
+Idempotency-Key: event-payment-123
+{
+  "type":"payment.captured","recipientId":"u_42",
+  "dedupeKey":"payment:pay_123:capture","priority":"critical",
+  "channels":["push","email"],"data":{"amount":"19.00"},
+  "expiresAt":"2026-08-18T12:00:00Z"
+}
+```
+
+Return `202 Accepted` with `{intentId, state:"queued"}` once the intent is durably stored, not after provider delivery. Repeating the same idempotency key and request hash returns the same intent; a changed body returns `409`. `GET /v1/notification-intents/{id}` exposes state and channel attempts without provider secrets. `DELETE`/suppress is idempotent and returns a version conflict (`409` or `412`) when a delivery already crossed an irreversible boundary.
+
+Use `400` for invalid template/data, `403` for unauthorized tenant, `409` for duplicate/conflicting intent, `429` for caller quota, and `503` only when the service cannot durably accept the intent. A worker retries provider `429/5xx` and transport ambiguity with the provider's idempotency key; it does not retry invalid recipient or consent failures. A timeout after provider acceptance is reconciled via provider status/webhook when available.
+
+## Data Model, Access Paths, and Ownership
+
+```text
+notification_intents(intent_id PK, producer_tenant, recipient_id, type,
+  dedupe_key, priority, payload_ref, state, expires_at, created_at,
+  UNIQUE(tenant, dedupe_key))
+deliveries(delivery_id PK, intent_id, channel, provider, state,
+  attempt_count, provider_message_id, next_attempt_at, last_error,
+  UNIQUE(intent_id, channel))
+preferences(recipient_id, event_type, channel, mode, quiet_hours, version)
+inbox(recipient_id, event_id, read_at, created_at, payload_ref)
+```
+
+The notification service owns intent/delivery state and adapter policy. Preference/profile ownership remains with the account service, but a versioned snapshot is stored with the intent so a later preference change does not silently rewrite an already-accepted transactional decision. Workers claim due deliveries with a lease; the provider adapter owns provider credentials and idempotency mapping. A DLQ stores exhausted jobs with a reason and replay guard.
+
+## Progressive Architecture: Naive → Bottleneck → Improvement → New Trade-off
+
+1. **Naive:** producer synchronously calls email/SMS/push. Provider latency and outages block business requests; duplicate producer retries can send two messages.
+2. **Bottleneck/failure:** one shared queue and worker pool decouple producers, but marketing traffic fills the queue and one provider's slow responses consume all workers; preference reads and templates become per-message database chatter.
+3. **Improvement:** durably store intents, publish via an outbox, partition queues by priority/channel/tenant, snapshot preferences, use provider adapters with bounded retries and keys, and route dead jobs to a DLQ.
+4. **New trade-off:** asynchronous delivery is eventually consistent and status is not an immediate “sent” guarantee. Priority isolation costs capacity, snapshots can be stale, and provider fallback may violate user channel intent unless policy is explicit.
+
+Reference architecture:
+
+```text
+Producer → Intent API → intent DB + outbox → priority topics/queues
+                                      ↓
+                              preference/template resolver
+                                      ↓
+                     channel workers → provider adapters → providers
+                                      ├→ delivery state/status
+                                      └→ DLQ/reconciliation
+```
+
+The outbox closes the producer-state/event gap; queues absorb provider variability; delivery state and provider idempotency provide a practical effectively-once effect where supported.
+
+## Bottlenecks and Concurrency / Consistency
+
+Provider quotas, hot recipients, template rendering, preference reads, queue partition skew, and delivery-state contention dominate. Deduplicate intent creation with a unique `(tenant,dedupeKey)`; deduplicate each channel delivery with a unique row and a lease/fencing token. Do not hold a database transaction while calling a provider. Preference consistency is a product choice: critical opt-outs should be read from an authoritative/fast path, while a durable intent keeps the accepted snapshot. At-least-once queues require idempotent workers.
+
+## Failure Analysis
+
+- **Provider timeout after acceptance:** query/webhook by provider idempotency key; mark `unknown` and reconcile, not blindly resend.
+- **Worker crash after send before state update:** lease expiry redelivers; provider key or dedupe table prevents a duplicate where possible.
+- **Outbox lag:** business write succeeds while notification is delayed; alert on outbox age and expose `queued` status.
+- **Queue partition hot spot:** hash by recipient or tenant intentionally, then isolate celebrities/large campaigns.
+- **Preference service outage:** use a bounded cached policy/snapshot; fail closed for marketing and use a reviewed fallback for critical security events.
+- **Provider outage:** trip an adapter circuit, back off with jitter, route only policy-approved fallback channels, and preserve critical jobs.
+
+## Security
+
+Authorize producers to send only tenant-owned event types/recipients; validate templates and escape rendered content. Enforce consent/unsubscribe and protect phone/email tokens. Encrypt payloads and minimize PII in queues/logs, with retention and deletion workflows. Rotate provider secrets, use least privilege, verify webhooks, and prevent notification endpoints from becoming phishing or SMS-cost abuse vectors.
+
+## Observability
+
+Track accepted intents, dedupe hits, queue depth/age by priority/channel/tenant, worker utilization, provider latency/status/rate-limit responses, attempts per success, unknown outcomes, DLQ size/age, delivery latency, preference denials, fallback rate, and cost per channel. Trace intent ID through outbox, queue, worker, and provider; correlate provider message IDs without exposing recipient PII. Alert separately on critical delivery SLO burn, marketing backlog, and provider-specific failure.
+
+## Explicit Trade-offs and Alternatives
+
+- **Synchronous provider call vs durable async:** sync gives immediate response but couples availability; async gives durability and status semantics.
+- **Push vs pull fanout:** push creates one delivery job per channel/recipient and isolates latency; pull can reduce writes for inbox views but shifts work to reads.
+- **Provider fallback:** increases success but can violate cost, consent, or channel expectations; require an explicit policy.
+- **Exactly-once vs at-least-once:** external providers rarely offer true end-to-end exactly-once; use keys, dedupe, and reconciliation.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+“I accept a notification intent durably, publish it through an outbox, then resolve a versioned preference snapshot and deliver through isolated channel workers. Queues are at-least-once, so each intent/channel has a unique key, provider idempotency key, bounded retry, and reconciliation for unknown outcomes. Priority queues, provider quotas, and DLQs keep a campaign outage away from password resets; `202` means accepted, not delivered.”
+
+### When to Introduce It
+
+Introduce queues when provider latency/outages or fanout makes a synchronous producer path unsafe. Add an outbox when intent creation is coupled to another service's transaction; add priority isolation when one workload can starve another.
+
+### Common Follow-Ups
+
+- How do you prevent duplicate emails after a worker crash?
+- What does 202 mean to the producer?
+- How do preferences change after an intent is accepted?
+- What happens when SMS is throttled for an hour?
+
+### Common Candidate Mistakes
+
+Claiming “exactly one email,” logging PII in every retry, retrying permanent consent errors, and using one unbounded queue for all priorities.
+
+## Summary
+
+Persist intent before delivery, isolate channels and priorities, and make every retry duplicate-safe at the narrowest provider boundary. Delivery is a workflow with unknown outcomes and compliance constraints, not a fire-and-forget HTTP call.
+
+## Quiz Seeds
+
+1. Why should the API return 202 instead of 200 “sent” after storing an intent?
+2. Where does a unique dedupe key live for a notification intent and a channel delivery?
+3. Which failure creates an unknown provider outcome?
+4. Why are transactional preferences snapshots useful?
+5. How should a marketing burst affect password-reset jobs?
+6. What metric distinguishes provider throttling from an internal worker shortage?
+7. When is channel fallback unsafe?
+8. Why is an outbox needed if the producer already publishes to a queue?
+
+## Related Topics
+
+- [Delivery semantics](../06-messaging/delivery-semantics.mdx) — scopes at-most/at-least/effectively-once claims.
+- [Idempotent consumers](../06-messaging/idempotent-consumers.mdx) — duplicate-safe worker effects.
+- [Transactional outbox](../07-distributed-coordination/transactional-outbox.mdx) — durable intent publication.
+- [Retries](../08-reliability/retries.mdx) — error classification and deadlines.
+
+## References
+
+### Documentation / Articles
+
+- [Firebase Cloud Messaging](https://firebase.google.com/docs/cloud-messaging) — describes push delivery components and why acceptance is not user-visible receipt.
+- [Amazon SES quotas](https://docs.aws.amazon.com/ses/latest/dg/quotas.html) — provides a concrete provider rate/quota boundary to model.
+- [Twilio messaging status callbacks](https://www.twilio.com/docs/messaging/guides/webhook-request) — illustrates asynchronous provider status and webhook verification concerns.
+- [Google SRE: Handling Overload](https://sre.google/sre-book/handling-overload/) — grounds priority isolation, admission, and graceful degradation.
+
+### Papers
+
+- [Kafka: a Distributed Messaging System for Log Processing](https://notes.stephenholiday.com/Kafka.pdf) — explains durable partitioned messaging patterns commonly used for fanout pipelines.
+
+## Future Visualization / Workspace Spec
+
+Simulate an intent flowing through outbox, priority queues, preference snapshot, channel worker, provider acceptance, timeout, retry, and DLQ. Controls should vary channel fanout, provider quotas, latency/errors, dedupe support, quiet hours, queue partition skew, and critical-vs-marketing mix. Show queue age, attempts, unknown outcomes, duplicate prevention, provider throttles, and user-visible state. The workspace should include Producer, Intent DB, Outbox, Queues, Workers, Provider, and Reconciler nodes with labeled ownership and retry boundaries.

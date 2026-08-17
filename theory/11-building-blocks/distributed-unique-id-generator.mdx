@@ -1,0 +1,183 @@
+---
+type: lesson
+id: 11-02-distributed-unique-id-generator
+slug: distributed-unique-id-generator
+title: Distributed Unique ID Generator
+description: Generate identifiers across writers without a central bottleneck while making ordering, leakage, and clock behavior explicit.
+module: building-blocks
+order: 2
+difficulty: core
+estimatedMinutes: 35
+prerequisites:
+  - 00-03-estimation
+  - 01-02-horizontal-vs-vertical-scaling
+  - 04-14-concurrency-control
+  - 07-01-clocks-and-ordering
+  - 07-05-leases-and-fencing-tokens
+tags:
+  - unique-ids
+  - snowflake
+  - ordering
+  - clocks
+  - coordination
+objectives:
+  - Compare database sequences, UUID variants, random IDs, and timestamp/node/sequence layouts.
+  - Separate uniqueness, local generation, sortability, opacity, and global ordering requirements.
+  - Explain worker-ID allocation, sequence overflow, clock rollback, and persistence choices.
+  - Estimate ID space and generator throughput for a multi-region workload.
+relatedLessons:
+  - 07-01-clocks-and-ordering
+  - 07-05-leases-and-fencing-tokens
+  - 04-14-concurrency-control
+  - 04-10-consistent-hashing
+---
+
+# Distributed Unique ID Generator
+
+> “Unique ID” is not one guarantee: decide whether the system needs collision resistance, monotonic order, time-sortability, opacity, compactness, or a single global sequence.
+
+## Why This Exists
+
+A single auto-increment database sequence is easy to reason about, but every writer must reach one authority. Under multi-region writes or a large fan-out, that sequence adds latency and becomes a write bottleneck. Generating `max(id) + 1` independently is worse: concurrent writers collide, and retry behavior is ambiguous.
+
+The improvement is to generate IDs close to writers with enough namespace or coordination to avoid collisions. The new trade-off is larger identifiers, gaps, weaker ordering, clock dependence, or an allocation service that still needs high availability.
+
+## Mental Model
+
+Treat an ID as a tuple of guarantees rather than a number:
+
+```text
+ID = namespace | time/order component | writer identity | local sequence/randomness
+```
+
+| Strategy | Uniqueness authority | Order | Useful properties | Cost |
+| --- | --- | --- | --- | --- |
+| Database sequence | One database/sequence owner | Strong for allocation order | Compact, simple | Central bottleneck; gaps after rollback are normal |
+| UUID/random 128-bit | Probability/algorithm | No meaningful creation order unless a time-ordered variant | Offline generation, opaque, huge space | Index locality and storage overhead; not literally mathematical proof of uniqueness |
+| Range allocation | Database grants blocks to writers | Roughly allocation order | Fewer central calls | Gaps, block loss, and a lease/renewal protocol |
+| Timestamp + node + sequence | Configured namespace and local state | Usually roughly time-sortable | Compact, fast, no request-time coordinator | Clock rollback, worker identity, sequence overflow |
+| Global service | Durable authority | Strongest chosen ordering | One contract for all writers | Availability/latency dependency and operational ownership |
+
+Snowflake-style layouts are a practical timestamp/node/sequence family, not a magic standard. A typical signed 64-bit layout reserves a timestamp epoch, worker/datacenter bits, and a per-millisecond sequence. The exact bit allocation is an engineering contract with an expiration horizon and a maximum rate per worker.
+
+## How It Works
+
+For a local time-based generator, read a monotonic-safe timestamp, compare it to the previous value, and increment a sequence when multiple IDs share the same tick. If the clock moves backward, options include blocking until it catches up, borrowing a logical clock/epoch, or failing rather than emitting IDs that may collide or reorder. Blocking protects uniqueness but creates availability and latency risk.
+
+Worker IDs must be unique in the scope encoded into the ID. Static configuration is simple but fragile during autoscaling. A coordination service can lease worker IDs with fencing/epochs; the generator must stop when its lease is no longer valid. Never assign worker identity from an untrusted hostname alone.
+
+If the sequence space is exhausted in one timestamp unit, block until the next unit or reject. If the timestamp field overflows at the chosen epoch, the format must be migrated before that date. Store the epoch and bit contract as part of the schema, not only in code comments.
+
+## Example
+
+An order system has 64 writer workers across two regions and needs IDs generated offline, sortable for recent pages, and safe at 2,000 IDs/ms per worker. A 41-bit millisecond timestamp, 10 bits of worker identity, and 12 bits of sequence can represent a long horizon and 4,096 IDs/ms per worker, assuming the worker identity is stable and clock rollback is handled.
+
+The naive global sequence adds one round trip for every order and turns a region partition into an order-creation outage. A random UUID removes the coordination dependency but makes time-ordered scans and clustered indexes less friendly. The Snowflake-style design is fast and compact, but two workers accidentally sharing an ID or one worker continuing after clock rollback can break uniqueness. The system must monitor sequence utilization, clock offset, duplicate rejects, and worker lease expiry.
+
+## Visualization We Eventually Want
+
+Build an **ID Generator Timeline**. Let learners choose sequence, UUID, range allocation, or timestamp/node/sequence; set workers, rate per worker, clock skew/jumps, worker-ID collisions, bit allocation, and restart behavior. Show generated IDs in numeric and creation order, collisions, gaps, sequence exhaustion, blocking time, and sortable pagination. A failure preset should pause a worker, roll its clock backward, and reassign its worker ID; the event log should identify which guarantee was violated or preserved.
+
+## Scaling Behavior
+
+Local generation scales with workers until the chosen sequence or CPU/hash cost is exhausted. Central sequences scale with the authority's write path and network latency. Range allocation amortizes coordination but reserves unused IDs when a worker crashes. Random IDs move the scaling concern to index size, collision probability, and serialization rather than allocation.
+
+Estimate bits from the required horizon and rates. If a timestamp has `T` distinct units and a worker needs `R` IDs/unit, the sequence needs at least `ceil(log2(R))` bits. Worker bits must cover the maximum concurrently active namespace, including safe reuse after leases expire. Multi-region uniqueness can come from globally unique worker IDs, region bits, or independent UUID namespaces; it does not come from local clocks alone.
+
+## Failure Modes
+
+- **Clock rollback:** two timestamps can reuse the same time/sequence range.
+- **Worker-ID collision:** separate generators emit identical tuples.
+- **Restart state loss:** a generator restarts with the same timestamp and sequence.
+- **Sequence overflow:** a hot worker blocks or silently wraps.
+- **Epoch/bit exhaustion:** IDs stop fitting the original contract.
+- **Central allocator outage:** range/sequence issuance blocks new IDs.
+- **Ordering overclaim:** IDs sort by generation hints, not necessarily commit or causality order.
+- **Guessable IDs:** sequential IDs leak volume or enable enumeration.
+
+Mitigate with leased worker identities, persisted last timestamp where necessary, rollback policy, alerts before horizon/sequence exhaustion, opaque public IDs or access checks, and separate internal order keys from public references.
+
+## Trade-offs
+
+Compact sortable IDs improve index locality and pagination but expose approximate creation time and need clock/worker coordination. UUIDs are easy to generate anywhere but consume more bytes and do not answer “which came first?” A global sequence gives a clear order but sacrifices locality and availability. Gaps are generally acceptable; pretending IDs are contiguous couples correctness to an unnecessary and brittle property.
+
+## Alternatives
+
+- **Database-generated identity:** choose when one writer database already owns the transaction and global order matters locally.
+- **UUIDv4/random:** choose when opaque, offline generation matters more than index locality.
+- **Time-ordered UUID:** choose when standard libraries and larger opaque IDs are acceptable.
+- **Range/block allocation:** choose when a central database can grant blocks but request-time coordination must be reduced.
+- **Application natural key:** choose only when a domain identifier is already immutable and collision-free; do not force a synthetic generator where it adds no value.
+
+## When to Use
+
+Use a distributed generator when many independent writers need IDs before a central commit, when database hot spots are measured, or when sortability materially improves storage/pagination. Clarify whether uniqueness is global, per tenant, per entity type, or per operation.
+
+## When Not to Use
+
+Do not build a new ID service for a single database that already has a reliable sequence. Do not select a time-based ID solely because it “scales” while ignoring public enumeration or legal privacy requirements. Do not use generated IDs as a substitute for idempotency keys; a retry must reuse the same operation key when the business effect must be one-time.
+
+## Common Misconceptions
+
+- **“Snowflake IDs are globally ordered.”** They are usually approximately time-sortable, not a total order across clocks and regions.
+- **“UUID means collision impossible.”** The probability can be negligible, but the system still needs a collision/error strategy.
+- **“A sequence has no gaps.”** Rollbacks, allocation blocks, and crashes naturally create gaps.
+- **“NTP makes clocks safe for uniqueness.”** Time synchronization reduces skew; it does not enforce worker identity or prevent rollback.
+- **“An ID can be both opaque and reveal creation time.”** Those are competing information-leak choices.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I first separate uniqueness, ordering, opacity, and generation latency. A database sequence is simplest inside one writer; UUIDs decentralize generation; a Snowflake-style ID combines an epoch timestamp, leased worker identity, and local sequence for compact approximate ordering. The hard parts are worker-ID ownership, clock rollback, sequence overflow, and bit-horizon planning. Public IDs may need an opaque layer, and idempotency keys are a separate contract.
+
+### When to Introduce It
+
+Introduce a distributed generator after estimating writer count, ID rate, persistence/index needs, and whether a single database sequence is actually a bottleneck.
+
+### Common Follow-Ups
+
+- How are worker IDs assigned and reclaimed?
+- What happens when the clock moves backward?
+- Are IDs ordered across regions?
+- What happens when a worker emits more than its sequence capacity?
+- Why not use UUIDs?
+
+### Common Candidate Mistakes
+
+They claim strict global order, omit worker-ID allocation, use wall-clock time without a rollback policy, or confuse uniqueness with idempotency.
+
+## Summary
+
+Pick an ID format from explicit guarantees. Distributed time-based IDs trade a central bottleneck for worker identity and clock protocols; UUIDs trade index/storage efficiency for simple decentralization. Plan horizon, rollback, overflow, restart, and public exposure before claiming the generator is complete.
+
+## Quiz Seeds
+
+1. Which properties does a database sequence provide that UUIDv4 does not?
+2. Why can a Snowflake-style generator produce duplicate IDs after a worker-ID collision?
+3. What are three valid responses to a clock moving backward?
+4. A worker needs 5,000 IDs per millisecond. How many sequence bits are required?
+5. Why are gaps in a sequence usually acceptable?
+6. How is an idempotency key different from a generated entity ID?
+7. What guarantee does a timestamp component leak to a public API client?
+8. What must happen before a timestamp field reaches its epoch horizon?
+
+## Related Topics
+
+- [Clocks and ordering](../07-distributed-coordination/clocks-and-ordering.mdx) explains why timestamps do not establish causality.
+- [Leases and fencing tokens](../07-distributed-coordination/leases-and-fencing-tokens.mdx) gives a safe model for worker ownership.
+- [Concurrency control](../04-databases/concurrency-control.mdx) explains sequence allocation and unique constraints.
+- [Consistent hashing](../04-databases/consistent-hashing.mdx) is an alternative ownership tool, not an ID generator.
+
+## References
+
+### Documentation / Articles
+
+- [Twitter Snowflake archive](https://github.com/twitter-archive/snowflake) — the original service and source illustrate the timestamp, worker, and sequence decomposition and its operational assumptions.
+- [UUID specifications (RFC 9562)](https://www.rfc-editor.org/rfc/rfc9562.html) — defines UUID variants and the semantics/format choices behind random and time-ordered identifiers.
+- [PostgreSQL sequence manipulation](https://www.postgresql.org/docs/current/functions-sequence.html) — documents sequence allocation, caching, and why rollback does not make values contiguous.
+- [ULID specification](https://github.com/ulid/spec) — provides a readable time-sortable identifier alternative and makes its monotonicity limits explicit.
+
+### Papers
+
+- [Time, clocks, and the ordering of events in a distributed system](https://lamport.azurewebsites.net/pubs/time-clocks.pdf) — grounds the distinction between timestamp sorting and causal ordering.

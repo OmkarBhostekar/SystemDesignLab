@@ -1,0 +1,180 @@
+---
+type: lesson
+id: 09-03-golden-signals
+slug: golden-signals
+title: Golden Signals
+description: Use latency, traffic, errors, and saturation to detect user impact and choose the next operational action.
+module: observability
+order: 3
+difficulty: core
+estimatedMinutes: 26
+prerequisites:
+  - 09-01-logs-metrics-and-traces
+  - 01-04-percentiles-tail-latency
+  - 06-09-backpressure
+  - 08-07-load-shedding-and-graceful-degradation
+tags:
+  - golden-signals
+  - latency
+  - traffic
+  - errors
+  - saturation
+  - capacity
+objectives:
+  - Define latency, traffic, errors, and saturation at a user-relevant boundary.
+  - Distinguish symptoms from causes and pair signals with concrete mitigations.
+  - Measure asynchronous systems with queue age, lag, and worker saturation.
+  - Explain why averages, CPU-only dashboards, and request counts can hide incidents.
+relatedLessons:
+  - 09-04-sli-slo-and-sla
+  - 09-06-alerting
+  - 08-05-circuit-breaker
+  - 06-09-backpressure
+---
+
+# Golden Signals
+
+> The four golden signals are a compact starting lens: measure what users wait for, send, fail to do, and what resource is running out.
+
+## Why This Exists
+
+An operations team can collect thousands of host, runtime, and dependency metrics and still miss a customer-visible outage. CPU may be normal while a queue is full; request volume may be high while every request returns a cached error; average latency may look healthy while the slowest 1% times out. The naive dashboard lists whatever a platform exports, not what decisions the service needs to make.
+
+Golden signals compress the first operational question into four dimensions: latency, traffic, errors, and saturation. They are not a complete monitoring system or a universal SLO template. They help an operator detect the symptom, size the event, and choose whether to shed work, add capacity, roll back, or investigate a dependency.
+
+## Mental Model
+
+```text
+traffic → work admitted → latency experienced → errors observed
+                └──────── saturation / queueing ────────┘
+```
+
+- **Latency:** time experienced by the caller, usually distributions and percentiles, not only a mean.
+- **Traffic:** demand entering a boundary, such as requests/s, messages/s, bytes/s, or active connections.
+- **Errors:** requests or operations that did not meet the contract, including explicit failures, timeouts, rejected work, and sometimes invalid business outcomes.
+- **Saturation:** how close a limiting resource is to exhaustion—CPU, connections, queue capacity, memory, rate limit, worker slots, or dependency budget.
+
+The signal boundary matters. A gateway's 200 response may represent an asynchronous acceptance, while the user's actual business completion fails later. Define whether “error” means HTTP failure, eventual job failure, or both, and show each separately.
+
+## How It Works
+
+At the user-facing edge, count requests by route template, method, status class, and outcome. Record latency as a histogram or suitable distribution so p50, p95, and p99 can be computed. For traffic that fans out, distinguish incoming demand from downstream call rate; retries are additional traffic even when user request rate is unchanged.
+
+Define an error policy. A timeout, rejected queue admission, and dependency failure often count as errors if the user did not get the promised result. A 404 for a missing resource may be a valid outcome rather than an error. Business failure (no inventory) may deserve its own outcome even if the HTTP status is 200.
+
+Measure saturation at the bottleneck: queue depth and age, worker utilization, DB connection pool wait, memory pressure, rate-limit tokens, or dependency concurrency. CPU alone is a poor proxy for a blocked IO service. Record capacity and headroom so an operator can predict time to exhaustion.
+
+Use the signals as a loop:
+
+1. Confirm user-impact latency/error change.
+2. Compare traffic to normal and identify whether demand or behavior changed.
+3. Locate saturation or queue growth at the first constrained hop.
+4. Apply the least risky mitigation: stop a rollout, shed optional work, increase capacity, or isolate a dependency.
+5. Verify recovery and watch for retry amplification or backlog debt.
+
+## Example
+
+An image-processing API receives 500 requests/s, with p99 latency rising from 800 ms to 8 s and 5xx errors at 3%. CPU is only 55%, but the worker queue is 95% full and oldest job age grows. Traffic is normal; saturation is in worker slots and queue capacity. The immediate action is to reject or defer low-priority jobs with a retry-after/status endpoint, then add workers or reduce per-image cost. Adding web servers alone cannot drain the bottleneck.
+
+For an asynchronous email service, user-facing request latency may remain 50 ms while queue age grows from 1 minute to 45 minutes. The golden signal is not only HTTP latency: message traffic, delivery failure rate, oldest queue age, and worker saturation describe the promised completion.
+
+## Visualization We Eventually Want
+
+Build a workload simulator with request rate, service capacity, queue size, dependency latency, failure rate, and retry toggles. Plot p50/p95/p99 latency, incoming vs retry traffic, errors by contract, queue age/depth, and resource saturation. Presets should include a CPU-bound service, IO-bound connection-pool exhaustion, and an async worker backlog. Let the learner apply rate limiting, load shedding, rollback, or capacity and observe which signals move first.
+
+## Scaling Behavior
+
+As traffic grows, aggregate metrics by bounded dimensions and retain tenant/route breakdowns only where they support a decision. Percentiles should be computed from histograms or mergeable distributions; averaging per-instance p99 values can misrepresent the fleet. In a sharded or multi-region service, report fleet and worst-partition views.
+
+Saturation is often nonlinear: queueing latency can stay low until utilization approaches capacity, then increase sharply. A worker can be “50% CPU” but saturated on a downstream pool. For async work, queue age and lag are often more predictive than depth because a few huge jobs can hide old work.
+
+## Failure Modes
+
+- **Average-only latency:** a small timeout population disappears in the mean.
+- **Wrong error denominator:** counting only 5xx hides client timeouts, rejected work, or eventual job failures.
+- **CPU as saturation:** IO, connection, memory, and queue limits exhaust first.
+- **Traffic blind spot:** retries and fan-out inflate dependency load without increasing user request count.
+- **Unbounded labels:** per-user or raw-path dimensions make dashboards and alerts unusable.
+- **Delayed completion ignored:** an async API reports success while its queue silently misses its completion objective.
+- **Metric pipeline failure:** a healthy-looking dashboard reflects stale or partial telemetry.
+
+## Trade-offs
+
+Golden signals are easy to communicate and map to action, but they omit domain-specific correctness, cost, and security signals. More dimensions aid diagnosis but increase cardinality and operator cognitive load. Aggressive alert thresholds catch short blips but create noise; longer windows reduce pages but delay response. A single fleet aggregate hides hotspots; per-tenant or per-region views cost more but expose fairness and blast radius.
+
+## Alternatives
+
+- **USE method (utilization, saturation, errors):** useful for resource-centric infrastructure diagnosis; pair with user latency and traffic.
+- **RED method (rate, errors, duration):** convenient for request-driven services; add queue and resource saturation for async or capacity-limited systems.
+- **Business KPIs:** necessary for correctness (orders completed, money settled), but should not replace technical symptoms.
+- **Full SLO dashboard:** best once user journeys and objectives are defined; golden signals are the first compact view.
+
+## When to Use
+
+Use golden signals on every user-facing service, worker pool, and dependency boundary. Define each signal in terms of the contract and bottleneck, then connect it to a runbook action.
+
+## When Not to Use
+
+Do not treat the four names as a checklist that proves reliability. A batch pipeline may need freshness and correctness; a payment system needs settlement state; a security system needs detection latency. Add domain indicators where they change decisions.
+
+## Common Misconceptions
+
+- **“Traffic is always user requests.”** It can be messages, bytes, fan-out calls, retries, or active streams.
+- **“An error is every non-2xx response.”** Valid business outcomes and client errors need an explicit contract.
+- **“Saturation means CPU > 80%.”** Any bounded resource can saturate.
+- **“Golden signals identify root cause.”** They expose symptoms and likely bottlenecks; traces/logs establish causal evidence.
+- **“A queue depth of zero means healthy.”** A stuck consumer may have no visible depth while completed work is late.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I start with user-boundary latency percentiles, demand rate, contract-defined errors, and the first constrained resource. I include retries and fan-out in traffic, measure queue age for async work, and avoid CPU-only saturation proxies. The signals tell me whether to roll back, shed optional work, add capacity, or trace a dependency; they are symptoms, not a complete root-cause model.
+
+### When to Introduce It
+
+Introduce golden signals as soon as a service has a user or downstream contract, especially before selecting autoscaling, alert thresholds, or failure mitigation.
+
+### Common Follow-Ups
+
+- Which failures count in your error rate?
+- Why is p99 more useful than mean latency here?
+- How do you measure saturation for a queue consumer?
+- What if traffic is normal but errors spike?
+
+### Common Candidate Mistakes
+
+- Showing only CPU, memory, and request count.
+- Alerting on a single instance's noisy percentile.
+- Ignoring retries as extra traffic.
+- Forgetting business completion after asynchronous acceptance.
+
+## Summary
+
+Latency, traffic, errors, and saturation create a small, actionable first view. Define them at the right contract boundary, use distributions and bounded dimensions, include async age and retry load, and pair symptoms with traces, logs, and business outcomes.
+
+## Quiz Seeds
+
+1. Why can p99 latency rise while average latency barely changes?
+2. Name two forms of saturation that are not CPU utilization.
+3. Should a valid “item not found” response count as a server error? What contract decides?
+4. Why must retries be included in downstream traffic?
+5. Which signal reveals an async worker is late even when HTTP request latency is low?
+6. A queue is 95% full but CPU is 40%. What bottleneck is plausible, and what action follows?
+7. Why are fleet-wide percentile averages unsafe for tail diagnosis?
+
+## Related Topics
+
+- [SLI, SLO, and SLA](./sli-slo-and-sla.mdx)
+- [Actionable Alerting](./alerting.mdx)
+- [Backpressure](../06-messaging/backpressure.mdx)
+- [Load Shedding and Graceful Degradation](../08-reliability/load-shedding-and-graceful-degradation.mdx)
+
+## References
+
+### Documentation / Articles
+
+- [Monitoring Distributed Systems](https://sre.google/sre-book/monitoring-distributed-systems/) — introduces the four golden signals and symptom-oriented monitoring.
+- [Observability primer](https://opentelemetry.io/docs/concepts/observability-primer/) — connects telemetry to user reliability and distributed behavior.
+- [Metrics](https://opentelemetry.io/docs/concepts/signals/metrics/) — describes aggregations, histograms, and cardinality limits.
+- [Alerting](https://prometheus.io/docs/practices/alerting/) — recommends alerts on user symptoms with enough slack to avoid noise.

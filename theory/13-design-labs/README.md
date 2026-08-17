@@ -1,10 +1,10 @@
 # Module 13 — Interview Design Labs
 
-**Status:** Scaffold only. Lab prompts, reference architectures, and interactive workspace behavior are not yet authored.
+**Status:** Theory complete for all 20 canonical labs. The Markdown-first prompts, worked estimates, reference architectures, failure analysis, interview lenses, quiz seeds, annotated references, and future workspace specifications are authored; interactive workspace behavior remains a later application milestone.
 
 ## Purpose
 
-Provide progressively less-scaffolded practice applying the full interview method to realistic systems. Every lab should move through requirements, capacity estimation, APIs, data model, high-level architecture, deep dive, failure analysis, trade-offs, and a reference architecture. The reference is for comparison, not an automatic correctness score.
+Provide progressively less-scaffolded practice applying the full interview method to realistic systems. Every authored lab moves through requirements, capacity estimation, APIs, data model, progressive high-level architecture, bottlenecks/concurrency, failure analysis, security, observability, trade-offs, and a reference architecture. The reference is for comparison, not an automatic correctness score.
 
 ## Depth classification
 
@@ -53,8 +53,18 @@ Provide progressively less-scaffolded practice applying the full interview metho
 
 - Labs are the downstream application of every preceding module, not a replacement for theory.
 - The design-lab workspace described by the PRD should expose prompts for requirements, estimation, API, data, architecture, bottlenecks, failures, trade-offs, and reference comparison.
-- Future review and interview mode can use lab attempts, but the initial scaffold does not imply an evaluator or an AI dependency.
+- Future review and interview mode can use lab attempts, but these Markdown sources do not imply an evaluator or an AI dependency.
+
+## Authored lab inventory
+
+The canonical files are now present in the order below:
+
+- Beginner: `13-01-url-shortener`, `13-02-rate-limiter`, `13-03-unique-id-generator`, `13-04-pastebin`.
+- Intermediate: `13-05-notification-service`, `13-06-chat-and-messaging`, `13-07-news-feed`, `13-08-search-autocomplete`, `13-09-web-crawler`, `13-10-file-sync-and-drive`, `13-11-metrics-and-monitoring-platform`, `13-12-distributed-message-queue`.
+- Advanced Backend: `13-13-ticket-and-hotel-booking`, `13-14-e-commerce-inventory-and-ordering`, `13-15-payment-system`, `13-16-digital-wallet`, `13-17-distributed-key-value-store`, `13-18-object-storage`, `13-19-ride-hailing-and-nearby-drivers`, `13-20-video-streaming-platform`.
+
+All twenty files intentionally remain theory-only (`visualizationId: null`, `quizId: null`) until the corresponding interactive registries and workspace are implemented.
 
 ## Authoring boundary
 
-No lab is complete because its name appears here. Each future lab must have a problem statement, prompts, a reference solution and rationale, related concept links, and a way to compare the learner's design with the reference without pretending that one architecture is universally correct.
+The authored labs satisfy the theory/reference boundary above. The future design-lab UI still needs a guided checklist, learner/reference comparison, editable architecture canvas, and persistence; those application capabilities are intentionally not claimed by these Markdown sources.

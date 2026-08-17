@@ -1,0 +1,172 @@
+---
+type: lesson
+id: 11-09-realtime-presence
+slug: realtime-presence
+title: Real-Time Presence
+description: Represent ephemeral online state with heartbeats, leases/TTLs, connection gateways, and best-effort fanout.
+module: building-blocks
+order: 9
+difficulty: core
+estimatedMinutes: 35
+prerequisites:
+  - 02-06-realtime-transports
+  - 03-04-health-checks-and-failover
+  - 05-05-eviction-and-ttl
+  - 06-03-pub-sub-and-topics
+  - 08-01-timeouts
+tags:
+  - presence
+  - heartbeat
+  - ttl
+  - websocket
+  - pub-sub
+objectives:
+  - Model presence as an expiring lease rather than durable truth.
+  - Design heartbeat, disconnect, reconnect, and multi-device semantics with bounded staleness.
+  - Separate connection ownership from presence fanout and durable user state.
+  - Explain why pub/sub loss, clock/TTL behavior, and gateway failure produce approximate presence.
+relatedLessons:
+  - 02-06-realtime-transports
+  - 06-03-pub-sub-and-topics
+  - 05-05-eviction-and-ttl
+  - 12-04-realtime
+---
+
+# Real-Time Presence
+
+> Presence is a short-lived observation (“this session has renewed recently”), not a durable claim that a human is online.
+
+## Why This Exists
+
+A chat or collaboration product wants to show “online,” “away,” or “last seen.” Storing a boolean in the user database fails when a process crashes or a mobile device loses connectivity: no one clears the bit. A heartbeat endpoint improves detection but writes every connection to a primary database and still races across multiple devices.
+
+The improvement treats each session or connection as an expiring lease. Gateways renew it periodically; a presence service aggregates active sessions and publishes changes. The new trade-off is heartbeat traffic, false offline/online windows, pub/sub loss, and the need to avoid making ephemeral presence a correctness dependency.
+
+## Mental Model
+
+```text
+connection gateway -- heartbeat/renew --> session TTL store
+       │                                      │
+       └─ disconnect --------------------------┘
+                                              └─ best-effort presence event
+```
+
+For a user with multiple devices, `online` is the OR of active sessions. `away` may be an application inactivity signal, not a network fact. `last seen` is durable-ish metadata with a different privacy and freshness contract. A TTL expiry says the service has not heard from a session within a grace window; it does not prove the device is powered off.
+
+## How It Works
+
+On connection, a gateway creates a session ID scoped to the authenticated user and sets `presence:session` with an expiry. Heartbeats renew it before expiry. Use server-observed time/TTL, not a client timestamp, to decide liveness. A gateway disconnect removes the session only if its owner token/version still matches; a late disconnect must not delete a newer reconnect.
+
+Presence state can be stored in a partitioned TTL-capable store, with a pub/sub channel or stream for change notifications. Pub/sub is useful for low-value live fanout but is commonly at-most-once; a reconnecting client should fetch a current snapshot rather than expect every transition. Durable presence history belongs in a separate store if the product needs audit/analytics.
+
+Choose heartbeat interval `H` and expiry `E` so `E > H + network/jitter budget`. Short intervals make offline detection faster but multiply traffic and battery usage. Use a grace period to avoid flapping when a mobile connection is briefly quiet. Presence updates should be coalesced and rate-limited per user/room; not every heartbeat needs a broadcast.
+
+## Example
+
+A chat app has 5 million concurrent sessions and sends heartbeats every 20 seconds. A naive database boolean creates 250,000 writes/s before reconnect churn. The improved gateway renews session keys in a partitioned TTL store every 25 seconds with a 75-second expiry and emits a room-level change only when the user's aggregate state changes.
+
+A gateway dies after a session renews but before publishing “online.” Another gateway still sees the TTL and publishes on the next snapshot; live watchers may be briefly stale. A mobile device drops off without a close frame; the session expires after the grace window. A reconnect creates a new session; an old delayed disconnect carries the old session token and cannot clear the new one. The trade-off is at-most-minutes presence staleness in exchange for low durable-write cost.
+
+## Visualization We Eventually Want
+
+Build a **Presence Expiry and Fanout Lab**. Controls should include session count, devices per user, heartbeat interval, TTL/grace, packet loss, gateway failure, reconnect delay, room subscribers, pub/sub loss, and snapshot refresh. Show session keys, renewals, expirations, aggregate user state, online/offline transitions, false-offline window, heartbeat QPS, and fanout events. Scenarios should include a gateway crash, mobile network loss, duplicate reconnect, and a large room. A current-snapshot panel must remain understandable when event animation is disabled.
+
+## Scaling Behavior
+
+Heartbeat traffic is approximately concurrent sessions divided by the heartbeat interval. At 5 million sessions/25 seconds, that is roughly 200,000 renewals/s before retries and fanout. Partition by session/user hash, use pipelined renewals where safe, and keep hot rooms separate from the write path. Room fanout can be much larger than heartbeat traffic; aggregate changes and use pull snapshots for large audiences.
+
+TTL expiry work may be approximate and delayed under store load. Size expiry/renewal capacity and monitor expiration lag. Multi-region presence needs a scope: region-local online, globally merged presence, or nearest-region view. Cross-region active-active merges should tolerate duplicate sessions/events and partitioned observations.
+
+## Failure Modes
+
+- **Missed heartbeat:** a healthy mobile client appears offline after the grace window.
+- **Gateway crash:** connection closes but TTL remains until expiry.
+- **Late disconnect:** old owner clears a new session without fencing.
+- **Pub/sub loss:** watchers miss a transition and remain stale.
+- **TTL lag:** expiry notification is later than the nominal deadline.
+- **Heartbeat storm:** reconnect causes every client to renew at once.
+- **Hot room:** one room's presence fanout overloads a gateway.
+- **Privacy leak:** presence is exposed to an unauthorized user or tenant.
+
+Use owner/session tokens, jittered heartbeat schedules, snapshot-on-reconnect, bounded fanout, ACL checks, expiry-lag metrics, and graceful “unknown/recently seen” UI semantics. Never use a stale presence bit to authorize a critical action.
+
+## Trade-offs
+
+Short TTLs improve freshness but increase traffic and false-offline risk. Durable stores improve queryability but cost writes and retention. Pub/sub gives low-latency fanout but can lose events; streams or snapshots provide recovery at more storage/processing cost. Gateway-local state lowers latency but is lost on failure and difficult to aggregate globally.
+
+## Alternatives
+
+- **Gateway-local connections plus periodic snapshot:** choose for small rooms where exact live state is not required.
+- **Durable event stream:** choose when presence transitions feed analytics or replayable workflows.
+- **Client pull/last-seen:** choose when seconds/minutes of staleness and low battery/network use matter.
+- **Database heartbeat rows:** choose for low concurrency/admin systems where write cost is small.
+- **CRDT/mergeable session sets:** choose for multi-region active-active semantics when conflict resolution is worth the complexity.
+
+## When to Use
+
+Use expiring presence for chat, collaboration, gaming, and dashboards where approximate liveness is useful and a stale result is acceptable. Define session scope, expiry bound, privacy, and recovery snapshot behavior.
+
+## When Not to Use
+
+Do not use presence to decide payment, authorization, reservation, or safety-critical state. Do not persist every heartbeat merely to support a “last seen” display; separate the analytics requirement from liveness.
+
+## Common Misconceptions
+
+- **“A WebSocket close event is reliable.”** Mobile networks and process crashes often provide no clean close.
+- **“TTL zero means exactly offline now.”** Expiry and notifications can be delayed.
+- **“Pub/sub gives a complete history.”** At-most-once channels can lose events; resync from state.
+- **“One user has one presence key.”** Multiple devices/sessions need aggregation.
+- **“Heartbeat means the human is active.”** It means a session renewed; activity is a separate signal.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I model each authenticated connection as a short lease renewed by a heartbeat. A TTL store aggregates sessions per user; gateway disconnects are best-effort and fenced by session ID, while pub/sub broadcasts changes. Since events can be lost and TTL expiry is approximate, clients resync snapshots on reconnect and the product exposes bounded-stale/unknown semantics. Presence is never the source of truth for critical authorization or transactions.
+
+### When to Introduce It
+
+Introduce it when users need a live/last-seen hint across many persistent connections and the product can tolerate a bounded false-online/offline window.
+
+### Common Follow-Ups
+
+- How many heartbeats per second at five million sessions?
+- What if the gateway crashes before disconnect?
+- How do multiple devices combine?
+- How do clients recover missed pub/sub events?
+- What if a user is online in two regions?
+
+### Common Candidate Mistakes
+
+They store a boolean in the primary DB, trust clean disconnects, omit TTL/heartbeat estimates, or treat pub/sub events as durable state.
+
+## Summary
+
+Presence is an expiring observation. Use session-scoped leases, server-side TTL, fenced disconnects, snapshot recovery, and bounded fanout. Choose freshness and battery/network cost deliberately, and keep correctness-critical workflows independent of presence.
+
+## Quiz Seeds
+
+1. Why does a boolean `online` column become stale after a gateway crash?
+2. Choose heartbeat `H` and expiry `E` for a stated jitter budget.
+3. Why does a late disconnect need a session token?
+4. What happens when a client misses pub/sub events?
+5. Estimate renewals/s for 5 million sessions at 25-second intervals.
+6. How should multi-device presence aggregate?
+7. Why can TTL expiry notifications be delayed?
+8. Which business decisions must not rely on presence?
+
+## Related Topics
+
+- [Real-time transports](../02-networking/realtime-transports.mdx) carries persistent connections.
+- [Pub/sub and topics](../06-messaging/pub-sub-and-topics.mdx) contrasts live fanout and durable streams.
+- [Eviction and TTL](../05-caching/eviction-and-ttl.mdx) explains expiry behavior.
+- [Real-time archetype](../12-architecture-archetypes/realtime.mdx) composes gateways, presence, and fanout.
+
+## References
+
+### Documentation / Articles
+
+- [Redis key expiration](https://redis.io/docs/latest/develop/using-commands/keyspace/) — documents TTL precision, persistence, replication, and the non-instant nature of expiration events.
+- [Redis Pub/Sub delivery semantics](https://redis.io/docs/latest/develop/pubsub/) — explicitly describes at-most-once delivery and why disconnected subscribers need a resync path.
+- [WebSocket protocol (RFC 6455)](https://www.rfc-editor.org/rfc/rfc6455.html) — defines the persistent transport and close/control frames underneath a gateway design.
+- [Server-Sent Events (HTML Living Standard)](https://html.spec.whatwg.org/multipage/server-sent-events.html) — provides a browser-native one-way streaming alternative and reconnect behavior.

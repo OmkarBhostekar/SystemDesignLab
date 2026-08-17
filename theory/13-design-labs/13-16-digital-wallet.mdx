@@ -1,0 +1,207 @@
+---
+type: lesson
+id: 13-16-digital-wallet
+slug: digital-wallet
+title: Digital Wallet
+description: Design a balance-correct wallet with double-entry ledger, concurrent transfers, duplicate-safe commands, limits, and recovery.
+module: design-labs
+order: 16
+difficulty: deep-dive
+estimatedMinutes: 80
+prerequisites:
+  - 00-03-estimation
+  - 00-04-interview-framework
+  - 04-04-acid-and-transactions
+  - 04-05-transaction-isolation
+  - 04-14-concurrency-control
+  - 06-07-idempotent-consumers
+  - 07-06-distributed-transactions-and-2pc
+tags:
+  - digital-wallet
+  - ledger
+  - transfers
+  - concurrency
+  - idempotency
+objectives:
+  - Enforce conservation, no-negative-available-balance, and currency invariants for transfers.
+  - Design duplicate-safe debit/credit commands with ledger and balance projections.
+  - Compare lock ordering, serializable transactions, and queued account ownership for concurrent transfers.
+  - Explain limits, holds, reversals, reconciliation, audit, and recovery boundaries.
+relatedLessons:
+  - 04-04-acid-and-transactions
+  - 04-05-transaction-isolation
+  - 04-14-concurrency-control
+  - 06-07-idempotent-consumers
+  - 07-06-distributed-transactions-and-2pc
+visualizationId: null
+quizId: null
+---
+
+# Digital Wallet
+
+> A wallet is a money-conservation system: transfers must be atomic or explicitly pending, duplicate commands must be harmless, and every displayed balance must be explainable by an immutable ledger.
+
+## Problem Statement
+
+Design a wallet that lets authenticated users hold balances, add funds through a payment provider, transfer money to another wallet, pay merchants, place holds, and withdraw. Transfers may arrive concurrently in opposite directions, clients retry after timeouts, and provider deposits can be delayed or reversed. The lab assumes one currency per account for the core invariant; cross-currency exchange is a separate workflow.
+
+## Functional Requirements (Scoped)
+
+- Create/verify wallet accounts and expose available/pending balances.
+- Deposit, debit, transfer, hold, release, withdraw, and reverse with idempotency keys.
+- Enforce per-account/tenant limits, KYC/risk states, and sufficient available funds.
+- Record immutable double-entry ledger events and derive balance projections.
+- Expose transfer status, receipts, audit history, and reconciliation/recovery workflow.
+
+Out of scope: card network implementation, full AML modeling, cross-currency pricing, and arbitrary multi-party atomic settlement.
+
+## Non-Functional Requirements and Priorities
+
+| Priority | Requirement | Working target / question |
+| --- | --- | --- |
+| P0 | Conservation | For each currency, total debits/credits and external clearing accounts balance. |
+| P0 | No overdraft | An account's available balance cannot become negative except in an explicit credit policy. |
+| P0 | Duplicate safety | Replaying a command does not debit/credit twice. |
+| P0 | Audit/recovery | History is append-only, replayable, and reconciled with providers. |
+| P1 | Transfer latency | p95 under 300 ms for same-ledger transfers; pending for cross-boundary work. |
+| P1 | Security | Strong auth, step-up/risk controls, secret/PII minimization, and fraud audit. |
+
+## Estimation Prompts and Checked Example
+
+Ask for active wallets, transfers/day, hot-account skew, average ledger rows/command, provider deposit/withdraw rate, and retention. Example:
+
+- 20M wallets × 0.5 transfers/day = 10M transfers/day → `≈116 transfers/s`; 20× peak is `≈2,315/s`.
+- One transfer creates two account postings plus a transaction/event/idempotency row; at 2,315/s, about `≈9,260 rows/s` are written before audit/notifications.
+- If a wallet ledger row averages 300 bytes and 10M transfers/day produce 4 rows each, daily postings are `40M × 300 B ≈12 GB` logical; indexes, replicas, snapshots, and retention multiply this.
+- A hot merchant account receiving 10k transfers/s cannot be made parallel without changing the serial balance invariant; queueing/limits may be safer than unlimited retries.
+
+## API Design
+
+```http
+POST /v1/transfers
+Idempotency-Key: transfer-clientA-42
+{"sourceWallet":"w_1","destinationWallet":"w_2",
+ "amountMinor":2500,"currency":"USD","clientReference":"invoice-9"}
+```
+
+Return `201 {transferId, state:"posted", ledgerTransactionId}` after the atomic ledger transaction, or `202 {state:"pending"}` for an external/cross-boundary workflow. Reusing the key/request hash returns the same result; changed input is `409`. `POST /holds`, `:release`, `:reverse`, and `:withdraw` use distinct operation keys and legal state/version checks. `409 InsufficientFunds`/state conflicts are business outcomes; `422` is invalid amount/currency; `429` is risk/quota; `503` means no safe authoritative write.
+
+A timeout after commit is resolved by `GET /transfers/{id}` or idempotency lookup. Clients must not retry with a new key. Provider webhook/event IDs are deduplicated and applied through the wallet state machine.
+
+## Data Model, Access Paths, and Ownership
+
+```text
+wallets(wallet_id PK, owner_id, currency, status, available_minor,
+        pending_minor, version, limit_version)
+ledger_transactions(tx_id PK, currency, state, source_operation, created_at)
+ledger_entries(entry_id PK, tx_id, wallet_id, direction, amount_minor,
+               available_effect, balance_after_ref, UNIQUE(tx_id, wallet_id, direction))
+operations(operation_id PK, wallet_id/source, idempotency_key UNIQUE,
+           request_hash, state, result_ref)
+holds(hold_id PK, wallet_id, amount_minor, state, expires_at, operation_id)
+```
+
+The wallet ledger owns money movement; the balance columns are projections updated in the same local transaction or rebuilt from entries. A transfer command locks source/destination wallets in deterministic order (or uses serializable/CAS), checks currency/status/available funds, writes balanced entries, updates projections, and stores the operation result atomically. External funding/withdrawal uses a clearing account and pending state until provider evidence/reconciliation.
+
+## Progressive Architecture: Naive → Bottleneck → Improvement → New Trade-off
+
+1. **Naive:** update `wallet.balance = balance - amount` then add to destination. Concurrent reads lose updates; a timeout can repeat the debit; a crash between rows creates money.
+2. **Bottleneck/failure:** use a single serializable transaction across both accounts. Correctness improves but hot accounts, deadlocks, long locks, and cross-service/provider calls reduce throughput/availability.
+3. **Improvement:** keep same-ledger transfer and double-entry postings in one local transaction with deterministic lock order; use idempotency/inbox; model external operations as pending workflows with clearing accounts, outbox, and reconciliation.
+4. **New trade-off:** a transfer may be pending while money is reserved; projections need rebuild/verification; a hot account may need a single queue/actor, introducing latency. Cross-region active-active writes require account ownership/fencing or accept weaker guarantees.
+
+Reference architecture:
+
+```text
+Client → Wallet API → account/ledger DB (atomic transfer)
+                         ├→ outbox → notifications/projections
+                         └→ external workflow → provider → webhook/reconciler
+```
+
+Ledger entries are the audit source; balance/projection/read caches are derived and can be checked against them.
+
+## Bottlenecks and Concurrency / Consistency
+
+Hot wallets/merchants, lock ordering, ledger/index append, projection rebuild, idempotency retention, provider webhooks, and risk checks dominate. Lock accounts by sorted wallet ID to avoid deadlocks; retry serialization failures with the same operation key. A transfer's source debit and destination credit are atomic for one ledger owner. If accounts span shards/regions, choose a coordinator/2PC or pending debit/credit saga with clearing accounts; never imply atomicity without naming the boundary. Balance reads should be strongly consistent for spend decisions and may use projections for display with a version/freshness marker.
+
+## Failure Analysis
+
+- **Crash before commit:** no ledger effect; same key can retry.
+- **Crash after commit before response:** idempotency result lookup returns posted transfer.
+- **Deadlock/serialization failure:** retry bounded with same key; do not create a second operation.
+- **Destination unavailable:** keep a pending/held state or reject before debit; compensation must be balanced.
+- **Provider deposit unknown:** query/webhook/reconcile clearing account; never credit twice.
+- **Projection drift:** freeze risky operations if necessary, rebuild from ledger, and compare totals.
+- **Region loss:** fence writers, restore ledger, replay outbox, and reconcile before reopening writes.
+
+## Security
+
+Authenticate and authorize wallet ownership/merchant roles; require step-up/MFA/risk checks for withdrawals or high-value transfers. Use integer minor units, strict currency/limit checks, replay-protected idempotency keys, signed provider webhooks, and short-lived tokens. Encrypt PII/secrets, minimize logs, segregate ledger write roles, audit operator adjustments, and rate-limit account enumeration/card testing.
+
+## Observability
+
+Track transfer latency/state, conflict/serialization/deadlock rate, hot-wallet skew, available/pending balances, ledger balance checks, operation dedupe/conflict, provider unknown age, webhook lag, reconciliation mismatches, projection lag, risk rejects, and recovery replay. Trace transfer/ledger IDs without sensitive account data; alert on conservation violations, negative available balances, drift, and stuck pending state.
+
+## Explicit Trade-offs and Alternatives
+
+- **One local ACID ledger vs distributed transfer saga:** ACID is easiest to prove; saga scales ownership but exposes pending/compensation states.
+- **Pessimistic locks vs optimistic serializable:** locks serialize hot accounts predictably; optimistic avoids waits under low conflict but retries under contention.
+- **Mutable balance vs derived projection:** mutable is fast but hard to audit; ledger-derived is recoverable and verifiable at storage/query cost.
+- **Active-active regions vs single account owner:** active-active lowers latency but needs conflict/ordering/fencing; single owner simplifies money correctness.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+“A transfer is one idempotent command that creates balanced double-entry postings and updates source/destination available balances atomically inside the ledger owner. I lock accounts in deterministic order or use serializable retries, never call providers while holding locks, and represent external funding/withdrawal as pending clearing-account workflows. Every display balance is a projection verifiable from the immutable ledger; reconciliation and fencing handle failures.”
+
+### When to Introduce It
+
+Introduce double-entry and idempotency before discussing scale. Introduce queues/ownership when one hot account or cross-shard transfer cannot fit a local transaction; keep a single ledger boundary if the requirements allow it.
+
+### Common Follow-Ups
+
+- What happens when source and destination are on different shards?
+- How do you prevent duplicate debit after a timeout?
+- Why lock accounts in a deterministic order?
+- How do you reconcile a provider deposit?
+
+### Common Candidate Mistakes
+
+Updating one balance at a time, using floats, retrying with a new key, calling external providers inside ledger locks, and treating a read cache as spend authority.
+
+## Summary
+
+Conserve money through balanced immutable entries, atomic local transfers, idempotent commands, and explicit pending/clearing workflows. Strong ownership and reconciliation matter more than a flashy active-active topology.
+
+## Quiz Seeds
+
+1. What invariant must every double-entry transaction satisfy?
+2. Why is deterministic lock ordering useful for transfers?
+3. Which state protects against a provider deposit timeout?
+4. How many posting rows arise from 2,315 transfers/s at four rows each?
+5. Why are floating-point balances unsafe?
+6. What does a timeout after commit require the client to do?
+7. How can a hot merchant account scale without violating serial balance rules?
+8. When is a transfer saga preferable to 2PC?
+
+## Related Topics
+
+- [ACID and transactions](../04-databases/acid-and-transactions.mdx) — local ledger atomicity.
+- [Transaction isolation](../04-databases/transaction-isolation.mdx) — serializable/lock behavior.
+- [Concurrency control](../04-databases/concurrency-control.mdx) — duplicate/race prevention.
+- [Idempotent consumers](../06-messaging/idempotent-consumers.mdx) — provider/event retries.
+- [Distributed transactions](../07-distributed-coordination/distributed-transactions-and-2pc.mdx) — cross-boundary choices.
+
+## References
+
+### Documentation / Articles
+
+- [Stripe idempotent requests](https://docs.stripe.com/api/idempotent_requests) — concrete duplicate-safe money-command behavior.
+- [PostgreSQL transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html) — documents serializable conflicts/retries.
+- [PCI DSS](https://www.pcisecuritystandards.org/standards/pci-dss/) — security/compliance boundary for payment data.
+- [ISO 4217 currency codes](https://www.iso.org/iso-4217-currency-codes.html) — supports explicit currency identity and integer-unit modeling.
+
+## Future Visualization / Workspace Spec
+
+Simulate concurrent opposite-direction transfers, lock ordering, serializable conflicts, idempotency replays, provider deposits, pending holds, ledger postings, projection drift, and recovery. Controls should vary hot-account skew, cross-shard placement, provider timeout, duplicate webhook, and region fencing. Show available/pending balances, debit/credit conservation, lock waits, operation states, reconciliation cases, and replay. Workspace nodes should include Client, Wallet API, Ledger DB, Clearing Account, Provider, Outbox, Projection, and Reconciler.

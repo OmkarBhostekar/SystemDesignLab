@@ -1,0 +1,213 @@
+---
+type: lesson
+id: 13-11-metrics-and-monitoring-platform
+slug: metrics-and-monitoring-platform
+title: Metrics and Monitoring Platform
+description: Design a high-cardinality telemetry pipeline with ingestion, aggregation, retention, querying, alerting, and cardinality guardrails.
+module: design-labs
+order: 11
+difficulty: advanced
+estimatedMinutes: 65
+prerequisites:
+  - 00-03-estimation
+  - 00-04-interview-framework
+  - 04-07-b-tree-vs-lsm
+  - 06-09-backpressure
+  - 06-10-batching-and-stream-vs-batch
+  - 08-07-load-shedding-and-graceful-degradation
+tags:
+  - metrics
+  - observability
+  - time-series
+  - cardinality
+  - alerting
+objectives:
+  - Separate metric ingestion, aggregation, durable retention, query, and alert evaluation paths.
+  - Estimate samples/s, bandwidth, active series, storage, and query fanout.
+  - Control high-cardinality labels and protect ingestion under overload.
+  - Explain alert freshness, missing data, downsampling, and tenant isolation.
+relatedLessons:
+  - 04-07-b-tree-vs-lsm
+  - 06-09-backpressure
+  - 06-10-batching-and-stream-vs-batch
+  - 08-07-load-shedding-and-graceful-degradation
+visualizationId: null
+quizId: null
+---
+
+# Metrics and Monitoring Platform
+
+> A monitoring platform is a write-heavy time-series pipeline with a separate query/alert workload; uncontrolled label cardinality can be a more dangerous failure than raw sample rate.
+
+## Problem Statement
+
+Design a multi-tenant platform that receives counters, gauges, histograms, and exemplars from services, stores them for hot and long-term windows, supports dashboard/range queries, and evaluates alerts. Producers may batch, retry, or go offline. Tenants can accidentally add a request ID as a label and create millions of series. The system should preserve critical telemetry while degrading low-value detail predictably.
+
+## Functional Requirements (Scoped)
+
+- Ingest OTLP/Prometheus-like samples with metric name, labels, timestamp, value, and tenant.
+- Validate schemas, enforce label/cardinality quotas, and accept batches with per-sample errors.
+- Query recent and historical ranges with aggregation/downsampling.
+- Define alert rules, evaluate them on fresh windows, and deliver deduplicated notifications.
+- Retain raw/aggregated data by tier and export durable data for audits/reprocessing.
+
+Out of scope: log indexing, full distributed tracing storage, arbitrary SQL over raw samples, and guaranteeing alert delivery when all notification providers are down.
+
+## Non-Functional Requirements and Priorities
+
+| Priority | Requirement | Working target / question |
+| --- | --- | --- |
+| P0 | Ingestion durability | Accepted critical samples are buffered/replayed within declared loss policy. |
+| P0 | Tenant isolation | One tenant's cardinality or query cannot starve others. |
+| P0 | Alert freshness | P95 evaluation lag under 30 s for configured critical rules. |
+| P1 | Query latency | Dashboard range queries under 2 s for bounded windows/series. |
+| P1 | Cost | Downsample/cold-tier old data; make retention and resolution explicit. |
+| P2 | Exploit resistance | Prevent cardinality, batch-size, timestamp, and query fanout abuse. |
+
+## Estimation Prompts and Checked Example
+
+Ask for hosts, metrics/host, scrape/emit interval, label cardinality, sample bytes, retention/resolution, query load, and replication. Example:
+
+- 100k hosts × 2,000 active series × one sample/15 s = 200M samples/15 s → `≈13.3M samples/s`.
+- At 100 bytes encoded/sample, ingress is `≈1.33 GB/s ≈10.6 Gb/s` payload; compression/batching can change wire cost, not logical sample rate.
+- Active series = `100k × 2,000 = 200M`; at 2 KB series metadata, that is `≈400 GB` before indexes/replicas. A single accidental high-cardinality label can exceed this quickly.
+- 13.3M samples/s × 86,400 ≈`1.15T samples/day`; even 16 bytes compressed/sample is `≈18.4 TB/day` logical. Retention/downsampling is mandatory.
+- If 1% of series alert every minute, evaluating 2M series/minute is `≈33k evaluations/s`; isolate alert workers from dashboard queries.
+
+Sensitivity prompts: Is this host-scale realistic? Are histograms expanded? How many tenants share a cluster? May samples be dropped under overload, and which classes are protected?
+
+## API Design
+
+```http
+POST /v1/metrics:write
+Authorization: Bearer <tenant-token>
+Content-Type: application/x-protobuf
+```
+
+Return `200` with per-batch accepted/rejected counts and a stable `ingestId`; `202` may mean durably queued but not indexed. Samples are append-like; retries with the same batch ID must be deduplicated or explicitly allowed to duplicate because aggregators can make duplicates non-idempotent. Prefer client timestamp plus server receive time and reject unreasonable skew. `400` covers schema/label errors, `413` batch too large, `429` tenant quota/cardinality, and `503` only when the documented buffer cannot accept more.
+
+The batch `Idempotency-Key` (or producer batch ID) is retained for the duplicate window; reusing it with a different payload returns `409 BatchIdConflict`. A timeout is resolved with an ingest-status query before the producer retries.
+
+`GET /v1/query_range` includes time range, step, matchers, max series/points, and timeout; return `422` for excessive fanout and partial-result metadata when allowed. `POST /v1/alerts/rules` is idempotent by rule version; evaluation state uses monotonic windows and dedupe keys for notifications.
+
+## Data Model, Access Paths, and Ownership
+
+```text
+series(series_id PK, tenant, metric_name, canonical_labels_hash,
+       labels_ref, created_at, last_seen_at)
+samples(series_id, timestamp, value, exemplar_ref,
+        PRIMARY KEY(series_id, timestamp))
+rollups(tenant, metric, label_group, bucket_start, resolution, value)
+alert_rules(rule_id PK, tenant, expression, window, version, state)
+alert_state(rule_id, fingerprint, last_eval, pending_since, state)
+```
+
+Ingest owns validation/quotas and writes a log/partition; aggregation owns rollups; the time-series store owns retention/query blocks; alerting owns rule state and notification intents. Access paths are series-by-label lookup, append by `(series_id,time)`, range scan by time block, and bounded matcher fanout. A series registry is authoritative for cardinality; an approximate count may protect the hot path but not billing/audit.
+
+## Progressive Architecture: Naive → Bottleneck → Improvement → New Trade-off
+
+1. **Naive:** write every sample to a relational table and query it directly. It is easy to understand but index/write amplification, retention deletes, and dashboard scans overload one store.
+2. **Bottleneck/failure:** add a time-series engine and replicas, but allow arbitrary labels and unbounded queries. Storage explodes, one tenant's query fans out across every shard, and alerts compete with dashboards.
+3. **Improvement:** validate labels/quotas at ingestion, partition by tenant/series/time, batch/compress append blocks, separate hot/cold tiers, cap queries, and run alert evaluation on a dedicated stream/read path. Use backpressure and priority shedding.
+4. **New trade-off:** dropping/downsampling data affects debugging and alert fidelity; eventual rollups make recent queries/alerts temporarily inconsistent. Strong retention/tenant isolation costs storage and operational complexity.
+
+Reference architecture:
+
+```text
+Collectors → ingest gateway → durable partition/log → validators/cardinality
+                                      ├→ hot TS blocks/replicas → query API
+                                      ├→ rollup/downsample → cold store
+                                      └→ alert evaluator → notification service
+```
+
+The ingest acknowledgment boundary is explicit: accepted means persisted in a replayable buffer, not necessarily queried immediately.
+
+## Bottlenecks and Concurrency / Consistency
+
+Cardinality registry, append bandwidth, compaction, high-fanout query, alert evaluation, tenant fairness, and retention deletion are limits. Series creation uses a conditional insert/registry version; samples for the same series/timestamp need a duplicate policy (last-write, first-write, or reject) documented per metric type. Out-of-order samples may be buffered within a window or dropped with telemetry. Query results can merge replicas/rollups with partial status; alert evaluation needs a watermark and missing-data policy.
+
+## Failure Analysis
+
+- **Ingest shard outage:** route/replay from durable buffer; shed low-priority samples, preserve SLO/alert metrics.
+- **Cardinality explosion:** reject/quarantine new series, cap labels, and protect existing ingestion; never auto-scale blindly.
+- **Compaction lag:** query raw blocks with a cost cap, alert on storage/CPU backlog.
+- **Query storm:** per-tenant concurrency/point limits, caches, and partial results.
+- **Clock skew/out-of-order:** watermark/window policy; expose dropped/late counts.
+- **Alert evaluator outage:** persist rule offsets/state and replay; deduplicate notifications by fingerprint.
+- **Cold-store loss:** restore from exported blocks/replicas according to RPO; recent hot data may have different guarantee.
+
+## Security
+
+Authenticate tenant ingestion/query, enforce tenant/label authorization, and prevent query matchers from crossing partitions. Treat labels/values as untrusted and cap lengths; hash or redact sensitive labels. Encrypt data and backups, rotate collector credentials, audit rule changes, and use least privilege for alert delivery. Avoid putting user IDs, tokens, or raw URLs in label sets.
+
+## Observability
+
+Monitor samples accepted/rejected/dropped, ingest lag, buffer age, active/new series, cardinality by tenant/metric, out-of-order rate, compaction, storage growth, query latency/fanout/partial results, rollup age, alert evaluation lag/missed windows, notification dedupe, and quota rejects. Trace batch/series IDs without high-cardinality labels; maintain a small “monitor the monitor” path outside the platform. Alert on data loss, lag, and cardinality before CPU saturation.
+
+## Explicit Trade-offs and Alternatives
+
+- **Pull scrape vs push emit:** pull centralizes scheduling and freshness; push supports ephemeral jobs but needs backpressure/authentication.
+- **Raw retention vs rollups:** raw supports forensic precision but costs huge storage; rollups reduce cost and lose detail.
+- **Shared vs per-tenant clusters:** shared is efficient but needs strong isolation; dedicated gives noisy-neighbor control at cost.
+- **Drop vs block under overload:** dropping low-value samples preserves availability but changes observability; blocking all traffic risks a monitoring blind spot.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+“I separate ingestion from query and alert paths. An ingest gateway validates labels/quotas and writes batches to a durable partition; consumers build compressed time-series blocks and rollups, while alert evaluators use a bounded watermark path. Tenant/cardinality/query limits protect the platform, and low-value data can be sampled under overload. I define whether an ack means buffered or queryable and expose partial/freshness status.”
+
+### When to Introduce It
+
+Introduce a log/buffer when collectors and storage have different failure/throughput profiles; introduce rollups and cardinality controls before retention or dashboards become the bottleneck.
+
+### Common Follow-Ups
+
+- How do you prevent a request ID label from creating millions of series?
+- What happens to alerts during compaction lag?
+- What does a successful ingest response guarantee?
+- Which data is safe to drop first?
+
+### Common Candidate Mistakes
+
+Designing only a dashboard query path, treating all labels as cheap, acknowledging before durable buffering, and hiding partial or late alert results.
+
+## Summary
+
+Ingestion, storage, queries, and alerts have different workload and failure shapes. Make acknowledgment/retention/freshness explicit, enforce cardinality and tenant budgets early, and isolate critical alerts from dashboard and low-value sample load.
+
+## Quiz Seeds
+
+1. Calculate samples/s and daily samples from 100k hosts × 2,000 series × 15 s.
+2. Why is active-series cardinality often more dangerous than sample QPS?
+3. What should an ingest ack mean if samples are only buffered?
+4. Which query limits prevent a tenant from fanning out the cluster?
+5. How can alert evaluation survive ingest/compaction lag?
+6. Why are late samples and duplicate timestamps policy choices?
+7. Which telemetry can be shed first during overload?
+8. What metrics reveal a monitoring platform blind spot?
+
+## Related Topics
+
+- [B-tree vs LSM tree](../04-databases/b-tree-vs-lsm.mdx) — write/compaction and read trade-offs.
+- [Backpressure](../06-messaging/backpressure.mdx) — bounded ingest/processing stages.
+- [Batching and stream vs batch](../06-messaging/batching-and-stream-vs-batch.mdx) — aggregation and rollups.
+- [Load shedding](../08-reliability/load-shedding-and-graceful-degradation.mdx) — priority protection under overload.
+- [Observability module](../09-observability/README.md) — signal, SLO, and alerting context.
+
+## References
+
+### Documentation / Articles
+
+- [OpenTelemetry Metrics](https://opentelemetry.io/docs/concepts/signals/metrics/) — defines metric instruments, aggregation, and signal semantics.
+- [Prometheus data model](https://prometheus.io/docs/concepts/data_model/) — documents labels, series identity, timestamps, and cardinality consequences.
+- [Prometheus storage](https://prometheus.io/docs/prometheus/latest/storage/) — explains local TSDB blocks, retention, and compaction trade-offs.
+- [Google SRE: Monitoring Distributed Systems](https://sre.google/sre-book/monitoring-distributed-systems/) — grounds alert signal quality and monitoring design.
+
+### Papers
+
+- [Gorilla: A Fast, Scalable, In-Memory Time Series Database](https://www.vldb.org/pvldb/vol8/p1816-teller.pdf) — explains compression and storage techniques for high-rate time series.
+
+## Future Visualization / Workspace Spec
+
+Simulate collectors sending normal and high-cardinality samples into validation, durable buffering, blocks, rollups, queries, and alert evaluation. Controls should vary sample rate, label cardinality, batch size, compaction speed, retention, query fanout, late samples, and overload shedding. Show active series, bytes, lag/watermarks, dropped samples, query cost, alert freshness, and tenant fairness. The workspace should include Collector, Ingest, Buffer, Series Registry, TSDB, Rollup, Query, Alert, and Notification nodes with ack/freshness labels.

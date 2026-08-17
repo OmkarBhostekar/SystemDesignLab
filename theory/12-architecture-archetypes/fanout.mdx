@@ -1,0 +1,179 @@
+---
+type: lesson
+id: 12-03-fanout
+slug: fanout
+title: Fanout Systems
+description: Deliver one event to many readers by choosing push, pull, hybrid, and hot-recipient strategies from skew and freshness.
+module: architecture-archetypes
+order: 3
+difficulty: core
+estimatedMinutes: 40
+prerequisites:
+  - 01-03-latency-vs-throughput
+  - 04-12-denormalization
+  - 05-08-hot-keys
+  - 06-03-pub-sub-and-topics
+  - 06-09-backpressure
+  - 11-08-notification-system
+tags:
+  - fanout
+  - push-model
+  - pull-model
+  - celebrity-skew
+  - read-model
+objectives:
+  - Compare fanout-on-write, fanout-on-read, and hybrid delivery under recipient skew.
+  - Estimate write amplification, read amplification, storage, and freshness for each model.
+  - Design around celebrity/hot users, queues, cache pressure, and duplicate delivery.
+  - Identify when a fanout result is a read model versus a durable business record.
+relatedLessons:
+  - 05-08-hot-keys
+  - 06-03-pub-sub-and-topics
+  - 11-08-notification-system
+  - 12-01-read-heavy
+  - 11-04-search-autocomplete
+---
+
+# Fanout Systems
+
+> Fanout is the shape where one source event must become many recipient views; choose where to pay the multiplication—write time, read time, or a hybrid.
+
+## Why This Exists
+
+A social post, notification, permissions change, or live event may be read by thousands or millions of recipients. The naive design stores only the source event and joins every followed source on each feed read. A different naive design writes one recipient row synchronously, making a celebrity post block the write request.
+
+The improvement chooses fanout-on-write, fanout-on-read, or a hybrid based on recipient count, read frequency, freshness, and skew. The new trade-off is write/read amplification, storage, queue lag, deletion/privacy propagation, and hot-key isolation.
+
+## Mental Model
+
+```text
+source event ──┬─ push: materialize recipient views now ─> fast reads
+               ├─ pull: store source; merge at read time ─> cheap writes
+               └─ hybrid: push ordinary, pull celebrity/hot source
+```
+
+| Model | Pays multiplication | Strength | Weakness |
+| --- | --- | --- | --- |
+| Fanout-on-write | Once per recipient at publish | Fast/predictable feed reads | Expensive celebrity writes and storage |
+| Fanout-on-read | At each recipient read | Cheap publish and fresh source | Read tail/fanout work; repeated merges |
+| Hybrid | Classifies sources/recipients | Balances skew | More routing and consistency states |
+
+The correct unit is not always a user. A notification may need per-channel jobs; a feed may need a bounded recent-item read model; a permission event may require a durable source check at access time. Do not materialize a copy when the recipient must see current authorization.
+
+## How It Works
+
+For push, enqueue an event and partition fanout work by recipient/shard. Write a compact feed item containing source ID and ordering metadata, not an entire mutable object. Readers hydrate from a cache/source or snapshot. Use idempotent event IDs and versioned deletion/privacy updates.
+
+For pull, index a user's followed sources and fetch recent items from each source, then merge by time/rank. Bound the number of sources and use per-source cursors/cache. A celebrity source makes pull read amplification huge; a hybrid marks it as pull-only while ordinary sources are pushed.
+
+Asynchronous fanout means a feed can be temporarily incomplete. Expose a cursor/version and define whether the product prefers older complete items, a partial result, or a loading gap. Queue lag and fanout retries must not reorder items unexpectedly.
+
+## Example
+
+A news feed has 10 million daily readers and one user follows 500 accounts. A normal account has 1,000 followers; a celebrity has 20 million. Pushing every post to every follower makes a celebrity write impossible and causes queue/storage spikes. Pulling all 500 sources on every read gives poor p99 and repeated work.
+
+The hybrid design pushes ordinary accounts into per-user feed partitions and keeps celebrity posts in a source timeline. Feed reads merge the cached pushed items with a bounded celebrity pull, then hydrate and rank. A celebrity post is not copied 20 million times; a user opening the app pays a small read merge. If a user unfollows an account, access checks or tombstones prevent old items from appearing while asynchronous cleanup removes them later.
+
+## Visualization We Eventually Want
+
+Build a **Fanout Amplification Explorer**. Controls should include source count, follower distribution, publish rate, reader rate, push/pull threshold, queue workers, storage cost, cache hit rate, and update/delete lag. Show write amplification, read fanout, queue age, per-source hotness, storage rows, feed freshness, p99 merge latency, and duplicate/tombstone effects. Presets should compare uniform authors, one celebrity, a burst event, unfollow/privacy deletion, and a hybrid threshold change.
+
+## Scaling Behavior
+
+Fanout-on-write cost is `events × eligible recipients`; fanout-on-read cost is `reads × followed sources`. Real distributions matter more than averages. Partition by recipient for push and by source for pull; then account for hot recipients/sources and cross-partition merge.
+
+Store IDs/versions rather than full objects to reduce copy cost, and use cache/materialized hydration for hot sources. Queue capacity must absorb bursts without allowing one source to starve others. A feed’s freshness SLO should track event age at read, not only queue depth.
+
+## Failure Modes
+
+- **Celebrity storm:** one source consumes all fanout workers/storage.
+- **Partial fanout:** some recipients see an event while others do not.
+- **Duplicate rows:** retries insert repeated feed items.
+- **Out-of-order feed:** partitions or retries reorder items.
+- **Delete/privacy lag:** revoked content remains in materialized feeds.
+- **Read merge tail:** pull path waits for the slowest source.
+- **Hot recipient:** one user's feed/notification key overloads a shard.
+- **Cache stampede:** a shared source/object expires during fanout reads.
+
+Use hybrid thresholds, per-source quotas, idempotent upserts, ordering/version fields, source authorization at read, tombstones, bounded merges, and backpressure. “Eventually cleaned” is not sufficient when privacy revocation is immediate; the read path needs a current policy check.
+
+## Trade-offs
+
+Push buys read latency with write amplification/storage; pull buys cheap writes with read amplification/tail. Hybrid adds classification and dual semantics but isolates skew. Compact materialized rows reduce storage but require hydration and stale-object handling. Strong deletion/privacy checks add read cost but protect correctness.
+
+## Alternatives
+
+- **Pub/sub broadcast:** choose for live connected subscribers where loss/reconnect semantics are acceptable.
+- **Per-user inbox/notification queue:** choose for durable delivery and acknowledgement rather than ranked feeds.
+- **Periodic batch rebuild:** choose when freshness is minutes/hours and fanout can be amortized.
+- **Shared source cache + pull:** choose for moderate follow graphs and highly reusable source timelines.
+- **No materialization:** choose when recipient count/read rate is small enough for direct joins.
+
+## When to Use
+
+Use this archetype when one source action must reach many recipient views or channels. Quantify recipient distribution, read/write rate, freshness, ordering, and deletion/privacy semantics.
+
+## When Not to Use
+
+Do not materialize every recipient for tiny/low-read data. Do not use a feed copy as authorization truth. Do not select push solely because reads are fast if one source can dominate the system.
+
+## Common Misconceptions
+
+- **“Fanout-on-write is always faster.”** It moves cost to writes and fails on celebrities.
+- **“Pull is always fresh.”** Caches, source lag, and merge timing still create staleness.
+- **“A queue makes fanout exactly once.”** Retries duplicate unless writes are idempotent.
+- **“A feed row contains truth.”** It is a read model; source/privacy checks may still be required.
+- **“The average follower count is enough.”** The tail/celebrity distribution determines capacity.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I choose where fanout multiplication happens from follower skew, publish/read rates, freshness, and storage. Push materializes ordinary sources for cheap reads; pull merges hot/celebrity sources at read time; a hybrid isolates the heavy tail. Fanout jobs are partitioned, bounded, idempotent, and versioned. Deletes/privacy require tombstones plus current authorization checks, and queue lag/freshness are first-class metrics.
+
+### When to Introduce It
+
+Introduce it when one event reaches many recipients and direct joins or synchronous writes show a multiplication bottleneck.
+
+### Common Follow-Ups
+
+- What happens for a 20-million-follower account?
+- How do you avoid duplicate or out-of-order items?
+- How quickly do deletes/privacy changes propagate?
+- What is the push/pull threshold?
+- How do you measure feed freshness?
+
+### Common Candidate Mistakes
+
+They pick push or pull without distribution estimates, ignore celebrity skew, treat feed copies as truth, or omit retry/idempotency and deletion behavior.
+
+## Summary
+
+Fanout is a placement decision for multiplication. Use push, pull, or hybrid deliberately; isolate skew, bound queues/merges, make retries idempotent, and keep authorization/privacy semantics stronger than the read model.
+
+## Quiz Seeds
+
+1. When is fanout-on-write cheaper than fanout-on-read?
+2. Why does a celebrity account change the architecture?
+3. How can compact feed rows lower storage while adding hydration work?
+4. What guarantees does a feed read model not provide?
+5. How should a privacy deletion interact with an old pushed item?
+6. What is the read/write amplification formula for each model?
+7. How do partitioning and idempotent upserts handle fanout retries?
+8. What metric expresses feed freshness better than queue depth?
+
+## Related Topics
+
+- [Notification system](../11-building-blocks/notification-system.mdx) applies fanout to channels.
+- [Hot keys](../05-caching/hot-keys.mdx) explains celebrity skew.
+- [Pub/sub and topics](../06-messaging/pub-sub-and-topics.mdx) handles live broadcast.
+- [Read-heavy systems](./read-heavy.mdx) covers downstream caches/read models.
+
+## References
+
+### Documentation / Articles
+
+- [Facebook News Feed: ranked feed architecture](https://engineering.fb.com/2021/01/26/core-infra/news-feed-ranking/) — illustrates why feed ranking/read models and workload shape matter beyond a simple follower join.
+- [Apache Kafka consumer groups](https://kafka.apache.org/42/design/design/) — grounds partitioned fanout work, replay, and consumer scaling.
+- [Google Cloud Pub/Sub overview](https://cloud.google.com/pubsub/docs/overview) — contrasts durable topic delivery with ephemeral broadcast and subscriber backpressure.
+- [AWS SQS visibility timeout](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-visibility-timeout.html) — documents the duplicate/retry boundary that fanout workers must handle.

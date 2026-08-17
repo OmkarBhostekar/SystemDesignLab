@@ -1,0 +1,217 @@
+---
+type: lesson
+id: 13-17-distributed-key-value-store
+slug: distributed-key-value-store
+title: Distributed Key-Value Store
+description: Design partitioned and replicated key-value storage with quorums, consistency choices, rebalancing, and failure recovery.
+module: design-labs
+order: 17
+difficulty: deep-dive
+estimatedMinutes: 85
+prerequisites:
+  - 00-03-estimation
+  - 00-04-interview-framework
+  - 01-09-cap
+  - 04-08-replication
+  - 04-09-partitioning-and-sharding
+  - 04-10-consistent-hashing
+  - 04-11-read-write-quorums
+  - 07-03-consensus-and-raft-intuition
+tags:
+  - key-value-store
+  - partitioning
+  - replication
+  - quorums
+  - rebalancing
+objectives:
+  - Choose partition/replica ownership and define consistency at read/write boundaries.
+  - Calculate quorum behavior and explain stale reads, conflict repair, and hinted handoff.
+  - Design rebalancing, membership, failure detection, and recovery without losing acknowledged data.
+  - Compare leader-based and leaderless replication from workload and failure requirements.
+relatedLessons:
+  - 01-09-cap
+  - 04-08-replication
+  - 04-09-partitioning-and-sharding
+  - 04-10-consistent-hashing
+  - 04-11-read-write-quorums
+  - 07-03-consensus-and-raft-intuition
+visualizationId: null
+quizId: null
+---
+
+# Distributed Key-Value Store
+
+> A distributed KV store is an ownership map plus a replication protocol: partitioning chooses who can answer, quorums choose what “acknowledged” means, and rebalancing changes both over time.
+
+## Problem Statement
+
+Design a service for `get`, `put`, conditional update, and delete by opaque key. The workload may be large, hot-key skewed, and multi-region. The product asks for configurable latency/consistency: some reads tolerate staleness, while others require read-your-write or linearizable compare-and-set. Nodes fail, partitions split, and membership changes without stopping all traffic. Ask whether a single key needs transactions, range scans, TTL, or multi-key atomicity; this lab assumes single-key operations with optional conditional versions.
+
+## Functional Requirements (Scoped)
+
+- Put/get/delete values by key with optional TTL, version/ETag, and compare-and-set.
+- Read/write at a named consistency level; expose version/token in responses.
+- Partition keys, replicate across failure domains, and recover/rebalance nodes.
+- Detect/repair stale replicas and expose health/repair status.
+- Provide quotas, value-size limits, batch operations only where semantics are explicit.
+
+Out of scope: arbitrary SQL/range queries, cross-key transactions, and a claim that one topology gives both zero-latency and linearizability during every partition.
+
+## Non-Functional Requirements and Priorities
+
+| Priority | Requirement | Working target / question |
+| --- | --- | --- |
+| P0 | Acknowledged durability | A write acknowledged at policy `W` survives the specified failure model. |
+| P0 | Consistency contract | Caller can distinguish stale/eventual, session, quorum, or linearizable reads. |
+| P0 | Partition tolerance | Node/zone failures do not lose ownership metadata or corrupt versions. |
+| P1 | Scale | Add nodes and rebalance bounded data without a full outage. |
+| P1 | Tail latency | p99 budget includes replica fanout, repair, and cross-region hops. |
+| P2 | Operability | Hot keys, replica lag, entropy, hinted handoff, and ownership skew are visible. |
+
+## Estimation Prompts and Checked Example
+
+Ask for keys, value size, read/write QPS, hot-key distribution, replication factor, quorum, retention/TTL, and rebalancing bandwidth. Example:
+
+- 500M keys × 2 KB value+metadata ≈`1 TB` logical; RF3 is `≈3 TB` before indexes/free space/repair.
+- 1M operations/s × 2 KB = `2 GB/s` logical client payload; RF3 leader/follower traffic adds approximately 4 GB/s internal replication for a leader-based path.
+- With `N=3, R=2, W=2`, `R+W>N` (`4>3`), so a healthy quorum intersection exists for a single-key version under the protocol. This does not prove linearizability, conflict resolution, or read availability during a partition.
+- A 5% hot-key share at 1M ops/s is 50k ops/s on one key; adding nodes does not split that key without a product/model change.
+
+## API Design
+
+```http
+PUT /v1/kv/user:42
+If-Match: "v17"
+X-Consistency: quorum
+{"plan":"pro"}
+```
+
+Return `200 {value, version, etag}` or `201` for a new key; `412` means compare-and-set version mismatch, `409` a conflict policy cannot merge, `404` absent, `429` quota/hot-key protection, and `503` insufficient healthy replicas for the requested write guarantee. `GET` accepts `X-Consistency: eventual|session|quorum|linearizable` and returns `staleBy`/version metadata where available. Retries of a put require a request/operation ID or conditional version; a lost response must not create a second logical version unless last-write semantics explicitly permit it.
+
+An `Idempotency-Key`/operation ID is scoped to the tenant and key for the deduplication window; replay returns the original version, while a mismatched payload returns `409 RequestIdConflict`.
+
+Membership/rebalance operations are control-plane, versioned, and idempotent. Do not expose internal ownership tokens as client authorization.
+
+## Data Model, Access Paths, and Ownership
+
+```text
+key_records(key PK, value_ref, version/vector_clock, tombstone,
+            expires_at, checksum, updated_at)
+partitions(partition_id PK, range_or_token, epoch, owners, state)
+replica_state(partition_id, node_id, applied_version, durable_offset,
+              state, last_heartbeat)
+membership(node_id PK, zone, generation, status, capacity)
+repair_tasks(task_id PK, partition_id, source, target, range, epoch, state)
+```
+
+The KV cluster owns key bytes/versions and partition metadata. A coordinator/consensus group owns membership and epochs; data nodes own partition replicas. The access path hashes/routes a key to a replica set, executes a quorum/leader protocol, then returns a version/token. Clients own application-level merge semantics when conflicts are exposed; the store must not silently discard concurrent writes unless last-write is the contract.
+
+## Progressive Architecture: Naive → Bottleneck → Improvement → New Trade-off
+
+1. **Naive:** one database server maps keys to local rows. It is simple/consistent but storage, throughput, and failure all share one host.
+2. **Bottleneck/failure:** hash keys across independent nodes. Capacity scales, but node loss loses data or changes ownership abruptly; replicas/clients have no shared membership epoch.
+3. **Improvement:** partition by hash/range, replicate across zones, use leader/quorum or versioned leaderless writes, and coordinate membership/rebalance with a consensus-backed control plane. Repair via streaming snapshots/logs and checksums.
+4. **New trade-off:** quorum/linearizable writes add latency and may reject during partitions; leaderless availability exposes conflicts/stale reads and repair cost. Consistent hashing reduces movement but does not solve hot keys or replica consistency.
+
+Reference architecture:
+
+```text
+Client → routing/coordinator → partition owner set
+                           ├→ leader/replicas or quorum coordinator
+                           └→ hinted handoff/read repair/repair stream
+Control plane (consensus) → membership/epoch/ring manifest
+```
+
+A request carries partition epoch; stale routing returns a retryable redirect. Rebalance copies data before ownership switch and fences old writers.
+
+## Bottlenecks and Concurrency / Consistency
+
+Hot keys, cross-zone quorum latency, compaction/repair, membership changes, large values, and routing-cache stampedes dominate. For a leader-based partition, writes serialize per key/partition and followers acknowledge per policy; for leaderless, version vectors/timestamps plus read repair reconcile. Conditional put requires a single serialization authority or consensus; a client-side `If-Match` cannot be linearizable across replicas without coordination. TTL/tombstones must be retained long enough to prevent resurrecting deletes during repair.
+
+## Failure Analysis
+
+- **Replica timeout:** return based on policy (`W`/linearizable may fail; eventual may use healthy replicas) and record under-replication.
+- **Partition split:** fence old leader/epoch; do not let two owners accept conflicting linearizable writes.
+- **Stale read:** return version/staleness or read repair; do not claim fresh data.
+- **Node loss during rebalance:** retain old owner until a durable replica catches up; throttle copy to protect foreground traffic.
+- **Hot key:** cache/read replicas or split application-level key; cannot hide one serial write key with more shards.
+- **Tombstone expiry:** delay GC until all replicas/repair windows pass; otherwise deletes can resurrect.
+- **Control-plane outage:** freeze membership changes and use last known epoch; continue only within safe data policy.
+
+## Security
+
+Authenticate clients, authorize tenant/key namespaces, and enforce per-tenant quotas/size/TTL. Encrypt node/client and inter-zone traffic, rotate node credentials, and protect membership/repair control. Avoid exposing raw key/value in metrics/logs; scrub PII and prevent values from being interpreted as executable content. Audit destructive deletes, range operations, and operator rebalances.
+
+## Observability
+
+Measure per-partition QPS/latency, quorum acks/failures, stale-read/version age, hot-key top-N, replica lag, under-replication, repair bytes/age, hinted handoff, ownership skew, compaction, tombstone age, routing redirects, membership epochs, and recovery time. Trace key hash/partition/epoch without raw sensitive values. Alert on lost quorum, stale routing, repair backlog, and tombstone safety windows.
+
+## Explicit Trade-offs and Alternatives
+
+- **Leader-based replication:** simpler order/linearizable CAS; leader/hot-partition bottleneck and failover latency.
+- **Leaderless quorum:** high availability and flexible quorum; conflict/version repair and read/write semantics are harder.
+- **Hash vs range partitioning:** hash spreads point keys; range enables scans but can hotspot ordered keys.
+- **Synchronous cross-zone vs async replica:** stronger acknowledged durability vs latency/availability.
+- **Consensus per partition vs control-plane only:** stronger ordering/failover guarantees cost coordination and metadata.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+“I separate a consensus-backed membership/epoch plane from partition data. Keys route to a replicated owner set; the API names whether a read/write is eventual, quorum, session, or linearizable. Rebalancing copies/checksums before an epoch switch and fences old owners. Leader-based CAS is easier to prove; leaderless quorum improves availability but needs version/conflict repair. `R+W>N` helps overlap but is not, by itself, linearizability.”
+
+### When to Introduce It
+
+Introduce this design when a single relational/KV node cannot meet storage/throughput/failure requirements and access is mostly point-key. If transactions/range queries dominate, a distributed KV may be the wrong abstraction.
+
+### Common Follow-Ups
+
+- What do `N=3,R=2,W=2` guarantee?
+- How do you safely rebalance a partition?
+- What happens during a network partition?
+- How do you resolve concurrent writes or tombstones?
+
+### Common Candidate Mistakes
+
+Saying “choose any two” for CAP, equating quorum overlap with linearizability, using consistent hashing as a full replication protocol, and dropping tombstones immediately.
+
+## Summary
+
+A distributed KV design is a set of named ownership, replication, quorum, and repair contracts. Separate membership safety from data availability, state stale/conflict behavior, and rebalance only after a durable new owner is ready.
+
+## Quiz Seeds
+
+1. What does `R+W>N` provide and what does it not provide?
+2. Calculate logical/RF3 storage for 500M 2 KB keys.
+3. Why can a hot key remain a bottleneck after sharding?
+4. What prevents an old partition owner from writing after rebalance?
+5. Why must tombstones outlive repair windows?
+6. Which consistency level may reject during a partition?
+7. How does leaderless repair differ from leader failover?
+8. Why is membership/epoch state a separate control-plane concern?
+
+## Related Topics
+
+- [CAP theorem](../01-foundations/cap.mdx) — partition-aware trade-offs.
+- [Replication](../04-databases/replication.mdx) — copies/acks/failure.
+- [Partitioning and sharding](../04-databases/partitioning-and-sharding.mdx) — ownership/skew.
+- [Consistent hashing](../04-databases/consistent-hashing.mdx) — movement reduction, not full consistency.
+- [Read/write quorums](../04-databases/read-write-quorums.mdx) — quorum arithmetic.
+- [Raft intuition](../07-distributed-coordination/consensus-and-raft-intuition.mdx) — epochs/leader safety.
+
+## References
+
+### Documentation / Articles
+
+- [Amazon Dynamo paper](https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf) — original leaderless partition/quorum/vector-clock design.
+- [Apache Cassandra architecture](https://cassandra.apache.org/doc/latest/cassandra/architecture/overview.html) — production documentation for partitioning, replicas, consistency, and repair.
+- [etcd API guarantees](https://etcd.io/docs/v3.6/learning/api_guarantees/) — contrasts linearizable/serializable operations and a consensus-backed control plane.
+- [Raft paper](https://raft.github.io/raft.pdf) — grounds leader election, log safety, and membership change.
+
+### Papers
+
+- [Consistent Hashing and Random Trees](https://www.cs.princeton.edu/courses/archive/fall09/cos518/papers/chash.pdf) — original consistent-hashing placement and movement insight.
+
+## Future Visualization / Workspace Spec
+
+Build a KV cluster simulator with a ring/ranges, N replicas, leader/quorum modes, R/W controls, hot keys, versions/tombstones, node/zone failure, network partition, repair, and rebalancing epochs. Show routing, acknowledgments, stale reads, conflicts, repair bytes, ownership skew, and consistency outcomes. Workspace nodes should include Client, Router, Control Plane, Partition Leader/Replicas, Repair, and Metrics, with learners labeling each guarantee and failure boundary.

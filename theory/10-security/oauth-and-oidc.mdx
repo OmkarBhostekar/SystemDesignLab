@@ -1,0 +1,176 @@
+---
+type: lesson
+id: 10-04-oauth-and-oidc
+slug: oauth-and-oidc
+title: OAuth and OIDC
+description: Model delegated API access and federated login through authorization-server roles, secure redirect flows, and explicit token audiences.
+module: security
+order: 4
+difficulty: advanced
+estimatedMinutes: 34
+prerequisites:
+  - 10-01-authentication-and-authorization
+  - 10-02-sessions-and-tokens
+  - 10-03-jwt-tradeoffs
+tags:
+  - oauth
+  - oidc
+  - federation
+  - pkce
+  - delegated-access
+  - identity-provider
+objectives:
+  - Distinguish OAuth delegated authorization from OIDC authentication.
+  - Identify client, resource owner, authorization server, and resource server roles.
+  - Explain the authorization-code flow with PKCE, state/nonce, exact redirects, and audience checks.
+  - Analyze federation trust, token leakage, mix-up, consent, and provider compromise.
+relatedLessons:
+  - 10-03-jwt-tradeoffs
+  - 10-02-sessions-and-tokens
+  - 10-01-authentication-and-authorization
+  - 10-06-tls-and-encryption
+---
+
+# OAuth and OIDC
+
+> OAuth delegates limited access to a resource; OpenID Connect layers a signed identity assertion on OAuth—neither removes the need for local authorization and a clear federation trust boundary.
+
+## Why This Exists
+
+A calendar application wants to read a user’s events without learning the user’s password. A company wants employees to sign in through an external identity provider while its APIs receive only the permissions they need. The naive design asks the user for a third-party password or treats any access token as proof of identity. It fails because credentials cross the wrong trust boundary, permissions are too broad, and a token intended for one API is accepted by another.
+
+OAuth defines roles and a delegation protocol: the resource owner grants a client access through an authorization server to a resource server. OpenID Connect (OIDC) adds an identity layer so a relying party can authenticate an end user using an ID Token and issuer/user-info claims. OAuth alone is about authorization; an API access token should not be interpreted as “this is the human” without an explicit identity contract.
+
+## Mental Model
+
+```text
+resource owner ──consent──> authorization server
+       │                           │ code + tokens
+       └──── client (app) <────────┘
+                         └──── access token ──> resource server/API
+                         └──── ID token ─────> OIDC relying party (identity)
+```
+
+The client is the application requesting access, not necessarily the resource owner. A public client cannot keep a client secret (for example, a native app or browser app); a confidential client can protect credentials on a server. The authorization server authenticates the resource owner and issues grants/tokens. The resource server validates access tokens and enforces its own policy. In OIDC, the relying party validates an ID Token from a configured issuer and binds the login transaction to the user agent.
+
+## How It Works
+
+For a modern authorization-code flow:
+
+1. The client creates a transaction-specific `state`, a PKCE code verifier/challenge, and—when using OIDC—a `nonce`.
+2. It redirects the browser to the authorization endpoint with exact pre-registered redirect URI, client ID, requested scopes, response type `code`, and PKCE challenge.
+3. The authorization server authenticates the user and obtains consent according to policy. It redirects back with a short-lived, one-time authorization code and state.
+4. The client checks state, sends the code and PKCE verifier to the token endpoint, and authenticates as required by its client type.
+5. The authorization server returns an access token for a specific resource server and, for OIDC, an ID Token whose issuer, audience, nonce, signature, and time claims the client validates.
+6. The resource server validates the access token independently and authorizes the requested object/action. It does not use an ID Token as an API access token merely because both are JWTs.
+
+Exact redirect matching, PKCE, state/nonce binding, TLS, and short-lived codes defend against code interception, CSRF, mix-up, and redirect leakage. Avoid the implicit grant pattern that exposes access tokens in authorization responses unless a deployment has a compelling, explicitly mitigated legacy need. Publish issuer metadata and key rotation information through a trusted configuration/discovery path; do not let arbitrary user input choose an issuer.
+
+## Example
+
+An expense app requests `expenses.read` from a corporate authorization server. The browser returns a code bound to the app’s PKCE verifier and state. The app exchanges it server-side, stores refresh state in a protected session boundary, and calls `expenses-api` with an access token whose audience is only that API. The app validates the OIDC ID Token to establish the employee subject, then maps that subject to local tenant/role policy. It never forwards the ID Token to the expenses API as authority.
+
+If a second issuer is configured, the client binds the transaction to the selected issuer and verifies the returned `iss`; otherwise an attacker can cause a code or token from one provider to be interpreted as another provider’s identity. If the authorization server is compromised, issued tokens may be forged or mis-scoped; the resource server needs key rotation, issuer quarantine, token expiry/revocation, and incident response rather than assuming federation is an unconditional trust anchor.
+
+## Visualization We Eventually Want
+
+Animate browser, client, authorization server, resource server, and identity provider roles through a code + PKCE flow. Controls should remove PKCE, alter state/nonce, use a mismatched redirect or audience, expose a token in a URL, switch issuer, and replay a code. Display each trust boundary, verified claim, consented scope, and whether the result is authentication or delegated authorization.
+
+## Scaling Behavior
+
+Authorization servers become high-value, high-availability control planes for login, consent, code exchange, key publication, and revocation. Resource servers can validate tokens locally to reduce dependency latency, but key caches and issuer metadata need bounded refresh and emergency rotation. Large clients may need per-tenant issuer configuration and careful isolation so one tenant cannot choose another tenant’s issuer or redirect URI.
+
+Redirect-based flows add browser round trips and user-agent failure modes. Access-token scopes and audiences should remain narrow to reduce blast radius across many APIs. Refresh rotation and sender constraints increase state and cryptographic operations but reduce replay risk. Federation improves user experience and centralizes authentication while adding external availability, policy, and compromise dependencies.
+
+## Failure Modes
+
+- **OAuth/authentication confusion:** an access token is treated as proof of human identity.
+- **Redirect URI weakness:** wildcard/open redirects leak codes or tokens.
+- **CSRF/mix-up:** state, PKCE, or issuer binding is missing or reused across transactions.
+- **Code replay/interception:** a stolen code is exchanged without PKCE or one-time enforcement.
+- **Audience confusion:** a token for API A is accepted by API B.
+- **Issuer/key confusion:** attacker-controlled discovery or a wrong tenant issuer is trusted.
+- **Overbroad consent:** the client receives permissions far beyond its current feature.
+- **Provider compromise/outage:** login or token validation fails, or forged assertions enter the system.
+
+## Trade-offs
+
+Federation reduces password handling and centralizes identity policy, but adds redirects, provider dependency, onboarding/configuration work, and a large trust anchor. Local tokens reduce API latency but make revocation and key rotation harder. Narrow scopes/audiences reduce blast radius but may require more flows and consent. PKCE and sender constraints add protocol state and implementation complexity for materially stronger replay resistance.
+
+## Alternatives
+
+- **First-party session login:** simplest when one application owns identity; unsuitable when sharing credentials across organizations.
+- **Mutual TLS/service credentials:** strong server-to-server identity without user delegation; poor fit for interactive consent.
+- **SAML federation:** common in enterprise ecosystems; heavier XML/profile complexity but not interchangeable with OAuth API delegation.
+- **Signed one-time invitation:** useful for narrow onboarding, not general API authorization.
+
+## When to Use
+
+Use OAuth when a client needs delegated, scoped access to a resource it does not own. Add OIDC when the application needs a standardized federated login identity. Keep resource-server authorization and local tenant mapping explicit.
+
+## When Not to Use
+
+Do not use OAuth to hide a simple first-party session design, and do not use OIDC ID Tokens as general API bearer credentials. Avoid broad, long-lived scopes or dynamic issuer/redirect configuration without a strong trust and review model.
+
+## Common Misconceptions
+
+- **“OAuth is login.”** OAuth grants access; OIDC defines an authentication assertion on top.
+- **“ID Token and access token are interchangeable.”** They have different audiences and consumers.
+- **“PKCE is only for mobile apps.”** Current best practice applies it broadly, including web clients.
+- **“A trusted identity provider means all claims are current.”** Tokens still expire, can be replayed, and may become stale.
+- **“The API can trust whatever issuer the client sends.”** Issuer trust is configured, bounded, and verified.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> OAuth models a resource owner, client, authorization server, and resource server; OIDC adds a validated identity assertion. I use authorization code plus PKCE, transaction-bound state/nonce, exact redirects, narrow scopes/audiences, and TLS. The API validates access tokens and local policy independently, while the client validates the OIDC ID Token. I state issuer/key trust, provider compromise, revocation, and outage behavior.
+
+### When to Introduce It
+
+Introduce OAuth/OIDC when an app delegates access, integrates with external identity, or serves multiple organizations. Start by naming each role and trust boundary.
+
+### Common Follow-Ups
+
+- Why PKCE and state/nonce together?
+- What is the difference between an access token and ID Token?
+- How do you prevent a token for API A reaching API B?
+- What happens if the identity provider is unavailable?
+
+### Common Candidate Mistakes
+
+- Calling OAuth an authentication protocol without OIDC.
+- Accepting wildcard redirect URIs or skipping issuer/audience checks.
+- Forwarding ID Tokens to APIs.
+- Forgetting token revocation/provider compromise.
+
+## Summary
+
+OAuth delegates narrowly scoped access; OIDC authenticates an end user through a signed identity assertion. Use code + PKCE, bind transactions and issuers, validate exact audiences and claims, and keep resource-owner authorization independent. Federation shifts trust—it does not eliminate it.
+
+## Quiz Seeds
+
+1. Name the four OAuth roles.
+2. Why is an ID Token not an API access token?
+3. What does PKCE protect in the code flow?
+4. How do state and nonce address different binding concerns?
+5. Why must redirect URIs be exact and pre-registered?
+6. What happens if a resource server accepts a token with the wrong audience?
+7. Which controls address identity-provider compromise or issuer confusion?
+
+## Related Topics
+
+- [JWT Trade-offs](./jwt-tradeoffs.mdx)
+- [Sessions and Tokens](./sessions-and-tokens.mdx)
+- [Authentication and Authorization](./authentication-and-authorization.mdx)
+- [TLS and Encryption](./tls-and-encryption.mdx)
+
+## References
+
+### Documentation / Articles
+
+- [OAuth 2.0 Authorization Framework (RFC 6749)](https://www.rfc-editor.org/rfc/rfc6749.html) — defines OAuth roles, grants, authorization codes, and token endpoints.
+- [OAuth 2.0 Security Best Current Practice (RFC 9700)](https://www.rfc-editor.org/rfc/rfc9700.html) — updates threats and recommends PKCE, exact redirects, sender constraints, and avoiding implicit token exposure.
+- [OpenID Connect Core 1.0](https://openid.net/specs/openid-connect-core-1_0.html) — defines ID Tokens, nonce/audience/issuer validation, and authentication flows.
+- [Proof Key for Code Exchange (RFC 7636)](https://www.rfc-editor.org/rfc/rfc7636.html) — specifies the verifier/challenge binding that protects authorization codes.
+- [OAuth 2.0 Authorization Server Metadata (RFC 8414)](https://www.rfc-editor.org/rfc/rfc8414.html) — defines discoverable endpoint and key metadata without making discovery an implicit trust decision.

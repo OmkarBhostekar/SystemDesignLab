@@ -1,0 +1,180 @@
+---
+type: lesson
+id: 09-02-distributed-tracing
+slug: distributed-tracing
+title: Distributed Tracing
+description: Reconstruct one request or workflow across services and asynchronous hops without confusing correlation with causality or identity.
+module: observability
+order: 2
+difficulty: core
+estimatedMinutes: 30
+prerequisites:
+  - 09-01-logs-metrics-and-traces
+  - 03-08-service-boundaries
+  - 06-01-sync-vs-async
+  - 07-01-clocks-and-ordering
+tags:
+  - distributed-tracing
+  - trace-context
+  - spans
+  - async
+  - sampling
+objectives:
+  - Explain trace, span, parent-child, and link relationships.
+  - Propagate context across HTTP, RPC, queues, retries, and fan-out without trusting it as identity.
+  - Separate queue wait, service work, and downstream time in a trace waterfall.
+  - Choose sampling and retention policies that preserve rare slow or failed workflows.
+relatedLessons:
+  - 09-01-logs-metrics-and-traces
+  - 09-03-golden-signals
+  - 06-06-delivery-semantics
+  - 08-04-retry-storms-and-cascading-failures
+---
+
+# Distributed Tracing
+
+> A distributed trace is a causal map of one request or workflow; it explains where time and failure were spent, but it does not prove who the caller is.
+
+## Why This Exists
+
+In a monolith, a stack trace can often identify the slow function. In a service topology, an API gateway may spend 20 ms, checkout 40 ms, inventory 500 ms, and a queue consumer another 2 seconds. A conventional log search sees independent timestamps and cannot reliably tell whether two records belong to the same request. Retries and fan-out make duration totals especially easy to misread.
+
+The naive design copies a request ID into logs and calls the problem solved. It fails when a hop drops the ID, when an asynchronous message outlives the original request, or when parallel spans are added rather than nested. Tracing introduces a trace-wide context and timed spans at boundaries, then makes the resulting graph queryable.
+
+## Mental Model
+
+```text
+trace: checkout-7
+  root span: HTTP POST /checkout [0..920 ms]
+    child: inventory RPC [40..610 ms]
+    child: payment RPC   [50..180 ms]
+    producer: order.confirmed [700 ms]
+      link -> consumer span [t+2 s..t+2.1 s]
+```
+
+A trace is a set of spans sharing a trace ID. A span represents one operation with start/end time, attributes, events, status, and a span ID. Parent-child nesting expresses containment when an operation starts while another is active. A span link connects causally related work that is not a strict child, which is common for batch consumers or fan-in.
+
+Trace context normally carries a trace ID, the caller's span ID as parent, flags, and optional vendor state. The receiving service validates format, creates a new local span ID, and never lets an incoming caller choose arbitrary parentage inside trusted storage. Context propagation is interoperability, not authentication; a malicious client can send a plausible header.
+
+## How It Works
+
+1. The ingress creates a root span or continues a valid trace context from a trusted upstream.
+2. Every outbound HTTP/RPC call injects the current context and creates a client span; the server creates a corresponding server span.
+3. The service records semantic attributes such as route template, status class, peer service, retry attempt, and bounded shard/region labels.
+4. A message producer injects context into message metadata. A consumer extracts it, records queue wait from enqueue/dequeue timestamps, and either creates a child span or a link when one message represents many parents.
+5. Retries receive their own attempt spans or events so a waterfall shows repeated work rather than hiding it in one duration.
+6. Exporters batch and send spans to a collector. Sampling decisions may be made at ingress or after observing status/duration; the request and error metrics remain independent.
+
+Span timing does not automatically add up. Parallel children overlap. A parent can include local serialization and queue publish time. A missing child may mean unsampled data, not zero work. Use span events for meaningful transitions and baggage only for low-risk, bounded context; never propagate secrets or personal data by default.
+
+## Example
+
+`POST /orders` starts a trace at the edge. Order service calls inventory and payment in parallel. Inventory returns quickly, but payment retries once after a timeout. The root span lasts 900 ms; the payment child shows 600 ms including the retry, while the inventory child overlaps it. The order event is published at 850 ms and consumed by fulfillment 1.5 seconds later. A linked consumer span makes the end-to-end workflow visible while preserving the distinction between synchronous response time and asynchronous completion.
+
+If the same message is delivered twice, each processing attempt can have a span linked to the same message ID. Tracing shows duplicate work; idempotency remains a business invariant and is not supplied by the tracing system.
+
+## Visualization We Eventually Want
+
+Render an interactive waterfall/graph with gateway, order, inventory, payment, broker, and fulfillment nodes. Controls should toggle missing propagation, parallel fan-out, retry count, queue delay, sampling mode, and duplicate delivery. Display wall-clock duration, critical path, child overlap, queue wait, span links, and “unsampled/unknown” gaps. A switch should compare a fabricated request ID with standards-based trace context and show why neither is an authentication credential.
+
+## Scaling Behavior
+
+Span count grows with requests × fan-out × retries. High-cardinality attributes make storage and query costs grow faster than traffic. Large traces can exceed collector or backend limits; cap attributes, event counts, and message-body capture. Sampling rates often need to vary by service and workload, but inconsistent decisions can produce broken partial traces.
+
+For asynchronous workflows, retention must cover the maximum useful delay between producer and consumer. A trace that expires before the message is processed cannot answer “why did completion take six hours.” Keep durable business IDs and metrics for long-term reconciliation even when detailed traces expire quickly.
+
+## Failure Modes
+
+- **Propagation gap:** one service starts a new root, hiding the true critical path.
+- **Wrong parent:** background work is nested under a request that already finished, making duration and ownership misleading.
+- **Clock skew:** cross-host wall-clock display shifts spans; monotonic local duration and causal edges are safer.
+- **Sampling blind spot:** rare errors or high latency are omitted from head-sampled traces.
+- **Context spoofing:** untrusted headers are accepted as authorization, tenant, or user identity.
+- **Attribute explosion:** raw query strings, user IDs, and message payloads blow up storage or leak data.
+- **Fan-out overload:** tracing every sub-call adds CPU and network work exactly when the service is failing.
+- **Async expiry:** trace retention is shorter than queue retention, breaking delayed-work investigation.
+
+## Trade-offs
+
+Tracing gives causal and timing detail that metrics cannot, but instrumentation and storage are more expensive. Full traces make rare bugs easier to reproduce but can amplify load; sampling reduces cost while risking missing evidence. Automatic instrumentation is broad and quick, while manual spans capture business decisions but demand discipline. A collector decouples applications from backend outages but adds buffering, capacity, and loss policy.
+
+## Alternatives
+
+- **Request IDs plus structured logs:** sufficient for a small topology or low-volume batch path; weaker for parallel fan-out and timing.
+- **Profiling:** finds CPU or allocation hotspots without following a particular request; pair it with traces for distributed latency.
+- **Black-box synthetic traces:** validate an external journey even when internal instrumentation is broken, but cannot explain internal hops.
+- **Business workflow IDs:** essential for reconciliation across hours or days; use alongside shorter-lived trace context.
+
+## When to Use
+
+Use tracing when a request crosses services, regions, queues, or third-party calls and the debugging question is “where did this one operation spend time?” Propagate it at every transport boundary and sample based on user impact, not only average traffic.
+
+## When Not to Use
+
+Do not use a trace as the sole source for availability or rate calculations, as a security identity, or as permanent audit history. A low-volume one-process job may be adequately diagnosed with structured logs and metrics.
+
+## Common Misconceptions
+
+- **“The root span duration equals the sum of child durations.”** Parallel children overlap, and parent-local work is separate.
+- **“A trace ID is a request ID with extra formatting.”** Standard context also expresses parent position and sampling intent, though it still needs correct propagation.
+- **“Every message should be a child of the HTTP request.”** Long-lived or batched consumers often need links and separate workflow boundaries.
+- **“Missing span means no work happened.”** It may be unsampled, dropped, or not instrumented.
+- **“Trace context identifies the user.”** Authorization must use independently verified credentials.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I create spans at ingress, outbound calls, retries, queue publish/consume, and important state transitions. A trace ID groups spans; parent-child edges show containment and links connect asynchronous or fan-in work. I propagate standards-based context, separate queue wait from processing time, sample detailed traces while keeping complete SLO metrics, and treat trace context as untrusted correlation metadata rather than identity.
+
+### When to Introduce It
+
+Introduce tracing after the request path contains more than one process or an async boundary, especially when tail latency or “which dependency caused the failure?” is a key question.
+
+### Common Follow-Ups
+
+- How do you trace a message after the HTTP response has returned?
+- How do retries and fan-out affect span duration?
+- What happens when sampling omits the only failed request?
+- What data must never be copied into span attributes?
+
+### Common Candidate Mistakes
+
+- Treating a trace as an audit log or authentication token.
+- Forgetting queue wait and retry-attempt spans.
+- Capturing unbounded IDs and request bodies.
+- Claiming distributed tracing proves global event ordering.
+
+## Summary
+
+Tracing maps causal work across boundaries. Create bounded spans, propagate context correctly, use links for asynchronous relationships, preserve complete aggregate metrics, and make sampling sensitive to failures and tail latency. A trace explains behavior; it does not enforce identity, ordering, or idempotency.
+
+## Quiz Seeds
+
+1. Why can parallel child spans sum to more than the root duration?
+2. Which span or metric separates queue wait from consumer processing time?
+3. When is a span link preferable to a parent-child relationship?
+4. Why must trace context not be used to authorize a tenant?
+5. What evidence is lost with head sampling, and how can tail sampling help?
+6. How do retries change the interpretation of a downstream span?
+7. What retention mismatch can make a six-hour asynchronous workflow impossible to debug?
+
+## Related Topics
+
+- [Logs, Metrics, and Traces](./logs-metrics-and-traces.mdx)
+- [Golden Signals](./golden-signals.mdx)
+- [Delivery Semantics](../06-messaging/delivery-semantics.mdx)
+- [Retry Storms and Cascading Failures](../08-reliability/retry-storms-and-cascading-failures.mdx)
+
+## References
+
+### Documentation / Articles
+
+- [Trace Context](https://www.w3.org/TR/trace-context/) — standardizes `traceparent` and `tracestate` propagation across providers.
+- [OpenTelemetry Context Propagation](https://opentelemetry.io/docs/concepts/context-propagation/) — explains how context follows requests across process boundaries.
+- [OpenTelemetry Traces](https://opentelemetry.io/docs/concepts/signals/traces/) — defines spans, attributes, events, links, and trace structure.
+- [OpenTelemetry Sampling](https://opentelemetry.io/docs/concepts/sampling/) — compares sampling decisions and their operational consequences.
+
+### Papers
+
+- [Dapper, a Large-Scale Distributed Systems Tracing Infrastructure](https://research.google/pubs/dapper-a-large-scale-distributed-systems-tracing-infrastructure/) — grounds the span model, propagation, and sampling at scale.

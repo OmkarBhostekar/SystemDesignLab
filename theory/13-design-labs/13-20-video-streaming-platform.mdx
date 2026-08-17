@@ -1,0 +1,216 @@
+---
+type: lesson
+id: 13-20-video-streaming-platform
+slug: video-streaming-platform
+title: Video Streaming Platform
+description: Design video ingest, object storage, transcoding, manifests, CDN delivery, regional failover, and playback observability.
+module: design-labs
+order: 20
+difficulty: deep-dive
+estimatedMinutes: 90
+prerequisites:
+  - 00-03-estimation
+  - 02-04-http-evolution
+  - 00-04-interview-framework
+  - 03-06-api-gateway
+  - 04-08-replication
+  - 05-09-multi-layer-caching
+  - 06-10-batching-and-stream-vs-batch
+  - 08-09-backups-rpo-rto
+  - 08-10-multi-region-and-region-failover
+tags:
+  - video-streaming
+  - transcoding
+  - manifests
+  - cdn
+  - media-delivery
+objectives:
+  - Separate ingest, metadata, transcoding, packaging, origin storage, CDN, and playback telemetry.
+  - Estimate upload/egress bandwidth, encoded ladder storage, concurrent viewers, and cache impact.
+  - Design integrity, authorization, retry/idempotency, regional delivery, and recovery behavior.
+  - Explain adaptive bitrate manifests, segment alignment, backpressure, and observability.
+relatedLessons:
+  - 02-04-http-evolution
+  - 03-06-api-gateway
+  - 04-08-replication
+  - 05-09-multi-layer-caching
+  - 06-10-batching-and-stream-vs-batch
+  - 08-10-multi-region-and-region-failover
+visualizationId: null
+quizId: null
+---
+
+# Video Streaming Platform
+
+> Video streaming is two systems joined by metadata: an offline media supply chain creates verified renditions, while a CDN serves small immutable segments under tight bandwidth and startup-latency budgets.
+
+## Problem Statement
+
+Design a platform where creators upload video, the service validates and stores the source, transcodes multiple resolutions/codecs, packages HLS/DASH manifests and segments, and serves viewers globally through a CDN. Playback should adapt to bandwidth and recover from an origin/region failure. Upload and processing may be hours long; a viewer expects a fast start and smooth delivery. Ask whether live streaming is required; this lab assumes on-demand video, with a live-streaming extension noted as a future variation.
+
+## Functional Requirements (Scoped)
+
+- Create a video asset/upload session, resume multipart upload, and commit after checksum/metadata validation.
+- Transcode into an adaptive bitrate ladder, package immutable segments/manifests, and publish only validated renditions.
+- Return authorized playback manifests/keys and stream through CDN/origin.
+- Support asset metadata, visibility, takedown, version/republish, and retention.
+- Collect playback QoE/events and expose processing/playback status; retry jobs idempotently.
+
+Out of scope: codec implementation, live low-latency ingest, ad decisioning, recommendation ranking, and DRM protocol internals.
+
+## Non-Functional Requirements and Priorities
+
+| Priority | Requirement | Working target / question |
+| --- | --- | --- |
+| P0 | Content integrity | Published manifests reference complete checksum-verified segments. |
+| P0 | Delivery availability | Meet playback availability/startup SLO through CDN/origin/region failover. |
+| P0 | Authorization | Viewers receive only policy-approved manifests/keys; takedowns have a bounded stale window. |
+| P1 | Startup/rebuffer | p95 startup under 2 s and rebuffer rate under a stated target in healthy regions. |
+| P1 | Processing durability | Transcode/package jobs resume/retry without duplicate published versions. |
+| P2 | Cost/quality | Ladder, retention, CDN egress, and telemetry resolution are tunable. |
+
+## Estimation Prompts and Checked Example
+
+Ask for uploads/day, source duration/bitrate, encoded ladder, concurrent viewers, average playback bitrate, segment duration, CDN hit ratio, and retention. Example:
+
+- 100k uploads/day × 10 minutes × 100 MB source = `10 TB/day` source ingress; 30-day source retention is `300 TB` logical.
+- A 4-rendition ladder totaling 8 Mbps for 10 minutes is `8 Mb/s × 600 s = 4,800 Mb ≈600 MB` per video; 100k/day is `≈60 TB/day` encoded output before replicas.
+- 1M concurrent viewers at 3 Mbps average demand `3 Tb/s` at the edge. At 95% CDN hit, origin still serves `150 Gb/s`; CDN capacity, not API QPS, dominates.
+- With 6-second segments and 1M viewers, the system delivers about `1M/6 ≈167k segment requests/s` (more if each viewer switches renditions); manifest/API QPS is much smaller.
+
+Sensitivity prompts: Is content public or per-user entitlement? How many renditions/codecs? Does a takedown need to stop playback immediately? What is acceptable processing delay and origin egress during a cold release?
+
+## API Design
+
+```http
+POST /v1/videos
+Idempotency-Key: creator7-video42
+{"title":"Demo","size":1073741824,"sha256":"...","visibility":"unlisted"}
+```
+
+Return `201` with asset ID/upload session and signed multipart URLs. Part/status retries are idempotent; `POST /videos/{id}:commit` verifies the source/checksum and starts a processing job, returning `202 {state:"processing", version}`. Reusing the commit key returns the same job/version; a changed source returns `409`.
+
+`GET /videos/{id}/playback` returns a short-lived signed manifest URL/token only for an authorized viewer and published version. `GET /manifests/{id}`/segment CDN requests use immutable versioned paths; `403`/`404` hide unauthorized content, `410` represents a takedown/version gone where policy permits, `429` limits abuse, and `503` signals no safe origin/manifest path. Processing workers use job ID/rendition idempotency keys; a timeout after transcode is resolved by job status, not duplicate publication.
+
+## Data Model, Access Paths, and Ownership
+
+```text
+videos(video_id PK, owner_id, metadata_version, source_object,
+       visibility, state, published_version, created_at)
+uploads(upload_id PK, video_id, checksum, parts_state, expires_at,
+        idempotency_key UNIQUE)
+renditions(video_id, version, codec, width, bitrate, manifest_ref, state,
+           checksum, PRIMARY KEY(video_id, version, codec, bitrate))
+segments(rendition_id, sequence_no, object_key, checksum, duration)
+processing_jobs(job_id PK, video_id, version, stage, rendition, state,
+                attempt, input_checksum, output_manifest, UNIQUE(...))
+playback_events(event_id PK, video_id, viewer_bucket, position, event_time)
+```
+
+The asset service owns metadata/entitlement and published-version pointer; object storage owns source/rendition/segment bytes; transcode/package workers own derived artifacts; CDN owns edge cache; playback telemetry owns aggregate QoE. A version is published only after all required renditions/manifests/segments pass integrity checks. Segment URLs include immutable version/content hash so CDN invalidation is mostly avoided for new versions.
+
+## Progressive Architecture: Naive → Bottleneck → Improvement → New Trade-off
+
+1. **Naive:** stream original files through one API server. Uploads, transcoding, concurrent egress, and failures all compete; mobile/variable networks rebuffer.
+2. **Bottleneck/failure:** store source in object storage and serve it via a CDN. Delivery scales, but one bitrate cannot adapt; slow transcode/partial outputs and origin cache misses create poor startup/rebuffer behavior.
+3. **Improvement:** direct multipart ingest, durable processing queue, multi-rendition transcode/package, immutable segments/manifests in object storage, signed playback authorization, and CDN/origin across regions. Prewarm popular releases and track QoE.
+4. **New trade-off:** more renditions multiply processing/storage, manifests/keys introduce authorization and version complexity, and CDN caches can retain takedown content. Processing is eventually complete; users see `processing`/fallback states.
+
+Reference architecture:
+
+```text
+Creator → Upload API → source object store → job queue → transcode → package/validate
+                                             └→ rendition object store + manifests
+Viewer → playback auth → CDN → regional origin/object store → immutable segments
+                               └→ QoE events → stream/metrics store
+```
+
+The API is a control plane; video bytes flow through signed direct storage/CDN paths. Processing job stages are idempotent and content-addressed where practical.
+
+## Bottlenecks and Concurrency / Consistency
+
+Transcoding CPU/GPU, source/output storage, CDN cache-miss/origin bandwidth, manifest authorization, segment request bursts, object repair, and QoE event volume dominate. A `video_version` pointer is the publication consistency boundary; workers write private output paths and atomically publish only complete versions. Segment numbering/duration must align across renditions for adaptive switching. Takedown is authoritative at playback-token issuance; existing signed tokens/CDN segments have a documented maximum stale window. QoE telemetry is sampled/batched and not in the playback critical path.
+
+## Failure Analysis
+
+- **Upload part loss:** list/checksum missing parts and resume; expire abandoned sessions.
+- **Transcode worker crash:** stage/job lease retry from verified source; unique job/rendition key prevents duplicate publish.
+- **Partial output:** keep version unpublished; validate manifest references before pointer swap.
+- **Origin/CDN outage:** multi-origin/region failover, cached segment continuation, and a bounded degraded playback path.
+- **Cold-cache release:** prewarm popular first segments, protect origin with request coalescing, and use longer immutable segment TTLs.
+- **Takedown after cache:** revoke auth tokens, purge where supported, version paths, and measure stale delivery.
+- **QoE event storm:** sample/batch and shed low-priority telemetry while preserving error/rebuffer signals.
+- **Region loss:** route auth/origin to healthy region, keep asset/version metadata, and recover processing/telemetry by job/event offsets.
+
+## Security
+
+Authorize creator ownership and viewer entitlements; sign manifest/segment/key URLs with scope, version, expiry, and policy. Encrypt source/renditions at rest/in transit, isolate tenants, rotate signing/DRM secrets, scan uploads, and validate codecs/container limits. Prevent hotlinking/token replay with audience/binding/rate controls where appropriate. Minimize precise viewer IDs/location in telemetry, audit takedowns/entitlement changes, and do not expose private object keys.
+
+## Observability
+
+Measure upload/processing stage latency and queue age, rendition success, output checksum failures, publish/version state, manifest/token errors, CDN hit/origin egress, segment p50/p95/p99 latency, startup time, rebuffer ratio, bitrate switches, playback error codes, region failover, and stale-takedown delivery. Trace asset/version/job through upload/transcode/package; sample viewer telemetry but preserve session/QoE correlation. Alert on processing backlog, origin saturation, cache-miss storms, and QoE SLO burn rather than just API health.
+
+## Explicit Trade-offs and Alternatives
+
+- **Original/progressive download vs adaptive streaming:** simplest storage/delivery but poor varying-network UX; ABR multiplies artifacts and improves resilience.
+- **Precompute all renditions vs on-demand:** precompute startup/reliability at storage/processing cost; on-demand saves cold assets but risks first-view latency.
+- **CDN cache immutable segments vs signed every segment:** immutable paths improve hit ratio; per-request auth improves revocation but adds edge/authorization load.
+- **Replica vs erasure/cold tier:** replicas simplify hot reads; parity/cold saves cost but raises retrieval/repair latency.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+“I separate source ingest/control metadata from an asynchronous media pipeline. Direct multipart upload is checksum-verified; transcode/package workers write private immutable rendition/segment paths, validate manifests, then atomically publish a version. Playback auth issues short-lived signed manifests, while a CDN serves immutable segments from regional origins. I estimate segment-request/egress—not just API QPS—and track startup/rebuffer, cache misses, processing lag, and takedown staleness.”
+
+### When to Introduce It
+
+Introduce ABR/CDN when variable bandwidth and concurrent egress dominate; introduce job queues/private output/publish pointers when transcode can be slow or partial. Add multi-region origins after RPO/RTO and cache-failure analysis.
+
+### Common Follow-Ups
+
+- How do you publish only complete renditions?
+- What happens when the CDN has a takedown segment?
+- Why are segment requests more important than manifest QPS?
+- How do you retry a crashed transcode job?
+
+### Common Candidate Mistakes
+
+Serving video through application servers, treating a source upload as a playable version, ignoring segment alignment/ABR, using one TTL for auth and bytes, and measuring only API latency.
+
+## Summary
+
+Video systems scale their data path through immutable segments, CDN, and regional origins while keeping control-plane metadata and processing workflows durable. Publish complete versions atomically, authorize manifests/keys, estimate sustained egress and segment QPS, and make QoE/takedown windows observable.
+
+## Quiz Seeds
+
+1. Calculate edge demand for 1M viewers at 3 Mbps and origin demand at 95% CDN hit.
+2. Why must a rendition remain unpublished until every referenced segment is valid?
+3. What makes a transcode retry idempotent?
+4. Why are immutable versioned segment paths useful for CDN behavior?
+5. What is the difference between manifest authorization and segment cache freshness?
+6. How does a 6-second segment duration affect request QPS?
+7. Which QoE metrics matter beyond API p99?
+8. What should happen to a video when one rendition fails validation?
+
+## Related Topics
+
+- [HTTP evolution](../02-networking/http-evolution.mdx) — delivery semantics and range/cache behavior.
+- [API gateway](../03-traffic-and-services/api-gateway.mdx) — control-plane boundary.
+- [Replication](../04-databases/replication.mdx) — origin durability.
+- [Multi-layer caching](../05-caching/multi-layer-caching.mdx) — CDN/edge/origin cache placement.
+- [Batching and stream vs batch](../06-messaging/batching-and-stream-vs-batch.mdx) — media jobs and QoE aggregation.
+- [Multi-region failover](../08-reliability/multi-region-and-region-failover.mdx) — delivery/recovery.
+
+## References
+
+### Documentation / Articles
+
+- [RFC 8216: HTTP Live Streaming](https://www.rfc-editor.org/rfc/rfc8216.html) — defines HLS playlists, segments, and client delivery semantics.
+- [DASH-IF Interoperability Points v5](https://dashif.org/guidelines/iop-v5/) — documents MPEG-DASH manifests, segment alignment, and adaptive playback practice.
+- [Amazon CloudFront caching](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/ConfiguringCaching.html) — grounds CDN cache keys, TTL, and origin delivery trade-offs.
+- [Amazon S3 multipart upload](https://docs.aws.amazon.com/AmazonS3/latest/userguide/mpuoverview.html) — supports resumable source/rendition transfer and checksums.
+
+## Future Visualization / Workspace Spec
+
+Build an on-demand pipeline simulator with multipart source upload, checksum, queue stages, transcode workers, rendition ladder, manifest validation/publish, CDN cache/origin, signed playback, segment requests, and QoE. Controls should vary source duration, ladder count, worker/GPU capacity, job failures, segment duration, viewer concurrency/bitrate, CDN hit, origin loss, and takedown timing. Show processing backlog, storage/egress, segment QPS, cache hit, startup/rebuffer, rendition/version state, token/cache stale windows, and failover. Workspace nodes should include Creator, Upload, Source Store, Queue, Transcoder, Packager, Manifest/Auth, CDN, Origin, and QoE pipeline.

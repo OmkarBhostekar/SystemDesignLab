@@ -1,0 +1,218 @@
+---
+type: lesson
+id: 13-01-url-shortener
+slug: url-shortener
+title: URL Shortener
+description: Design a read-heavy redirect service with stable aliases, expiry, abuse controls, and predictable hot-key behavior.
+module: design-labs
+order: 1
+difficulty: core
+estimatedMinutes: 45
+prerequisites:
+  - 00-03-estimation
+  - 00-04-interview-framework
+  - 02-07-api-design-interviews
+  - 03-02-load-balancing-algorithms
+  - 04-06-database-indexes
+  - 05-03-cache-aside
+tags:
+  - url-shortener
+  - read-heavy
+  - redirects
+  - identifiers
+  - caching
+objectives:
+  - Turn a redirect-heavy workload into explicit QPS, storage, and cache assumptions.
+  - Choose an alias-generation and collision policy that is safe under concurrent creates.
+  - Design redirect, expiry, abuse, and deletion behavior with retry and idempotency semantics.
+  - Explain how the design evolves from one database to replicas, cache, and partitioning.
+relatedLessons:
+  - 01-03-latency-vs-throughput
+  - 04-09-partitioning-and-sharding
+  - 05-08-hot-keys
+  - 08-02-retries
+visualizationId: null
+quizId: null
+---
+
+# URL Shortener
+
+> Design the smallest service that turns a durable alias into a fast, safe redirect, then make its read-heavy path survive skew and failure.
+
+## Problem Statement
+
+Build a public service that accepts a long URL and returns a short URL. A request to the short URL should redirect quickly to the original URL. The service must support optional custom aliases, expiration, deletion, abuse reporting, and basic per-tenant quotas. The interview intentionally leaves traffic, alias length, and retention open so the candidate has to ask clarifying questions.
+
+## Functional Requirements (Scoped)
+
+In scope:
+
+- Create a short URL from a validated `https` or `http` destination.
+- Redirect `GET /{alias}` with a documented `302` or `301` policy.
+- Optionally set an expiry time and retrieve metadata for the owner.
+- Reserve a custom alias if it is available; reject conflicts without overwriting.
+- Delete or disable an alias and record an abuse/takedown state.
+- Provide an idempotent create option so a client retry does not create multiple aliases.
+
+Out of scope for the first design: link previews, full analytics, arbitrary JavaScript execution, bulk import, and a global guarantee that a deleted URL disappears from every already-warm cache instantly.
+
+## Non-Functional Requirements and Priorities
+
+| Priority | Requirement | Working target / question |
+| --- | --- | --- |
+| P0 | Redirect availability | 99.95% monthly for existing active aliases; what is the degraded response? |
+| P0 | Redirect latency | p99 under 100 ms at the edge of the service for warm aliases. |
+| P0 | Alias correctness | Never map one alias to two destinations; an expired/deleted alias must not redirect. |
+| P1 | Create durability | A successful create survives an application restart and is readable within seconds. |
+| P1 | Abuse resistance | Bound creation, destination fetch, and redirect abuse per principal/IP. |
+| P2 | Analytics freshness | Click counts can be eventually consistent and may be delayed during an outage. |
+
+Ask whether redirects may be stale for a short TTL, whether users need regional vanity domains, and whether the owner can edit a destination. Those answers determine invalidation and data ownership.
+
+## Estimation Prompts and Checked Example
+
+Ask the interviewer for MAU, creates/day, redirects/day, average alias and destination sizes, retention, peak multiplier, cache hit ratio, and per-instance capacity. If no numbers are supplied, state an illustrative case:
+
+- 10M aliases are active; each receives 20 redirects/month → 200M redirects/month.
+- `200M / (30 × 86,400) ≈ 77` average redirects/s; a 10× peak gives about `770 RPS`.
+- 1M creates/month is `≈0.39 writes/s` average; 10× peak is only `≈4 writes/s`.
+- A 1 KB row (alias, URL, timestamps, owner, state) for 10M aliases is `≈10 GB` logical data. Three replicas are `≈30 GB` before indexes, WAL, backups, and free-space headroom.
+- A warm cache holding 2M hot aliases at 1.5 KB/key+value+metadata is `≈3 GB` logical memory; budget allocator/replica overhead separately.
+- At 150 ms average service time and 770 RPS, Little's Law gives `770 × 0.150 ≈116` in-flight requests at peak. This is not a thread-count recommendation; sockets, database pools, and downstream timeouts still need limits.
+
+Sensitivity prompt: if one celebrity alias receives 20k RPS, average capacity is irrelevant; the hot-key path, edge caching, and per-alias invalidation become the design center.
+
+## API Design
+
+```http
+POST /v1/links
+Idempotency-Key: create-8c2d
+Content-Type: application/json
+
+{"destination":"https://example.com/article/42","customAlias":"spring-sale","expiresAt":"2027-01-01T00:00:00Z"}
+```
+
+Return `201` with `{alias, shortUrl, destination, expiresAt, version}`. Repeating the same idempotency key with the same request returns the stored response; reusing it with a different request returns `409 Idempotency-Key-Reused`. A custom alias race is a conditional insert and returns `409 AliasTaken`, never last-write-wins.
+
+`GET /{alias}` returns `302` for mutable destinations or `301` only when the product promises immutability. It returns `404` for unknown/expired aliases, `410` for a deliberately disclosed takedown if that distinction is safe, and `429` when a redirect abuse policy applies. `DELETE /v1/links/{alias}` is idempotent: repeated deletion returns the same disabled state. Return `400` for malformed URLs, `403` for an unauthorized owner, `412` for a stale `If-Match` version, and `503` only when the service cannot determine a safe answer.
+
+Retry creates only with the idempotency key; retry redirects only for transport failures and never “fixes” a `404`. A timeout after a create is resolved with `GET /v1/links/by-idempotency-key/{key}` or a status query, not a blind second insert.
+
+## Data Model, Access Paths, and Ownership
+
+```text
+links(alias PK, link_id, owner_id, destination, state, expires_at,
+      created_at, deleted_at, version, destination_hash)
+create_requests(owner_id, idempotency_key, request_hash, status,
+                response_json, created_at, expires_at,
+                UNIQUE(owner_id, idempotency_key))
+redirect_events(event_id, alias, occurred_at, region, coarse_user_agent)
+```
+
+The Link service owns alias uniqueness, destination state, expiry, and deletion. The analytics pipeline owns append-only click events and derived counts; it must not be in the redirect critical path. Reads are point lookups by alias, optionally by `(owner_id, link_id)` for management. A unique primary key on `alias` and a conditional state/version update protect the invariant. Do not put every click in the links row; a hot counter turns a read path into a write hotspot.
+
+## Progressive Architecture: Naive → Bottleneck → Improvement → New Trade-off
+
+1. **Naive:** one stateless API process reads and writes one relational table. It is easy to reason about and gives a unique alias constraint, but one process, one database, and synchronous click logging fail under traffic or a database outage.
+2. **Bottleneck/failure:** add a load balancer and API replicas. Redirect reads now converge on the database; a popular alias consumes connection pools and a synchronous analytics insert lengthens p99.
+3. **Improvement:** use a cache-aside alias cache with bounded TTL, negative-cache only short-lived misses, read replicas for metadata, and enqueue click events after returning the redirect. Partition analytics separately; put a CDN/edge cache in front only for immutable aliases.
+4. **New trade-off:** cached aliases can outlive deletion or expiry, and cache stampedes can hit the primary. Use versioned values, explicit invalidation on state change, TTL jitter/request coalescing, and a short maximum stale window. Partitioning the links table helps growth but makes custom alias routing and global uniqueness harder.
+
+Reference architecture:
+
+```text
+Client → DNS/CDN (optional immutable redirects) → load balancer
+       → Link API → L1 cache → distributed cache → primary/replica SQL
+                              └→ durable click queue → analytics store
+```
+
+The SQL store is the source of truth for alias ownership; the cache is an optimization, and the queue is a loss-tolerant or explicitly durable analytics boundary. Use a transactional outbox if a click event is contractual rather than best effort. The architecture follows from read volume, hot keys, and the need to keep analytics off the redirect latency budget.
+
+## Bottlenecks and Concurrency / Consistency
+
+Likely bottlenecks are cache misses during cold start, a celebrity alias, database connection pools, alias generation collisions, and abuse scans. Generate random/base62 aliases with a unique insert-and-retry loop or allocate IDs centrally; never assume a hash is collision-free. A custom alias is a compare-and-set on the unique key. Destination edits use an optimistic `version` and invalidate the old cache value only after commit. Reads may be eventually consistent across replicas, but a create response must be read-your-write through primary/session routing if the product promises immediate redirectability.
+
+## Failure Analysis
+
+- **Cache outage:** bypass to replicas/primary with a load-shed policy; do not let every client retry indefinitely.
+- **Primary unavailable:** serve cached active aliases within an explicitly bounded stale window; reject creates with `503` or queue them rather than inventing ownership.
+- **Lost response after commit:** idempotency lookup returns the original result.
+- **Queue lag:** preserve redirects and expose delayed analytics; cap queue retention and alert on age.
+- **Expired value in cache:** include `expiresAt` in the cached value and check it before redirecting.
+- **Poison destination/phishing:** scan at create and report time, but do not make an external fetch a synchronous dependency for every redirect.
+
+## Security
+
+Normalize and validate schemes, reject local/private-network destinations for server-side scanners, and protect management APIs with authenticated owner checks. Rate-limit create and redirect abuse by account, IP, and destination domain; reserve aliases against enumeration where needed. Avoid logging full query strings or personal click data; hash or coarsen analytics identifiers and set retention. Encrypt links and events in transit/at rest, sign administrator takedown actions, and treat custom aliases as untrusted output (HTML-escape them in dashboards).
+
+## Observability
+
+Track redirect QPS, hit/miss ratio, p50/p95/p99 latency, status by cause (`unknown`, `expired`, `disabled`), cache age, hot-key top-N, database pool wait, alias collision retries, create idempotency replays, queue depth/age, and analytics drop rate. Propagate a request ID and link ID; trace create through conditional insert/cache invalidation, but sample high-volume redirects. Alerts should distinguish a cache outage from a bad deploy and use an SLO burn rate rather than only host CPU.
+
+## Explicit Trade-offs and Alternatives
+
+- **Random aliases vs monotonic IDs:** random aliases are harder to enumerate but need collision retries; monotonic IDs are compact and easy to shard but reveal volume.
+- **`301` vs `302`:** `301` enables stronger caching and lower origin load but makes destination changes hard; `302` preserves control at more origin cost.
+- **SQL vs key-value storage:** SQL gives uniqueness, owner queries, and transactions; a KV store is excellent for point reads but needs separate uniqueness/management indexing.
+- **Synchronous analytics vs queue:** sync is immediately visible but couples availability and p99 to analytics; async is resilient but eventually consistent.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+“I keep alias ownership and destination state in a strongly consistent store, serve the read-heavy redirect path from a cache, and move click analytics to an asynchronous stream. Creates use a unique alias constraint plus an idempotency record, while expiry/deletion values carry version and TTL information so stale caches cannot redirect forever. I would ask whether aliases are mutable and how much stale redirect behavior is acceptable.”
+
+### When to Introduce It
+
+Introduce a cache after showing read/write skew or a hot alias; introduce a queue after showing analytics would consume redirect latency; introduce partitioning only when data size, tenant isolation, or write capacity—not fashion—requires it.
+
+### Common Follow-Ups
+
+- How do you prevent a cache from serving a deleted link?
+- How do you generate aliases across regions?
+- What happens when the same custom alias is created concurrently?
+- How would you count clicks without losing redirect availability?
+
+### Common Candidate Mistakes
+
+Calling a hash “collision-free,” writing click counters synchronously, claiming cache invalidation is instant everywhere, and forgetting that a lost create response can mean the write already committed.
+
+## Summary
+
+Keep alias uniqueness and lifecycle in one authoritative ownership boundary. Cache point reads, isolate hot analytics writes, and make create/delete retries duplicate-safe. State freshness and deletion guarantees explicitly; then scale the proven bottleneck.
+
+## Quiz Seeds
+
+1. Why does `hash(longUrl)` alone fail as a globally unique alias strategy?
+2. Given 200M redirects/month, 10× peak, and 150 ms latency, calculate peak QPS and in-flight requests.
+3. Which operation must be conditional when two users request the same custom alias?
+4. Why can a `301` make a mutable destination difficult to change?
+5. What should a timeout after a successful create return on retry?
+6. Which data belongs outside the hot `links` row and why?
+7. How would you handle a single alias receiving 20k RPS?
+8. What is the maximum stale redirect window after deletion, and how is it enforced?
+
+## Related Topics
+
+- [Interview framework](../00-interview-method/interview-framework.mdx) — the requirement-to-reference workflow used by this lab.
+- [Back-of-the-envelope estimation](../00-interview-method/estimation.mdx) — checked workload and capacity arithmetic.
+- [Database indexes](../04-databases/database-indexes.mdx) — point lookup and uniqueness access paths.
+- [Cache-aside](../05-caching/cache-aside.mdx) — the read-through choice and miss behavior.
+- [Hot keys](../05-caching/hot-keys.mdx) — why one popular alias can dominate a cluster.
+
+## References
+
+### Documentation / Articles
+
+- [RFC 3986: Uniform Resource Identifier](https://www.rfc-editor.org/rfc/rfc3986.html) — defines URI syntax and normalization concerns behind destination validation.
+- [RFC 9110: HTTP Semantics](https://www.rfc-editor.org/rfc/rfc9110.html) — grounds redirect methods, status codes, caching, and retry semantics.
+- [PostgreSQL constraints](https://www.postgresql.org/docs/current/ddl-constraints.html) — documents unique and check constraints that enforce alias invariants.
+- [Redis EXPIRE](https://redis.io/docs/latest/commands/expire/) — illustrates TTL behavior and why expiry in a cache is not a source-of-truth lifecycle.
+
+### Papers
+
+- [The Tail at Scale](https://research.google/pubs/the-tail-at-scale/) — explains why a synchronous analytics fan-out can dominate redirect tail latency.
+
+## Future Visualization / Workspace Spec
+
+Provide a stepper with create, cache miss, database commit, redirect, analytics enqueue, expiry, and delete events. Controls should vary read/write skew, alias collisions, cache TTL/jitter, hot-key rate, replica lag, and queue availability. Show request latency, cache state, stale-window violations, conditional-write conflicts, and queue age in a text status panel. A future workspace should let learners place Client, CDN, API, Cache, SQL, Queue, and Analytics nodes, label consistency/ownership on edges, and compare their design with the reference without scoring a single “correct” topology.

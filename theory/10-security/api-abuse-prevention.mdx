@@ -1,0 +1,174 @@
+---
+type: lesson
+id: 10-08-api-abuse-prevention
+slug: api-abuse-prevention
+title: API Abuse Prevention
+description: Protect user experience and provider capacity from automation, replay, credential attacks, and expensive workloads with identity-aware admission control.
+module: security
+order: 8
+difficulty: core
+estimatedMinutes: 30
+prerequisites:
+  - 10-01-authentication-and-authorization
+  - 10-05-rbac-and-abac
+  - 03-06-api-gateway
+  - 09-06-alerting
+  - 08-07-load-shedding-and-graceful-degradation
+tags:
+  - api-security
+  - rate-limiting
+  - quotas
+  - abuse
+  - replay
+  - admission-control
+objectives:
+  - Threat-model credential stuffing, scraping, replay, resource exhaustion, and business-flow abuse.
+  - Design layered rate limits, quotas, concurrency bounds, and cost-aware admission.
+  - Bind limits and abuse signals to authenticated principals, tenants, devices, and resources fairly.
+  - Connect rejection, observability, appeals, and incident response without relying on one IP limit.
+relatedLessons:
+  - 10-09-multi-tenancy-and-isolation
+  - 10-01-authentication-and-authorization
+  - 09-03-golden-signals
+---
+
+# API Abuse Prevention
+
+> Abuse prevention is identity-aware admission control: reject or slow harmful work before it consumes scarce capacity, while preserving fair access for legitimate callers.
+
+## Why This Exists
+
+An API can be correctly authenticated and still be abused. A bot can create millions of accounts, a credential-stuffing campaign can make login expensive, a scraper can exhaust a search index, or one valid tenant can submit huge image transformations and starve others. The naive design uses one requests-per-IP limit at the gateway. It fails behind NATs, misses authenticated distributed bots, and protects request count rather than CPU, bytes, queue slots, or business risk.
+
+Abuse prevention combines security and reliability. It assumes attackers can obtain valid credentials, distribute traffic, mimic clients, replay requests, and exploit expensive or state-changing workflows. Controls should be layered, explainable, observable, and reversible. Rate limits are one mechanism; authorization, idempotency, quotas, request budgets, concurrency limits, fraud signals, and workflow state checks complete the defense.
+
+## Mental Model
+
+```text
+request → authenticate/identify → estimate cost/risk → admit, delay, challenge, or reject
+                    │                    │
+              tenant/principal       capacity + policy + abuse history
+```
+
+Apply limits at multiple scopes: global safety, route/resource, authenticated principal, tenant/plan, device/session, and sometimes IP/network. Use a key that matches the harm and fairness goal. A login limit may combine account, source, device, and credential signals; a bulk export limit may be per tenant and concurrent job count; a public read endpoint may need a coarse IP/anonymous limit.
+
+Token bucket allows bursts up to capacity while bounding average rate. Leaky bucket smooths output. Sliding windows are intuitive but can be memory-heavy and boundary-sensitive. Concurrency limits protect work-in-progress costs better than request-rate limits for variable-duration operations. Quotas cover a longer period or billable resource. A rate limiter alone cannot stop a caller from issuing one extremely expensive request.
+
+## How It Works
+
+1. Classify the operation: read, write, authentication, expensive compute, export, or workflow transition. Define its cost and side effects.
+2. Authenticate early where possible, but retain anonymous defenses for login and enrollment. Derive a stable principal/tenant/device key only from verified context; never trust a client-provided tenant header.
+3. Enforce global and per-scope rate/concurrency/size limits close to the scarce resource. Reserve capacity for critical traffic and isolate optional/bulk work.
+4. Use replay protection for state-changing requests: idempotency keys, nonces, expiry, workflow state, and sender-bound credentials where risk warrants it.
+5. Return a consistent result (`429`/`Retry-After` or a durable job) without revealing detection rules. Record accepted, delayed, rejected, and challenged work with reason classes.
+6. Feed abuse signals to a review/response loop. Tune thresholds by false positives, tenant fairness, cost, and user outcomes; provide an appeal or support path for legitimate clients.
+
+Protect the limiter itself: bounded state, shard by key, fail-safe behavior, clock/timer assumptions, and a policy for datastore failure. A distributed counter that is eventually consistent may allow short bursts; a strongly consistent global limit may add latency and cost. State the tolerated error.
+
+## Example
+
+An image API gives each tenant a token budget based on plan and reserves 20 concurrent transformation slots globally for interactive requests. `POST /transform` consumes cost proportional to pixels, has a body-size limit, and returns a job ID when work exceeds the synchronous budget. A tenant’s burst is allowed within its bucket but cannot consume reserved interactive capacity. Login attempts use account/device/IP signals and progressive delay rather than blocking an entire NAT.
+
+If an attacker replays a payment request, the API requires a unique idempotency key bound to the account and operation state. A duplicate returns the prior result without repeating the charge. A valid API key that suddenly calls an expensive endpoint at 100× normal rate is still authenticated; the quota/risk policy can throttle or challenge it, and audit/alerting shows the principal and blast radius.
+
+## Visualization We Eventually Want
+
+Simulate anonymous and authenticated callers, tenants, IPs, devices, routes, costs, and a shared worker pool. Let the learner choose token-bucket capacity/refill, concurrency, quota window, key dimensions, fail-open/closed limiter behavior, replay, and reserved capacity. Display admitted/rejected/delayed work, fairness, queue growth, cost consumed, false positives, and how distributed-counter lag permits bursts.
+
+## Scaling Behavior
+
+Per-key state grows with active principals, tenants, devices, and attack-generated identifiers; TTL inactive keys and bound cardinality. A centralized limiter provides a global view but becomes a latency/availability dependency. Local limiters scale and isolate failure but permit aggregate overshoot; hierarchical limits combine local fast paths with coarse global budgets.
+
+Attackers can spread across IPs and identities, so use multiple signals and rate-limit expensive operations by cost rather than only request count. Quotas and reservations require durable accounting, reconciliation, and idempotent decrement. Multi-region traffic needs a policy for approximate global limits, region-local allowances, and failover without doubling a tenant’s capacity.
+
+## Failure Modes
+
+- **IP-only limit:** NATs punish legitimate users and distributed bots bypass it.
+- **Unauthenticated keying:** client supplies a tenant/user key and evades fairness.
+- **Request-count blindness:** one huge/expensive request exhausts CPU or memory.
+- **Limiter outage:** fail-open causes overload; fail-closed causes broad unavailability.
+- **Counter race/lag:** distributed updates permit bursts beyond the intended quota.
+- **Replay:** repeated state-changing calls duplicate side effects or consume quota repeatedly.
+- **False positives:** valid bulk jobs are blocked with no appeal or job contract.
+- **Leakage:** rejection responses reveal exact thresholds or account existence.
+
+## Trade-offs
+
+Stricter limits reduce abuse and protect capacity but hurt legitimate bursts and require product exceptions. Per-principal fairness improves isolation but needs trustworthy identity and state. Global strong consistency improves accuracy but adds latency and outage coupling; approximate/local limits improve availability but allow overshoot. Challenges or progressive delay reduce automated abuse but add user friction and accessibility work. Detailed signals improve detection but raise privacy and retention concerns.
+
+## Alternatives
+
+- **WAF/network filtering:** useful for broad volumetric patterns; cannot understand authenticated business cost.
+- **Queue-based admission:** smooths expensive work and enables durable retries; adds completion latency and storage.
+- **Fraud/risk scoring:** catches distributed or behavioral abuse; harder to explain and can create false positives.
+- **Paid quotas/contracts:** appropriate for partner APIs; still need safety limits and abuse response.
+
+## When to Use
+
+Use layered controls for every public or multi-tenant API, especially login, expensive compute, bulk export, writes, and workflows with irreversible side effects. Tie limits to the scarce resource and identity/fairness boundary.
+
+## When Not to Use
+
+Do not apply one global limit to all routes, rely solely on obscurity or API keys, or block legitimate traffic without a recovery/appeal path. A private low-volume endpoint may need only authentication, authorization, and request-size validation.
+
+## Common Misconceptions
+
+- **“Authentication prevents abuse.”** Valid identities can be compromised, automated, or intentionally overuse capacity.
+- **“Rate limiting means requests per IP.”** Cost, concurrency, tenant, principal, and workflow dimensions may matter more.
+- **“429 fixes overload.”** Rejected clients may retry; send clear retry semantics and protect the downstream path.
+- **“A distributed limiter is exact.”** Replication lag and failover policy define its error bounds.
+- **“Blocking is the only control.”** Delay, queue, challenge, reserve, or degrade can preserve user value.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I threat-model both anonymous and authenticated abuse, then limit by the scarce resource using layered global, route, principal, tenant, and concurrency budgets. I authenticate before deriving tenant keys, protect state-changing workflows with idempotency/replay controls, return bounded 429/job responses, and reserve capacity for critical work. I state limiter failure mode, distributed overshoot, fairness, observability, and false-positive handling.
+
+### When to Introduce It
+
+Introduce abuse controls when a design exposes public endpoints, expensive work, credentials, bulk operations, or multi-tenant capacity. Ask how an attacker can be valid yet harmful.
+
+### Common Follow-Ups
+
+- Why is per-IP limiting insufficient?
+- How do you limit a variable-cost endpoint?
+- What happens if the limiter datastore is down?
+- How do you prevent replay of a payment or booking request?
+
+### Common Candidate Mistakes
+
+- Choosing a fixed IP limit without tenant/principal context.
+- Forgetting concurrency, body size, or cost budgets.
+- Failing open without measuring overload or failing closed without a critical-path reserve.
+- Omitting idempotency and an appeal path.
+
+## Summary
+
+Abuse prevention is fair, identity-aware admission control tied to capacity and business risk. Combine rate, quota, concurrency, size, replay, and workflow controls; make rejection and limiter failures observable; and tune for legitimate behavior and attacker adaptation.
+
+## Quiz Seeds
+
+1. Why can a valid API key still be abusive?
+2. Which limiter dimension protects a variable-cost image operation better than request count?
+3. How should a system derive a tenant rate-limit key?
+4. What does `Retry-After` communicate, and why might clients still cause a retry storm?
+5. Compare fail-open and fail-closed behavior when the limiter store is unavailable.
+6. How does idempotency prevent replayed payment side effects?
+7. Why reserve capacity for critical work?
+
+## Related Topics
+
+- [Authentication and Authorization](./authentication-and-authorization.mdx)
+- [RBAC and ABAC](./rbac-and-abac.mdx)
+- [Multi-Tenancy and Isolation](./multi-tenancy-and-isolation.mdx)
+- [Golden Signals](../09-observability/golden-signals.mdx)
+
+## References
+
+### Documentation / Articles
+
+- [Additional HTTP Status Codes (RFC 6585)](https://www.rfc-editor.org/rfc/rfc6585.html) — defines `429 Too Many Requests` and retry guidance semantics.
+- [OWASP API Security Top 10 (2023)](https://owasp.org/API-Security/editions/2023/en/0x00-header/) — covers broken authorization, unrestricted resource consumption, and sensitive business-flow abuse.
+- [REST Security Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/REST_Security_Cheat_Sheet.html) — discusses API keys, 429 responses, request limits, workflow ordering, and audit logs.
+- [Rate Limiting](https://stripe.com/blog/rate-limiters) — an engineering explanation of token-bucket-like admission and fairness trade-offs (implementation example, not a vendor prescription).

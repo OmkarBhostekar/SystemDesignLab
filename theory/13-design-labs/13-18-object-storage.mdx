@@ -1,0 +1,213 @@
+---
+type: lesson
+id: 13-18-object-storage
+slug: object-storage
+title: Object Storage / S3-Like System
+description: Design durable large-object storage with metadata, multipart transfer, checksums, replication, CDN delivery, and signed access.
+module: design-labs
+order: 18
+difficulty: deep-dive
+estimatedMinutes: 85
+prerequisites:
+  - 00-03-estimation
+  - 00-04-interview-framework
+  - 04-08-replication
+  - 04-09-partitioning-and-sharding
+  - 05-09-multi-layer-caching
+  - 06-09-backpressure
+  - 08-09-backups-rpo-rto
+tags:
+  - object-storage
+  - blobs
+  - multipart-upload
+  - checksums
+  - cdn
+objectives:
+  - Separate object metadata/namespace from immutable blob placement and delivery.
+  - Design multipart upload, integrity checks, replication, deletion, versioning, and signed access.
+  - Estimate ingest/egress, physical redundancy, metadata scale, and repair bandwidth.
+  - Explain CDN/cache revocation, tenant isolation, lifecycle, and disaster recovery.
+relatedLessons:
+  - 04-08-replication
+  - 04-09-partitioning-and-sharding
+  - 05-09-multi-layer-caching
+  - 06-09-backpressure
+  - 08-09-backups-rpo-rto
+visualizationId: null
+quizId: null
+---
+
+# Object Storage / S3-Like System
+
+> Object storage is a metadata-to-bytes contract: durable naming, integrity, replica repair, and authorization must hold while the data path streams terabytes outside application servers.
+
+## Problem Statement
+
+Design an S3-like service for buckets/keys, object upload/download, multipart transfer, metadata, versioning, lifecycle, delete markers, and signed access. Objects range from kilobytes to terabytes; clients retry parts, networks fail, and a CDN may cache public content. The system should survive disk/node/zone failures, detect silent corruption, and isolate tenants. Ask whether strong read-after-create/list consistency is required; this lab assumes strong object-key visibility after commit but allows eventually updated listings/analytics if disclosed.
+
+## Functional Requirements (Scoped)
+
+- Create buckets/namespaces and put/get/head/delete objects by key.
+- Upload large objects in parts, resume, complete, abort, and verify full/part checksums.
+- List objects with prefix/cursor and expose metadata/version/ETag-like validators.
+- Replicate/repair data across failure domains; support versioning and lifecycle transitions.
+- Issue scoped signed URLs and enforce bucket/object ACL/policy, tenant quotas, and audit events.
+
+Out of scope: arbitrary SQL over object metadata, global POSIX filesystem semantics, real-time collaborative editing, and zero-latency purge from every external cache.
+
+## Non-Functional Requirements and Priorities
+
+| Priority | Requirement | Working target / question |
+| --- | --- | --- |
+| P0 | Durability/integrity | State annual durability/RPO and detect/repair checksum failures. |
+| P0 | Namespace correctness | A committed key resolves to one version under the stated consistency model. |
+| P0 | Authorization | Every signed/direct path enforces tenant/object policy and expiry. |
+| P1 | Throughput | Stream large objects without routing all bytes through metadata/API nodes. |
+| P1 | Availability | Reads/writes survive configured disk/node/zone loss with clear degraded modes. |
+| P2 | Cost/lifecycle | Erasure/cold tiers/retention and retrieval fees are explicit. |
+
+## Estimation Prompts and Checked Example
+
+Ask for object puts/day, size distribution/p99, read/egress ratio, replication/erasure policy, metadata size, retention, repair rate, and CDN hit. Example:
+
+- 10M objects/day × 5 MB average = `50 TB/day` logical ingress; 30-day retention is `1.5 PB` before versions/metadata.
+- 20M GETs/day × 5 MB = `100 TB/day` egress; average is `≈1.16 GB/s`, with a 5× peak `≈5.8 GB/s ≈46.4 Gb/s` payload. CDN hit ratio changes origin egress, not user demand.
+- RF3 requires `4.5 PB` physical for 1.5 PB logical; a 6+3 erasure layout is about `1.5 × 9/6 = 2.25 PB` plus metadata/parity/headroom but has different repair/read costs.
+- A 100B metadata row for 10B objects is `≈1 TB` logical before indexes/replicas; metadata sharding and prefix-list limits are first-class.
+
+## API Design
+
+```http
+POST /v1/buckets/photos/objects/{key}:start-multipart
+Idempotency-Key: upload-tenant7-42
+{"size":1099511627776,"checksum":"sha256:...","partSize":8388608}
+```
+
+Return upload ID, part URLs, checksum requirements, and expiry. `PUT` a part is idempotent by `(uploadId, partNumber, checksum)`; conflicting bytes return `409`. `POST :complete` atomically validates ordered parts/full checksum and publishes one object version. A lost completion response is recovered via `HEAD`/upload status with the same key.
+
+`GET/HEAD` returns metadata/checksum/version; `DELETE` creates a tombstone/delete marker under versioning and is idempotent. Return `412` for stale conditional writes, `404`/`403` according to enumeration policy, `413` for size, `429` for quota, and `503` when no safe durable placement/metadata quorum exists. Signed URLs carry bucket/key/version, method, expiry, tenant policy version, and optional checksum; retry only safe part/status operations, not a new upload identity.
+
+## Data Model, Access Paths, and Ownership
+
+```text
+buckets(bucket_id PK, tenant_id, policy_version, region, state)
+objects(bucket_id, key, version_id, state, size, checksum, manifest_ref,
+        metadata_ref, created_at, deleted_at,
+        PRIMARY KEY(bucket_id, key, version_id))
+uploads(upload_id PK, bucket_id, key, expected_size/checksum,
+        state, expires_at, idempotency_key UNIQUE)
+parts(upload_id, part_no, checksum, size, object_fragment_ref,
+      PRIMARY KEY(upload_id, part_no))
+placements(object_fragment_ref, node/zone, checksum, state, epoch)
+lifecycle_rules(bucket_id, prefix, transition_at, delete_at, version)
+```
+
+The namespace/metadata service owns bucket policy, object versions, manifests, and visibility; placement/storage nodes own fragments and checksums; repair/lifecycle workers own physical copies/deletion. Object commit changes metadata only after fragments are durable and verified. Reads resolve one manifest/version, then stream from healthy replicas/erasure fragments or a CDN after authorization.
+
+## Progressive Architecture: Naive → Bottleneck → Improvement → New Trade-off
+
+1. **Naive:** write object bytes into one database server. Transactional metadata is convenient, but large-object I/O, backups, disk, and egress saturate the store.
+2. **Bottleneck/failure:** split bytes across disks/nodes and return after one copy. Capacity scales, but node failure loses objects; direct clients can observe partial writes and checksums are absent.
+3. **Improvement:** use metadata manifests plus multipart direct transfer, checksums, replicated/erasure-coded fragments, quorum commit, repair scans, signed URLs, and CDN for public reads. Lifecycle workers tier/delete asynchronously.
+4. **New trade-off:** erasure coding saves capacity but makes small reads/repairs expensive; metadata and storage commits are a distributed boundary; signed URLs/CDN introduce revocation windows. Strong list/read consistency costs coordination and index complexity.
+
+Reference architecture:
+
+```text
+Client → Namespace/API → metadata quorum ──→ object manifest
+   └─ signed multipart URLs ↔ storage nodes/fragments → repair/scrub
+                                           └→ CDN/edge for reads
+```
+
+The metadata commit is the visibility boundary; an orphan fragment is garbage, not a readable object. Repair uses checksums and placement epochs to avoid resurrecting deleted versions.
+
+## Bottlenecks and Concurrency / Consistency
+
+Metadata hot prefixes, storage network/disk, multipart completion, checksum CPU, repair bandwidth, list pagination, lifecycle scans, CDN origin misses, and tenant egress are limits. Conditional object writes use version/ETag; one key/version commit is serialized by metadata. Fragments can be eventually repaired, but a committed object must meet its placement/ack policy. Delete markers and old versions remain through the repair/GC safety window. Prefix/list consistency must be stated separately from object GET.
+
+## Failure Analysis
+
+- **Part upload/network loss:** list parts, verify checksum, retry missing parts; expire abandoned uploads.
+- **Completion timeout:** status/HEAD by upload ID determines whether metadata committed; do not create a second version.
+- **Replica/fragment loss:** read healthy copies, schedule repair, alert on durability risk.
+- **Checksum mismatch/silent corruption:** scrub, quarantine bad fragment, reconstruct from verified peers; never serve unchecked bytes.
+- **Metadata quorum outage:** reject new visibility/deletes or serve cached public objects within policy; do not invent manifests.
+- **CDN stale after delete:** short signed TTL, cache purge/versioned keys, and explicit maximum stale window.
+- **GC race:** mark tombstones, wait for replication/repair epochs, then delete physical fragments idempotently.
+- **Region loss:** restore metadata/placement map, rebuild from replicas/parity, and expose RPO/RTO.
+
+## Security
+
+Authenticate bucket/tenant principals, authorize every object/version/list, and sign URL method/key/expiry/checksum/policy. Encrypt transport, at rest, and optionally per-tenant; rotate keys and isolate placement. Validate content length/type, scan untrusted uploads, prevent path/key traversal and SSRF via callbacks, cap multipart/metadata headers, and audit ACL/lifecycle/delete/restore actions. Do not log signed tokens or raw sensitive keys.
+
+## Observability
+
+Measure PUT/GET/HEAD/list latency, bytes, cache/CDN hit, origin egress, multipart incomplete age, checksum failures, commit latency, replica/fragment health, repair/scrub backlog, durability-risk bytes, metadata hot prefixes, list truncation, lifecycle lag, signed URL denial/stale window, and tenant quotas. Trace upload/object/version/fragment IDs without secret tokens. Alert on under-replication, corruption, GC anomalies, and RPO/RTO drift.
+
+## Explicit Trade-offs and Alternatives
+
+- **Replication vs erasure coding:** replicas simplify reads/repair and small objects; erasure saves capacity but increases compute/repair/read fanout.
+- **Direct signed transfer vs proxy API:** direct scales bandwidth; proxy centralizes policy/telemetry at API cost.
+- **Strong list/read consistency vs eventual index:** strong improves client reasoning; coordination/index cost rises.
+- **Immutable versions vs overwrite:** versions enable recovery/audit but consume storage and complicate list/delete.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+“I separate namespace metadata/manifests from immutable object fragments. Multipart uploads go directly to storage with per-part/full checksums; a metadata quorum publishes one version only after the required fragments are durable. GET authorization issues a short signed URL/CDN path, while background scrub/repair/lifecycle maintain integrity and cost. Delete/version/GC and cache revocation have explicit safety windows; the metadata commit is the visibility boundary.”
+
+### When to Introduce It
+
+Introduce direct object storage when payload size/egress dominates API/DB capacity. Add erasure coding and lifecycle tiers after durability/cost estimates; add versioning when restore/audit is required.
+
+### Common Follow-Ups
+
+- What if completion times out?
+- How do checksums detect silent corruption?
+- Why cannot a CDN purge be your authorization layer?
+- How do you repair after a zone loss?
+
+### Common Candidate Mistakes
+
+Treating object key/ETag as authorization, returning success before durable placement, ignoring incomplete multipart cleanup, and claiming immediate delete everywhere.
+
+## Summary
+
+Object storage needs two contracts: metadata visibility and byte durability. Verify parts, publish immutable versions atomically, replicate/repair with checksums, deliver directly/CDN, and make signed access/lifecycle/recovery bounds visible.
+
+## Quiz Seeds
+
+1. Calculate egress for 20M 5 MB GETs/day and a 5× peak.
+2. What does a metadata commit guarantee about orphan fragments?
+3. Why does a 6+3 erasure layout use less capacity than RF3?
+4. Which operation is safe to retry after a completion timeout?
+5. How does a signed URL differ from an ACL?
+6. Why must tombstones outlive repair/GC windows?
+7. What metrics reveal silent corruption before user reads fail?
+8. When are replicas preferable to erasure coding?
+
+## Related Topics
+
+- [Replication](../04-databases/replication.mdx) — durability/repair choices.
+- [Partitioning and sharding](../04-databases/partitioning-and-sharding.mdx) — metadata/placement ownership.
+- [Multi-layer caching](../05-caching/multi-layer-caching.mdx) — CDN/origin/cache paths.
+- [Backpressure](../06-messaging/backpressure.mdx) — multipart/repair flow control.
+- [Backups and RPO/RTO](../08-reliability/backups-rpo-rto.mdx) — recovery contract.
+
+## References
+
+### Documentation / Articles
+
+- [Amazon S3 multipart upload](https://docs.aws.amazon.com/AmazonS3/latest/userguide/mpuoverview.html) — documents multipart sessions, completion, and checksums.
+- [Amazon S3 data protection](https://docs.aws.amazon.com/AmazonS3/latest/userguide/data-protection.html) — covers versioning, replication, encryption, and integrity.
+- [Amazon S3 presigned URLs](https://docs.aws.amazon.com/AmazonS3/latest/userguide/using-presigned-url.html) — grounds scoped, expiring direct access and its revocation limits.
+- [Amazon CloudFront cache invalidation](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/Invalidation.html) — explains CDN purge behavior and cost/freshness trade-offs.
+
+### Papers
+
+- [Erasure Coding in Windows Azure Storage](https://www.microsoft.com/en-us/research/publication/erasure-coding-in-windows-azure-storage/) — explains parity-based durability and repair trade-offs for large objects.
+
+## Future Visualization / Workspace Spec
+
+Provide a multipart/object simulator with metadata manifest, parts/fragments, checksums, RF/erasure policy, quorum commit, CDN cache, signed URL, delete marker, scrub/repair, GC, and region loss. Controls should vary object size, part failure, corruption, replica loss, CDN TTL, metadata outage, repair bandwidth, and lifecycle. Show logical/physical bytes, durability risk, checksum errors, orphan fragments, stale URL window, origin egress, and RPO/RTO. Workspace nodes should include Client, Namespace, Metadata, Storage Nodes, Repair, CDN, Lifecycle, and Key Manager.

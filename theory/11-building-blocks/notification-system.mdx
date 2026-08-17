@@ -1,0 +1,178 @@
+---
+type: lesson
+id: 11-08-notification-system
+slug: notification-system
+title: Notification System
+description: Deliver user notifications across channels with preferences, durable fanout, provider retries, and duplicate-safe effects.
+module: building-blocks
+order: 8
+difficulty: core
+estimatedMinutes: 40
+prerequisites:
+  - 06-02-message-queue-fundamentals
+  - 06-07-idempotent-consumers
+  - 07-08-transactional-outbox
+  - 08-02-retries
+  - 08-07-load-shedding-and-graceful-degradation
+tags:
+  - notifications
+  - fanout
+  - preferences
+  - provider-retries
+  - deduplication
+objectives:
+  - Separate notification intent, preference evaluation, channel delivery, and provider outcome.
+  - Compare send-on-write, queued fanout, and pull/inbox models for recipient scale.
+  - Design retry, deduplication, rate limiting, quiet hours, and provider failover behavior.
+  - Identify channel-specific guarantees and privacy/security boundaries.
+relatedLessons:
+  - 06-07-idempotent-consumers
+  - 07-08-transactional-outbox
+  - 12-03-fanout
+  - 11-03-distributed-scheduler
+---
+
+# Notification System
+
+> A notification is a durable intent transformed into a channel-specific delivery attempt under user policy; “sent” must identify which boundary succeeded.
+
+## Why This Exists
+
+Sending email, push, SMS, or an in-app message inline with a business request couples checkout latency to an external provider. A provider timeout can make the user retry the business operation, and a duplicate request can send two notifications. A naive background worker improves latency but still needs preferences, provider limits, retries, and a way to recover after crashes.
+
+The improvement persists notification intent with the business event, evaluates current policy, fans out to eligible channels asynchronously, and records attempts with stable deduplication keys. The new trade-offs are eventual delivery, provider-specific semantics, queue backlog, cost, quiet-hour timing, and duplicates when an external response is ambiguous.
+
+## Mental Model
+
+```text
+business commit + outbox
+        └─> notification intent ─> preference/policy ─> channel jobs
+                                             ├─ email provider
+                                             ├─ push provider
+                                             ├─ SMS provider
+                                             └─ in-app inbox
+```
+
+Keep three identities distinct: the business event (`order.shipped`), the notification intent (one logical message for a recipient), and each channel attempt. A provider request key should be stable across retry, while a channel may have different content, urgency, and rate limit. Delivery status usually means accepted by a provider, not displayed to a person.
+
+## How It Works
+
+Write the business mutation and an outbox event in one local transaction. A dispatcher publishes it to a durable queue. A policy worker resolves user preferences, locale, quiet hours, consent, tenant rules, and channel availability. Fanout produces channel jobs with a deduplication key such as `(event_id, recipient, channel, template_version)`.
+
+Workers render and deliver each job. A provider response can be success, permanent rejection, transient failure, or unknown timeout. Retry transient errors with bounded exponential backoff and jitter; route poison/permanent failures to a dead-letter or suppressed state. For an unknown response, retry only with a provider-supported idempotency key or a reconciliation API; otherwise label the outcome ambiguous and avoid an unbounded duplicate loop.
+
+High-recipient events require a fanout choice. Send-on-write creates one job per recipient immediately; queued fanout spreads work but still stores many jobs. Pull/inbox stores the event once and lets clients fetch or materialize notifications, which reduces push work but changes timeliness and delivery semantics. “Push” is a delivery mode, not a guarantee that a device is online.
+
+## Example
+
+A collaboration app sends “document shared” notifications to 100,000 members. The naive request loops synchronously over recipients and calls email providers. The request times out, retries duplicate sends, and a provider quota is exhausted.
+
+The improved design commits the share plus outbox event, partitions fanout by recipient, evaluates preferences, and enqueues email/push/in-app jobs. A user with quiet hours gets a scheduled job; an in-app inbox is durable and can be read later. Provider attempts carry `notification_id` as an idempotency key where supported. Per-provider and per-tenant rate limits prevent one event from starving other traffic, and a fallback provider is used only when the first provider returns a classified transient/availability failure.
+
+The new trade-off is that some recipients receive the message later or through a different channel. The product must define whether one channel's failure should suppress another and whether a notification is best-effort, essential, or a business record requiring reconciliation.
+
+## Visualization We Eventually Want
+
+Build a **Notification Fanout and Delivery Lab**. Controls should include recipients, channel mix, fanout mode, preference/quiet-hour rules, queue partitions, provider latency/error class/quota, retry policy, dedup on/off, and device online state. Show intent-to-job expansion, queue age, per-channel attempts, provider acceptance versus delivery, duplicate effects, dead letters, cost, and fallback decisions. Scenarios should include a celebrity event, provider outage, duplicate business event, quiet-hour release, and a device reconnect. A filterable event log should let learners follow one notification ID end to end.
+
+## Scaling Behavior
+
+Fanout work is proportional to eligible recipient-channel pairs. Partition by recipient or tenant and cap per-event expansion so one celebrity event cannot monopolize workers. Pull/inbox models reduce immediate expansion but shift work to read time and require read-model storage. Provider quotas are often lower than internal queue capacity; model them as independent limiters.
+
+Notification state grows with attempts, dedup retention, and audit requirements. Retain enough history to reconcile provider outcomes and satisfy policy, then archive. Batch provider calls only when the provider contract preserves per-recipient privacy and idempotency. Monitor queue age, oldest notification age, provider acceptance, device delivery where available, duplicate rate, suppression rate, and cost per delivered channel.
+
+## Failure Modes
+
+- **Lost intent:** business commit succeeds but no notification event is published.
+- **Duplicate intent:** a retried producer creates two logical notifications.
+- **Preference race:** a user opts out after enqueue but before send.
+- **Provider ambiguity:** timeout occurs after provider accepted the message.
+- **Retry storm:** outage causes all channels to retry together.
+- **Celebrity fanout:** one event fills queues and starves ordinary users.
+- **Token/device churn:** push tokens expire or belong to another user.
+- **Privacy leak:** content is sent to an unauthorized recipient or wrong channel.
+- **Fallback duplicate:** secondary provider sends after primary actually accepted.
+
+Use outbox/CDC, stable dedup keys, policy checks near send, bounded retries/jitter, per-tenant/channel quotas, provider idempotency/reconciliation, token lifecycle management, and audit logs without storing unnecessary message content.
+
+## Trade-offs
+
+Asynchronous delivery protects request latency and allows retries but introduces lag and operational queues. Push gives immediacy but depends on devices/providers; email/SMS cost money and may be delayed; in-app inbox is durable but requires the user to open the product. Send-on-write offers prompt delivery but amplifies fanout; pull reduces writes but weakens real-time behavior. Multi-provider failover improves availability but risks duplicates and inconsistent templates.
+
+## Alternatives
+
+- **Synchronous direct send:** choose only for low-volume, non-critical workflows where provider latency fits the request SLO.
+- **In-app inbox/pull:** choose when durable user visibility matters more than immediate push.
+- **Event stream + per-channel consumers:** choose when many independent notification policies consume the same business event.
+- **Digest/batch notifications:** choose to reduce cost/noise for high-volume updates.
+- **Provider-managed topic fanout:** choose when provider limits and privacy model fit, while retaining an internal intent/audit record.
+
+## When to Use
+
+Use a notification system when delivery is asynchronous, multi-channel, retryable, user-configurable, or provider-limited. Define what “delivered” means and which messages are business-critical.
+
+## When Not to Use
+
+Do not route a critical state transition solely through a best-effort push notification. Do not send inline because “it is only one email” if retries can duplicate the business action. Do not collect sensitive message content in logs merely for observability.
+
+## Common Misconceptions
+
+- **“At-least-once queue delivery means one notification.”** The handler/provider boundary still needs idempotency or reconciliation.
+- **“Push success means the user saw it.”** It often means provider accepted a request.
+- **“Preferences are checked only at subscription time.”** Policy can change before queued delivery.
+- **“Fallback providers remove duplicates.”** Ambiguous primary outcomes make failover a business choice.
+- **“Fanout is always push.”** Pull/inbox and digest designs may be better for large audiences.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I atomically record business intent and an outbox event, resolve recipient preferences, then enqueue channel-specific jobs. Each attempt has a stable dedup key, bounded retries with jitter, provider quota protection, and a reconciliation path for unknown outcomes. I choose send-on-write, queued fanout, or pull/inbox from recipient skew and timeliness. Provider acceptance is different from device/user delivery, and critical business state remains in the source of truth.
+
+### When to Introduce It
+
+Introduce it when a request should not wait on providers, one event reaches many recipients, preferences or quiet hours matter, or delivery must be retried/audited.
+
+### Common Follow-Ups
+
+- How do you prevent duplicate sends?
+- What if the provider times out after accepting?
+- How do you handle a celebrity event?
+- When do you evaluate preferences?
+- What does failover to a second provider do to semantics and cost?
+
+### Common Candidate Mistakes
+
+They send inline, omit outbox/dedup, conflate provider acceptance with delivery, or ignore fanout skew and provider quotas.
+
+## Summary
+
+Persist intent, evaluate policy, fan out according to workload, and treat provider outcomes as a state machine. Stable IDs, outbox delivery, bounded retries, deduplication, quotas, and reconciliation matter more than naming a push service.
+
+## Quiz Seeds
+
+1. Why is an outbox useful when a business update and notification must agree?
+2. What is the difference between notification intent and channel attempt IDs?
+3. Why can a provider timeout create an ambiguous duplicate?
+4. Compare send-on-write and pull/inbox for 100,000 recipients.
+5. When should preferences be checked for a queued job?
+6. How do provider quotas interact with internal queue capacity?
+7. What does “delivered” mean for push versus in-app?
+8. How can a fallback provider improve availability while increasing duplicate risk?
+
+## Related Topics
+
+- [Idempotent consumers](../06-messaging/idempotent-consumers.mdx) handles duplicate deliveries.
+- [Transactional outbox](../07-distributed-coordination/transactional-outbox.mdx) protects business-to-event publication.
+- [Distributed scheduler](./distributed-scheduler.mdx) supports quiet hours and delayed delivery.
+- [Fanout archetype](../12-architecture-archetypes/fanout.mdx) generalizes recipient-skew choices.
+
+## References
+
+### Documentation / Articles
+
+- [Apple UserNotifications best practices](https://developer.apple.com/documentation/usernotifications) — documents device-token, authorization, and delivery boundaries for push notifications.
+- [Firebase Cloud Messaging architectural overview](https://firebase.google.com/docs/cloud-messaging/fcm-architecture) — explains server, FCM backend, transport, and device delivery boundaries.
+- [Twilio messaging status callbacks](https://www.twilio.com/docs/messaging/guides/webhook-request) — illustrates provider acceptance/status callbacks and why channel delivery is multi-state.
+- [Stripe idempotent requests](https://docs.stripe.com/api/idempotent_requests) — provides a concrete external-provider idempotency contract useful for ambiguous retries.
+- [RFC 8030: Web Push protocol](https://www.rfc-editor.org/rfc/rfc8030.html) — grounds push subscription, delivery, and provider responsibilities in a protocol specification.

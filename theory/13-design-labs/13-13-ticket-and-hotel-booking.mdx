@@ -1,0 +1,209 @@
+---
+type: lesson
+id: 13-13-ticket-and-hotel-booking
+slug: ticket-and-hotel-booking
+title: Ticket and Hotel Booking
+description: Design inventory holds and reservations that prevent overselling under races, expiry, payment delay, retries, and recovery.
+module: design-labs
+order: 13
+difficulty: deep-dive
+estimatedMinutes: 75
+prerequisites:
+  - 00-03-estimation
+  - 00-04-interview-framework
+  - 04-05-transaction-isolation
+  - 04-14-concurrency-control
+  - 07-08-transactional-outbox
+  - 08-02-retries
+  - 08-08-disaster-recovery
+tags:
+  - booking
+  - overselling
+  - holds
+  - isolation
+  - idempotency
+objectives:
+  - State the inventory invariant and choose a concurrency mechanism that enforces it under races.
+  - Design expiring holds, payment coordination, confirmation, cancellation, and reconciliation.
+  - Compare optimistic, pessimistic, and queue-owned inventory paths using contention and latency.
+  - Make isolation, recovery, idempotency, and customer-visible unknown outcomes explicit.
+relatedLessons:
+  - 04-05-transaction-isolation
+  - 04-14-concurrency-control
+  - 07-07-saga-pattern
+  - 07-08-transactional-outbox
+  - 08-08-disaster-recovery
+visualizationId: null
+quizId: null
+---
+
+# Ticket and Hotel Booking
+
+> Booking correctness is an invariant under concurrency: no more confirmed reservations than inventory, even when clients retry, holds expire, payment is slow, and a response is lost.
+
+## Problem Statement
+
+Design a booking service for hotel rooms or numbered tickets. A user searches availability, selects inventory, holds it for a short time, pays, and receives a confirmation. Many users may target the last room/seat simultaneously. Search can be slightly stale; confirmation cannot oversell. Payment is an external provider and may time out after charging. Ask whether adjacent seats, room attributes, cancellation windows, and cross-property inventory are required; this lab assumes one property/event inventory owner per booking.
+
+## Functional Requirements (Scoped)
+
+- Search availability by event/property, date, room/seat type, and constraints.
+- Create a short-lived hold for specific units or a quantity; return expiration.
+- Confirm a hold after payment authorization; release on expiry/cancel/failure.
+- Prevent duplicate confirmation from retries and expose booking/payment status.
+- Support operator reconciliation and recovery of abandoned/unknown holds.
+
+Out of scope: global travel search ranking, loyalty pricing, seat optimization, and arbitrary multi-property atomic transactions.
+
+## Non-Functional Requirements and Priorities
+
+| Priority | Requirement | Working target / question |
+| --- | --- | --- |
+| P0 | Inventory safety | `confirmed + active holds ≤ sellable inventory`; no oversell. |
+| P0 | Payment safety | One business booking cannot capture twice; unknown provider results are reconciled. |
+| P0 | Durability | A confirmed booking and inventory transition survive node/database failure. |
+| P1 | Search latency | p95 under 200 ms and allowed to be eventually consistent. |
+| P1 | Hold timeliness | p95 hold response under 300 ms; expiry enforcement is bounded and observable. |
+| P2 | Fairness | Bots/tenants cannot monopolize holds; abandoned holds do not starve demand. |
+
+## Estimation Prompts and Checked Example
+
+Ask for inventory units, search/hold/confirm QPS, hold duration, contention distribution, provider latency, and recovery targets. Example:
+
+- 1M searches/hour → `≈278 searches/s`; a 10× event peak is `≈2,780/s`.
+- 50k hold attempts/minute → `≈833/s`; with 5-minute holds, at most `≈4,165` holds are live at steady peak (`833 × 300`), ignoring release/expiry variance.
+- If a property has 100 rooms and 10% of hold attempts target one last room, that single inventory row becomes a serialized hot key; adding database replicas does not make the invariant parallel.
+- At 1.5 s median payment time and 500 confirms/s, about `750` payment workflows are in flight (`500 × 1.5`); a 30 s provider tail can produce `15,000` outstanding workflows and exhaust worker/pool limits.
+
+## API Design
+
+```http
+POST /v1/holds
+Idempotency-Key: hold-user42-cart7
+{"inventoryId":"room-2026-04-12-deluxe","quantity":1,"ttlSeconds":300}
+```
+
+Return `201 {holdId, expiresAt, inventoryVersion}` only after an atomic conditional reservation. A duplicate key returns the original hold; a stale/expired hold returns `409 HoldNotActive`, and unavailable inventory returns `409 SoldOut` (not a transient 500). `POST /holds/{id}:confirm` uses a separate idempotency key and payment intent ID. Return `202 PendingPayment` when provider outcome is unknown; do not claim `Confirmed` until the durable state transition commits.
+
+`DELETE /holds/{id}` is idempotent release. `GET /bookings/{id}` reports `pending`, `confirmed`, `cancelled`, `payment_unknown`, or `reconciliation_required`. Use `400` for invalid dates/quantity, `401/403` for identity/access, `429` for hold abuse, `412` for stale `If-Match`, and `503` only when no authoritative inventory decision is possible. Retries carry the same idempotency/payment keys and stay within a business deadline.
+
+## Data Model, Access Paths, and Ownership
+
+```text
+inventory(inventory_id PK, sellable, held, confirmed, version, state)
+holds(hold_id PK, user_id, inventory_id, quantity, state, expires_at,
+      idempotency_key UNIQUE, version, created_at)
+bookings(booking_id PK, hold_id, user_id, state, payment_intent_id UNIQUE,
+         confirmed_at, cancelled_at, version)
+outbox(event_id PK, aggregate_id, type, payload, published_at)
+```
+
+The inventory service owns the sellable/held/confirmed invariant; booking owns customer state; payment owns the provider/ledger boundary. Search reads a replica/read model and is never the final availability decision. The hold transaction atomically checks `sellable - held - confirmed ≥ quantity`, increments held, and inserts a hold. Expiry workers decrement held only if the hold version/state is still active; a late worker cannot release a confirmed hold.
+
+## Progressive Architecture: Naive → Bottleneck → Improvement → New Trade-off
+
+1. **Naive:** search availability, then insert a booking in a general database. Two clients see one room and both insert; last-write/wider transaction semantics oversell.
+2. **Bottleneck/failure:** wrap check and update in a transaction. Under default isolation a predicate race or lock queue remains; long payment calls hold locks and create deadlocks/timeouts.
+3. **Improvement:** use a short atomic hold transaction (conditional update/row lock), commit a durable hold with expiry, then run payment/confirmation as a saga. Outbox events, idempotency keys, and a sweeper/reconciler handle retries and ambiguous provider results.
+4. **New trade-off:** inventory is temporarily unavailable during holds; hold TTL and cleanup lag affect conversion. A single hot inventory owner serializes contention, while optimistic retries can amplify load. Strong correctness is prioritized over globally fresh search.
+
+Reference architecture:
+
+```text
+Search read model → Availability API → Inventory owner/SQL conditional update
+                                   └→ Hold DB + outbox → payment workflow
+                                                        ├→ Payment provider
+                                                        └→ confirm/release/reconcile
+```
+
+The payment provider is never called while an inventory row lock is held. A workflow records every transition and compensation.
+
+## Bottlenecks and Concurrency / Consistency
+
+Last-unit rows, multi-seat/room constraints, hold sweeper, payment worker pools, and search staleness dominate. For one unit, a row lock or `UPDATE ... WHERE available > 0` is easy to prove. For adjacent seats or multiple rooms, lock a deterministic ordered set or use serializable/constraint-backed allocation; otherwise partial holds oversell. Expiry uses database time/version and a lease-like state. Hold/confirm/release commands are idempotent; payment status is reconciled before compensation when unknown.
+
+## Failure Analysis
+
+- **Client timeout after hold commit:** status/idempotency lookup returns the hold; a second hold is not created.
+- **Payment succeeds, confirm response lost:** query provider by payment intent; finalize booking or refund with idempotent compensation.
+- **Hold expires while payment races:** transition order/version decides; never confirm an expired hold without a new reservation.
+- **Sweeper crash:** active holds remain safe (over-reservation, not oversell); alert on expiry lag and run idempotent sweeps.
+- **Inventory DB failover:** reject/queue new holds until a single owner/healthy quorum is available; stale search may continue.
+- **Duplicate provider webhook:** idempotent event handling keyed by provider event ID.
+- **Region loss:** route a property/event to one inventory authority; fail closed or read-only until fencing/recovery is proven.
+
+## Security
+
+Authenticate users and property/admin actors, authorize inventory/booking ownership, and bind prices/hold terms to a signed quote/version. Rate-limit search/hold, bot-score where needed, and prevent enumeration of private inventory. Keep payment data out of the booking service, use provider tokens, encrypt PII, audit refunds/admin overrides, and protect webhook signatures/replay windows.
+
+## Observability
+
+Track search/hold/confirm latency, hold conversion, active holds by inventory, expiry/sweeper lag, conditional conflicts, lock wait/deadlocks, oversell invariant checks, payment attempts/unknowns, saga state age, compensation/refund rate, queue age, provider errors, and reconciliation drift. Trace `holdId`, `bookingId`, and payment intent; alert on any invariant violation, not only 5xx rate.
+
+## Explicit Trade-offs and Alternatives
+
+- **Pessimistic row lock:** simple proof for hot inventory; lock waits and deadlocks under high contention.
+- **Optimistic version/CAS:** high throughput for rare conflicts; hot-key retry storms and user conflict responses.
+- **Single partition/actor:** predictable per-inventory order; rebalance/failover and hot-key capacity limits.
+- **Long hold vs short hold:** improves payment completion but reduces inventory availability; choose from checkout latency/abandonment data.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+“Search is a read model, not the correctness boundary. A short transaction atomically creates an expiring hold if `confirmed + held` stays within inventory, then commits an outbox event. Payment runs outside the lock in an idempotent saga; confirm, release, expiry, and reconciliation are state transitions, and unknown provider outcomes are not guessed. I would ask whether multi-unit adjacency requires serializable allocation and what stale-search/hold window is acceptable.”
+
+### When to Introduce It
+
+Introduce holds when payment/user interaction is longer than an inventory lock should be held. Introduce pessimistic ownership for hot units; use optimistic checks for low-conflict inventory.
+
+### Common Follow-Ups
+
+- What prevents two last-seat holds?
+- What if payment succeeds after hold expiry?
+- How do you recover a crashed expiry worker?
+- Is search availability strongly consistent?
+
+### Common Candidate Mistakes
+
+Holding database locks across payment, trusting search counts, retrying payment without an idempotency key, and ignoring state races between expiry, cancel, and confirm.
+
+## Summary
+
+Protect the inventory invariant with a short, explicit concurrency boundary. Treat payment and expiry as durable workflows with idempotent transitions and reconciliation; stale search is acceptable, overselling is not.
+
+## Quiz Seeds
+
+1. Why cannot a search result be the hold decision?
+2. How many live holds exist at 833/s and 300-second TTL?
+3. Which transaction condition enforces no oversell for one unit?
+4. Why must payment run outside an inventory lock?
+5. What should happen if payment succeeds after the hold expires?
+6. How does a sweeper avoid releasing a confirmed booking?
+7. Which isolation/locking choice handles adjacent-seat allocation?
+8. What metric would reveal a correctness failure before customer tickets?
+
+## Related Topics
+
+- [Transaction isolation](../04-databases/transaction-isolation.mdx) — predicate/race behavior.
+- [Concurrency control](../04-databases/concurrency-control.mdx) — optimistic/pessimistic choices.
+- [Saga pattern](../07-distributed-coordination/saga-pattern.mdx) — payment/compensation workflow.
+- [Transactional outbox](../07-distributed-coordination/transactional-outbox.mdx) — durable booking events.
+- [Disaster recovery](../08-reliability/disaster-recovery.mdx) — region/restore behavior.
+
+## References
+
+### Documentation / Articles
+
+- [PostgreSQL transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html) — documents isolation levels and serialization failures relevant to inventory races.
+- [PostgreSQL explicit locking](https://www.postgresql.org/docs/current/explicit-locking.html) — grounds row-lock/lock-wait/deadlock behavior.
+- [Stripe idempotent requests](https://docs.stripe.com/api/idempotent_requests) — concrete external-payment retry semantics.
+- [AWS Builders' Library: Making retries safe](https://aws.amazon.com/builders-library/making-retries-safe-with-idempotent-APIs/) — explains ambiguous outcomes and duplicate-safe APIs.
+
+### Papers
+
+- [Sagas](https://www.cs.cornell.edu/andru/cs711/2002fa/reading/sagas.pdf) — original long-lived transaction/compensation model behind booking workflows.
+
+## Future Visualization / Workspace Spec
+
+Build a booking race simulator with one/many inventory units, search staleness, hold TTL, optimistic CAS/row locks, payment latency/failure, expiry, cancellation, and region failover. Step two competing clients through read/check/hold/pay/confirm and show invariant values, lock waits, conflicts, active holds, unknown payment outcomes, refunds, and reconciliation. The workspace should expose Search, Inventory Owner, Hold DB, Outbox, Payment Provider, Workflow, and Reconciler nodes with explicit lock and idempotency labels.

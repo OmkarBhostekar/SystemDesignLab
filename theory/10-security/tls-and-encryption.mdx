@@ -1,0 +1,173 @@
+---
+type: lesson
+id: 10-06-tls-and-encryption
+slug: tls-and-encryption
+title: TLS and Encryption
+description: Place transport and data-at-rest encryption at explicit trust boundaries with key ownership, rotation, and compromise response.
+module: security
+order: 6
+difficulty: core
+estimatedMinutes: 32
+prerequisites:
+  - 02-01-request-lifecycle
+  - 02-03-tcp-vs-udp
+  - 10-01-authentication-and-authorization
+tags:
+  - tls
+  - encryption
+  - mtls
+  - key-management
+  - confidentiality
+  - integrity
+objectives:
+  - Explain what TLS protects in transit and where termination creates a new trust boundary.
+  - Distinguish encryption in transit, encryption at rest, integrity, and endpoint authentication.
+  - Design key ownership, rotation, access scope, and compromise response without naming a vendor.
+  - Choose where mutual TLS, application-layer encryption, or field-level encryption is justified.
+relatedLessons:
+  - 10-07-secrets-management
+  - 10-01-authentication-and-authorization
+  - 10-04-oauth-and-oidc
+  - 10-09-multi-tenancy-and-isolation
+---
+
+# TLS and Encryption
+
+> Encryption protects data only across a stated boundary: TLS secures a connection and authenticates endpoints, while at-rest or field-level encryption protects stored bytes under a separate key and access model.
+
+## Why This Exists
+
+Plain HTTP exposes credentials and business data to a network observer and permits tampering. Encrypting a database disk alone does not protect a request crossing a proxy, a backup copied to another environment, or a compromised application process that can read plaintext. The naive design says “turn on HTTPS” and assumes every hop and storage location is safe.
+
+Security design names the threat assumptions: passive eavesdropper, active network attacker, compromised proxy, stolen backup, malicious operator, or compromised application. TLS provides confidentiality and integrity between authenticated endpoints for the lifetime of a connection. Encryption at rest protects storage media and backups when the key is separate and access-controlled. Neither mechanism authorizes a caller or protects plaintext inside a compromised endpoint.
+
+## Mental Model
+
+```text
+client ==TLS session== edge ==TLS/mTLS== service ==TLS== database
+  plaintext exists at each endpoint and termination boundary
+                 └─ encrypted storage/backup under separate key boundary
+```
+
+During a TLS handshake, endpoints negotiate protocol/ciphers and establish symmetric traffic keys; server authentication binds the endpoint to a certificate/identity. Mutual TLS additionally authenticates the client/service. TLS 1.3 uses ephemeral key exchange patterns that provide forward secrecy under typical deployments, but certificate/key lifecycle and endpoint compromise still matter.
+
+If TLS terminates at an edge proxy, traffic from edge to service is plaintext inside that trust zone unless re-encrypted. The edge can see and alter application data, so it must be included in the trust model. End-to-end application-layer encryption can protect selected fields across intermediaries, but it complicates routing, search, validation, and key use.
+
+## How It Works
+
+1. Enumerate every hop and storage copy: clients, load balancers, service meshes/proxies, queues, databases, caches, logs, backups, exports, and support tools.
+2. Require modern TLS and certificate validation at every sensitive hop. Pin trust roots/identities through controlled configuration; do not disable verification to “fix” connectivity.
+3. Decide where termination and re-encryption occur. Use mutual authentication for service boundaries or high-value APIs when service identity must be proven, and keep authorization separate.
+4. Encrypt durable data with keys whose access is narrower than the data store. Separate key-encryption keys from data-encryption keys where operationally appropriate, and audit decrypt operations.
+5. Rotate certificates and keys before expiry, support bounded overlap, revoke/quarantine compromised identities, and test recovery without making all data permanently unreadable.
+6. Minimize plaintext lifetime and redact sensitive data from logs/traces. Encryption does not justify copying secrets into telemetry.
+
+At-rest encryption is not a single toggle. Disk/database encryption may protect stolen media; application/field encryption can protect against a storage reader but prevents plaintext queries and requires the application to possess decryption authority. Tokenization or hashing may be better for equality checks or analytics.
+
+## Example
+
+A payment service accepts client TLS at the edge, re-encrypts with mutual TLS to the payment service, and uses TLS to the database. The edge is trusted for routing but not granted payment-field decryption keys. Card-derived sensitive fields are encrypted at the application boundary with a key whose use is limited to the payment service; logs store a token/reference, not plaintext. Database backups are encrypted under a separate recovery key and access is audited.
+
+If the service certificate is compromised, the response revokes/quarantines that identity, rotates it, updates trust distribution, and investigates calls made with it. Rotating the database disk key alone would not stop an attacker who can still call the application and receive plaintext. If a proxy cannot re-encrypt a hop, that zone must be treated as a trust boundary and compensated with network isolation, service authorization, and field-level protection where required.
+
+## Visualization We Eventually Want
+
+Draw client, edge, service, database, queue, backup, and key authority with trust boundaries. Let the learner toggle TLS termination, re-encryption, mTLS, stolen certificate, stolen disk, field encryption, key rotation, and endpoint compromise. Display which observer can read/alter data, which identity is authenticated, key access logs, and what remains exposed as plaintext.
+
+## Scaling Behavior
+
+TLS handshake CPU and connection churn matter at high QPS; connection reuse, session resumption, and bounded termination capacity reduce cost without disabling verification. Certificate issuance and rotation must scale across instances and regions with propagation delay and failure handling. Mutual TLS adds certificate identity management and rollout coordination.
+
+At-rest encryption adds CPU, key-service calls, backup/recovery metadata, and operational dependencies. Envelope encryption and local data keys reduce per-record key operations but require secure wrapping-key access. Field-level encryption can make indexes, deduplication, and analytics expensive. Multi-region key replication creates a trade-off between availability and control of where plaintext can be decrypted.
+
+## Failure Modes
+
+- **TLS termination gap:** edge-to-service traffic is plaintext despite a green browser lock.
+- **Certificate expiry/rotation race:** healthy instances lose connectivity or clients reject new identities.
+- **Disabled verification:** self-signed/hostname checks are skipped to bypass an outage.
+- **Shared key blast radius:** one service compromise decrypts unrelated tenants/data.
+- **Backup/key mismatch:** encrypted backups cannot be restored after key loss or accidental revocation.
+- **Endpoint compromise:** an attacker reads plaintext after legitimate decryption.
+- **Metadata leakage:** traffic sizes, timing, hostnames, or logs reveal sensitive context despite encryption.
+- **False authorization:** mTLS proves service identity but not that the service may perform the business action.
+
+## Trade-offs
+
+TLS everywhere improves confidentiality and integrity but costs handshakes, certificates, debugging, and trust distribution. mTLS strengthens service identity but increases certificate lifecycle and rollout complexity. At-rest encryption protects media/backups but not authorized application reads. Field encryption narrows storage-reader trust but limits queryability and increases key/decryption operations. More isolated keys reduce blast radius but increase operational inventory and recovery paths.
+
+## Alternatives
+
+- **Network isolation only:** reduces reachability but does not protect data from a capable insider or compromised host.
+- **Application-layer message encryption:** protects payloads across brokers/intermediaries; complicates routing, inspection, and key rotation.
+- **Tokenization:** avoids storing raw sensitive values and supports controlled lookup; requires a secure token service and mapping lifecycle.
+- **Hashing:** appropriate for one-way comparison (for example, password verification with a password KDF), not reversible data confidentiality.
+
+## When to Use
+
+Use TLS for every network hop carrying sensitive or integrity-relevant data, mTLS where service identity is material, and at-rest/field encryption when storage or backup readers are in scope. Tie each choice to a threat boundary and key owner.
+
+## When Not to Use
+
+Do not treat encryption as a substitute for authorization, input validation, or endpoint hardening. Avoid custom cryptography and unnecessary field encryption when the threat model is only stolen media and the key boundary is already sound.
+
+## Common Misconceptions
+
+- **“HTTPS means data is encrypted end to end.”** It ends at a termination boundary unless every hop is protected.
+- **“mTLS authorizes an operation.”** It authenticates a client identity; policy still decides what it may do.
+- **“Disk encryption protects a compromised application.”** The process can usually read decrypted data.
+- **“Key rotation instantly erases compromise.”** Old keys, caches, backups, and plaintext copies need a response plan.
+- **“Encrypted data is free to log.”** Logs and traces are separate copies with their own access and retention risks.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I map network and storage boundaries, then use TLS with certificate validation on every sensitive hop; mTLS adds service identity when needed. I distinguish edge termination from end-to-end protection, and encrypt durable/field data under narrowly scoped, auditable keys. I plan rotation, overlap, revocation, backup recovery, and endpoint compromise because encryption does not replace authorization or protect plaintext after decryption.
+
+### When to Introduce It
+
+Introduce encryption when the design crosses an untrusted network, stores sensitive data, replicates/backups data, or needs service identity. Ask who can terminate TLS and who can use decryption keys.
+
+### Common Follow-Ups
+
+- What is protected if TLS terminates at a load balancer?
+- When is mTLS worth its lifecycle cost?
+- How do you rotate keys without losing access to backups?
+- Can an authorized service still leak plaintext?
+
+### Common Candidate Mistakes
+
+- Saying “encrypted at rest” without naming backups/logs/keys.
+- Disabling certificate verification to make a deployment work.
+- Sharing one key across tenants/services.
+- Treating mTLS as a complete authorization policy.
+
+## Summary
+
+Encryption is boundary-specific. TLS protects a connection between authenticated endpoints; at-rest and field-level encryption protect stored copies under a key-access model. Map termination, plaintext, key ownership, rotation, recovery, and compromise before claiming data is secure.
+
+## Quiz Seeds
+
+1. What does TLS protect between two authenticated endpoints?
+2. Which data is exposed when TLS terminates at an edge proxy?
+3. Why does mTLS not replace authorization?
+4. What is the difference between disk encryption and field-level encryption?
+5. How does a shared symmetric key increase blast radius?
+6. What must be preserved when rotating keys for backups?
+7. Why can a compromised application still read encrypted-at-rest data?
+
+## Related Topics
+
+- [Secrets Management](./secrets-management.mdx)
+- [Authentication and Authorization](./authentication-and-authorization.mdx)
+- [OAuth and OIDC](./oauth-and-oidc.mdx)
+- [Multi-Tenancy and Isolation](./multi-tenancy-and-isolation.mdx)
+
+## References
+
+### Documentation / Articles
+
+- [The Transport Layer Security (TLS) Protocol Version 1.3 (RFC 8446)](https://www.rfc-editor.org/rfc/rfc8446.html) — specifies the TLS 1.3 handshake, key schedule, authentication, and security properties.
+- [Recommendations for Secure Use of Transport Layer Security and Datagram Transport Layer Security (RFC 9325)](https://www.rfc-editor.org/rfc/rfc9325.html) — gives current protocol/cipher deployment guidance and threat considerations.
+- [Recommendation for Key Management (NIST SP 800-57 Part 1)](https://csrc.nist.gov/pubs/sp/800/57/pt1/r5/final) — explains key lifecycle, ownership, protection, and compromise response.
+- [Cryptographic Storage Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Cryptographic_Storage_Cheat_Sheet.html) — covers encryption-at-rest choices, key separation, and avoiding custom cryptography.

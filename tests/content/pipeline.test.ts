@@ -62,9 +62,9 @@ function expectValidationFailure(root: string, field: string, code?: string): Co
 }
 
 describe("the production content index", () => {
-  it("validates all nine completed modules and 82 lessons", () => {
+  it("validates all fourteen completed modules and 135 lessons", () => {
     const index = loadContentIndex();
-    expect(index.lessons).toHaveLength(82);
+    expect(index.lessons).toHaveLength(135);
     expect(index.modules.map((module) => module.id)).toEqual([
       "interview-method",
       "foundations",
@@ -75,11 +75,42 @@ describe("the production content index", () => {
       "messaging",
       "distributed-coordination",
       "reliability",
+      "observability",
+      "security",
+      "building-blocks",
+      "architecture-archetypes",
+      "design-labs",
     ]);
     expect(index.modules.map((module) => module.lessons.length)).toEqual([
-      4, 10, 7, 8, 14, 9, 10, 10, 10,
+      4, 10, 7, 8, 14, 9, 10, 10, 10, 7, 9, 10, 7, 20,
     ]);
     expect(index.lessons.every((lesson) => !Object.prototype.hasOwnProperty.call(lesson, "body"))).toBe(true);
+  });
+
+  it("resolves every generated lesson route and representative lessons from Modules 04–13", () => {
+    const index = loadContentIndex();
+    for (const lessonRecord of index.lessons) {
+      expect(resolveLesson(index, lessonRecord.module, lessonRecord.slug)?.id).toBe(lessonRecord.id);
+    }
+
+    const representatives = [
+      ["databases", "transaction-isolation", "04-05-transaction-isolation"],
+      ["caching", "cache-stampede", "05-07-cache-stampede"],
+      ["messaging", "delivery-semantics", "06-06-delivery-semantics"],
+      ["distributed-coordination", "transactional-outbox", "07-08-transactional-outbox"],
+      ["reliability", "exponential-backoff-and-jitter", "08-03-exponential-backoff-and-jitter"],
+      ["observability", "distributed-tracing", "09-02-distributed-tracing"],
+      ["security", "jwt-tradeoffs", "10-03-jwt-tradeoffs"],
+      ["building-blocks", "rate-limiter", "11-01-rate-limiter"],
+      ["architecture-archetypes", "fanout", "12-03-fanout"],
+      ["design-labs", "payment-system", "13-15-payment-system"],
+    ] as const;
+    for (const [moduleId, slug, id] of representatives) {
+      expect(resolveLesson(index, moduleId, slug)).toMatchObject({
+        id,
+        route: `/learn/${moduleId}/${slug}`,
+      });
+    }
   });
 
   it("resolves routes and previous/next navigation without scanning prose", () => {

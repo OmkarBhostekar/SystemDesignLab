@@ -1,6 +1,6 @@
 # Module 12 — System Design Archetypes
 
-**Status:** Scaffold only. Archetype lessons and their progressive visual examples remain to be authored.
+**Status:** Theory-complete. All seven canonical workload-shape lessons are authored and indexed; progressive visual examples remain future application work.
 
 ## Purpose
 
@@ -32,7 +32,16 @@ The first six archetypes are **Core**. Streaming/media systems are **Advanced** 
 - The archetypes pull from [`04-databases`](../04-databases/README.md), [`05-caching`](../05-caching/README.md), [`06-messaging`](../06-messaging/README.md), [`08-reliability`](../08-reliability/README.md), [`09-observability`](../09-observability/README.md), and [`11-building-blocks`](../11-building-blocks/README.md).
 - The interview framework in [`00-interview-method`](../00-interview-method/README.md) remains the governing workflow; archetypes are not reference answers.
 
+## Authored lessons
+
+- [Read-heavy systems](./read-heavy.mdx) — replicas, caches, CDNs, read models, freshness, and hot keys.
+- [Write-heavy systems](./write-heavy.mdx) — append paths, partitioning, batching, backpressure, and lag.
+- [Fanout systems](./fanout.mdx) — push, pull, hybrid delivery, and celebrity skew.
+- [Real-time systems](./realtime.mdx) — persistent connections, gateways, pub/sub, ordering, and reconnects.
+- [Transactional workflows](./transactional-workflow.mdx) — local transactions, sagas, idempotency, compensation, and reconciliation.
+- [Search and discovery systems](./search-and-discovery.mdx) — ingestion, candidate indexes, ranking, freshness, and policy.
+- [Streaming and media systems](./streaming-and-media.mdx) — ingest, manifests, segments, CDN delivery, bitrate, and egress.
+
 ## Authoring boundary
 
-Future archetype lessons should demonstrate how changing constraints changes the architecture. They must retain the PRD's naive → failure → improvement → trade-off progression and leave enough uncertainty for the learner to reason in the design labs.
-
+The archetypes demonstrate how changing constraints changes the architecture. They retain the PRD's naive → failure → improvement → trade-off progression and leave enough uncertainty for the learner to reason in the design labs. They are workload hypotheses, not memorized reference answers.

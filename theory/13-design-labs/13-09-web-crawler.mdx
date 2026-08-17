@@ -1,0 +1,209 @@
+---
+type: lesson
+id: 13-09-web-crawler
+slug: web-crawler
+title: Web Crawler
+description: Design a polite, deduplicating crawl pipeline with scheduling, backpressure, durable frontier state, and replayable results.
+module: design-labs
+order: 9
+difficulty: advanced
+estimatedMinutes: 60
+prerequisites:
+  - 00-03-estimation
+  - 00-04-interview-framework
+  - 06-02-message-queue-fundamentals
+  - 06-09-backpressure
+  - 07-05-leases-and-fencing-tokens
+  - 08-02-retries
+tags:
+  - web-crawler
+  - frontier
+  - politeness
+  - deduplication
+  - backpressure
+objectives:
+  - Model a durable crawl frontier keyed by host with politeness and retry policy.
+  - Deduplicate URLs/content without treating probabilistic filters as authority.
+  - Estimate fetch bandwidth, frontier state, parser work, and storage growth.
+  - Explain robots, abuse, poisoned pages, leases, and failure/replay behavior.
+relatedLessons:
+  - 04-09-partitioning-and-sharding
+  - 06-09-backpressure
+  - 07-05-leases-and-fencing-tokens
+  - 08-02-retries
+visualizationId: null
+quizId: null
+---
+
+# Web Crawler
+
+> A crawler is a scheduler under external rate limits: durable frontier ownership and per-host politeness matter as much as fetch throughput.
+
+## Problem Statement
+
+Design a crawler that starts from seed URLs, follows allowed links, stores fetched content/metadata, and supports recrawling according to freshness. It must respect `robots.txt`, per-host delays, HTTP caching validators, and an operator stop/block list. The web is untrusted: pages can be huge, cyclic, malicious, slow, or intentionally adversarial. Ask whether the output is an index, archive, or one-time graph snapshot; this lab assumes an index-oriented, bounded-depth crawl.
+
+## Functional Requirements (Scoped)
+
+- Ingest seeds and normalize/validate URLs.
+- Schedule fetches by host with delay, concurrency, priority, and retry policy.
+- Fetch with timeouts, redirects/size limits, robots policy, and conditional headers.
+- Deduplicate pending URLs and optionally content; parse allowed links and emit documents.
+- Pause/abort a host or tenant, inspect crawl status, and resume after worker failure.
+
+Out of scope: rendering arbitrary JavaScript, bypassing access controls, scraping private content, or guaranteeing a complete view of the changing web.
+
+## Non-Functional Requirements and Priorities
+
+| Priority | Requirement | Working target / question |
+| --- | --- | --- |
+| P0 | Politeness/compliance | Never exceed configured host policy; honor robots and operator blocks. |
+| P0 | Isolation | One hostile/slow host cannot starve unrelated hosts. |
+| P0 | Durable progress | A worker crash loses no committed frontier item permanently. |
+| P1 | Throughput | Fetch many hosts in parallel while respecting each host's budget. |
+| P1 | Freshness | Recrawl policy is explicit and observable by host/URL class. |
+| P2 | Cost | Bound content bytes, parser CPU, and retained versions. |
+
+## Estimation Prompts and Checked Example
+
+Ask for URLs/day, average response bytes, hosts, per-host delay/concurrency, content retention, parser rate, and recrawl interval. Example:
+
+- 100M URL fetches/day → `≈1,157 fetches/s`; a 5× burst is `≈5,785/s`.
+- At 100 KB average response, peak ingress is `≈578.5 MB/s ≈4.6 Gb/s` payload, before compression/protocol overhead. This may force regional workers and content-size tiers.
+- 10M active hosts with 1 frontier record of 300 bytes is `≈3 GB` logical; pending retries, URL fingerprints, host policy, and replication add substantial state.
+- If a parser handles 2,000 pages/s/worker and peak is 5,785 pages/s, at least `ceil(5,785/2,000)=3` healthy workers plus failure headroom are needed; network and host politeness may dominate instead.
+
+Sensitivity prompts: How many URLs per host? Is content stored raw? What is the maximum response size? How quickly must a block take effect? How much duplicate content is acceptable?
+
+## API Design
+
+```http
+POST /v1/crawls
+Idempotency-Key: crawl-seeds-42
+{"seeds":["https://example.org"],"maxDepth":4,"policyId":"default"}
+```
+
+Return `202 {crawlId, state:"queued"}` after seed/frontier persistence. Repeated idempotency keys with the same normalized seed/policy hash return the same crawl; changed input returns `409`. `GET /crawls/{id}` reports counters and frontier age. `POST /crawls/{id}:pause` and `POST /hosts/{host}:block` are idempotent control-plane commands with version checks.
+
+Internal claim API leases a host queue item with `leaseToken`, `attempt`, `notBefore`, and `policyVersion`. A worker must ack with the token; stale acks return `409 StaleLease`. Fetch `429/503`, timeout, and transport failures retry with host-aware backoff; `404/410`, robots denial, parse policy, and invalid URL are terminal. Use HTTP validators and do not blindly retry a non-idempotent external action (the crawler's fetch is read-only but still load-bearing for the host).
+
+## Data Model, Access Paths, and Ownership
+
+```text
+crawls(crawl_id PK, policy_id, state, created_at, stats_ref)
+frontier(host_key, url_hash, url, priority, not_before, depth,
+         attempt, status, lease_owner, lease_until, policy_version,
+         PRIMARY KEY(host_key, url_hash))
+host_state(host_key PK, next_allowed_at, concurrency, robots_hash,
+           robots_expires_at, blocked, version)
+documents(content_hash PK, object_key, content_type, fetched_at, size)
+url_versions(url_hash, fetched_at, status, etag, content_hash, metadata)
+```
+
+The crawler owns frontier scheduling and fetch policy; object storage owns large bodies; a document/index pipeline owns parsed results. Host state is the serialization boundary for politeness. URL deduplication is exact in the frontier database; a Bloom filter may reduce work but cannot be the only correctness check because false positives skip URLs.
+
+## Progressive Architecture: Naive → Bottleneck → Improvement → New Trade-off
+
+1. **Naive:** one process pops a URL, fetches, parses, and writes inline. It is easy to understand but a slow host blocks progress, restart loses frontier state, and no per-host fairness exists.
+2. **Bottleneck/failure:** add a shared queue and many workers. Throughput rises, but workers race on one host, violate politeness, duplicate URLs, and let a burst of large pages exhaust memory/network.
+3. **Improvement:** partition frontier by host, persist `nextAllowedAt`, use leases/fencing, apply bounded fetch/parser queues, and separate raw object storage from metadata/indexing. Use robots policy and conditional GET.
+4. **New trade-off:** per-host ordering reduces parallelism for a hot host, leases and delayed queues add scheduler complexity, and content dedupe/retention can hide changes if over-aggressive. Keep exact policy/state authoritative and use probabilistic filters only as optimization.
+
+Reference architecture:
+
+```text
+Seed API → frontier DB/partitions → host scheduler → fetch workers → parser queue
+                                      ↑ robots/policy cache        ├→ object store
+                                      └── lease/retry state         └→ index/document store
+```
+
+Each worker owns a lease for a host/item, not a permanent URL assignment; expired leases become retryable with attempt bounds.
+
+## Bottlenecks and Concurrency / Consistency
+
+Hot hosts, DNS/TLS/socket pools, frontier delayed scheduling, parser CPU, object-store egress, robots refresh, and crawl-status counters dominate. Claim/update is conditional on lease token and version. `nextAllowedAt` and per-host in-flight count update atomically so two workers cannot violate delay. URL normalization must be deterministic; content hashes dedupe bytes but do not replace URL/version history. Crawl statistics are eventually aggregated; frontier state is authoritative.
+
+## Failure Analysis
+
+- **Worker crash:** lease expiry returns item to the frontier; attempt count prevents infinite retry.
+- **Host stalls:** per-host timeout/circuit and scheduler fairness keep other hosts moving.
+- **Robots fetch failure:** choose fail-closed for unknown policy or a bounded cached policy; never silently crawl through a policy outage.
+- **Poison/huge response:** stream with max bytes, MIME/parse limits, sandbox parser, and abort.
+- **Frontier store outage:** stop admitting new work or use a bounded local buffer; do not duplicate uncontrolled fetches.
+- **Duplicate URL discovery:** exact unique key + Bloom prefilter; idempotent enqueue.
+- **Content store lag:** retain URL/version metadata and retry body upload; do not mark a document indexed before durable bytes if that is the contract.
+
+## Security
+
+Respect robots and legal/operator policies; authenticate control APIs and separate tenants. Defend workers against SSRF (block private/link-local IPs, re-resolve DNS safely, cap redirects), decompression bombs, zip/polyglot content, parser exploits, and unbounded URLs. Use egress allowlists where appropriate, malware scanning, TLS verification, least privilege, and redact credentials/query data from logs.
+
+## Observability
+
+Measure fetch QPS/bytes/status/latency by host, robots decisions, per-host delay/concurrency violations, frontier depth/age, retry/DLQ counts, lease expiry, duplicate rate, parser queue age/CPU, bytes rejected, object/index lag, and crawl freshness. Trace a URL hash through schedule/claim/fetch/parse/store; avoid raw sensitive URLs in high-cardinality labels. Alert on host-policy violations, frontier starvation, retry amplification, and parser backlog.
+
+## Explicit Trade-offs and Alternatives
+
+- **Central frontier vs per-host queues:** central simplifies visibility; per-host sharding enforces politeness but complicates global fairness/rebalance.
+- **Breadth-first vs priority/freshness:** breadth is simple; priority improves value but can starve low-score hosts.
+- **Raw content vs parsed-only:** raw enables replay/audit but costs storage and privacy risk.
+- **Exact dedupe vs Bloom filter:** exact costs state but preserves coverage; Bloom is cheap and fast with false positives/negatives depending on use.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+“I make the frontier durable and partition it by host, with `nextAllowedAt`, concurrency, robots policy, leases, and bounded retries. Workers fetch with strict time/size/SSRF limits, enqueue parsing asynchronously, and store large bodies separately. Exact URL dedupe protects coverage; a Bloom filter is only a fast prefilter. Host fairness, frontier age, and policy violations are more important than raw fetch QPS.”
+
+### When to Introduce It
+
+Introduce a durable frontier when restarts or long crawls make in-memory URLs unsafe; introduce host partitions and delayed scheduling as soon as many workers could violate politeness.
+
+### Common Follow-Ups
+
+- How do you avoid crawling one host too fast?
+- What if the same URL is discovered by 10 workers?
+- How do you handle robots fetch failure?
+- What stops a page from exhausting parser memory?
+
+### Common Candidate Mistakes
+
+Maximizing global QPS without host policy, using a Bloom filter as truth, allowing arbitrary redirects/SSRF, and treating a queue ack as proof that content is durably stored.
+
+## Summary
+
+The frontier is the system: host ownership, policy, leases, and backpressure determine safe throughput. Keep fetch, parse, and storage decoupled, bound untrusted input, and make retries/replay observable.
+
+## Quiz Seeds
+
+1. Why does a host-keyed frontier enforce politeness better than a global queue?
+2. Calculate peak ingress for 5,785 fetches/s at 100 KB.
+3. What invariant does a lease token protect?
+4. Why can a Bloom filter not be the only URL-dedupe structure?
+5. Should robots failure fail open or closed for this product, and why?
+6. Which failure lets duplicate fetches happen and how are they bounded?
+7. What controls a decompression bomb or huge response?
+8. Which metric reveals low-value starvation behind high-priority work?
+
+## Related Topics
+
+- [Message queue fundamentals](../06-messaging/message-queue-fundamentals.mdx) — durable work and acknowledgment boundaries.
+- [Backpressure](../06-messaging/backpressure.mdx) — keep fetch/parser stages bounded.
+- [Leases and fencing tokens](../07-distributed-coordination/leases-and-fencing-tokens.mdx) — safe work ownership.
+- [Retries](../08-reliability/retries.mdx) — classify external fetch failures.
+
+## References
+
+### Documentation / Articles
+
+- [RFC 9309: Robots Exclusion Protocol](https://www.rfc-editor.org/rfc/rfc9309.html) — formalizes robots policy discovery and interpretation.
+- [Google Search crawling and indexing FAQ](https://developers.google.com/search/help/crawling-index-faq) — documents practical crawl controls and freshness considerations.
+- [RFC 9110: HTTP Semantics](https://www.rfc-editor.org/rfc/rfc9110.html) — grounds validators, redirects, status codes, and request semantics.
+- [Google SRE: Handling Overload](https://sre.google/sre-book/handling-overload/) — supports bounded queues, backpressure, and load shedding.
+
+### Papers
+
+- [Space/Time Trade-offs in Hash Coding with Allowable Errors](https://dl.acm.org/doi/10.1145/362686.362692) — original Bloom-filter result and false-positive trade-off.
+
+## Future Visualization / Workspace Spec
+
+Simulate seed discovery, host queues, robots fetch, lease claim, politeness delay, worker crash, retry, parse backpressure, URL dedupe, and object/index commit. Controls should vary host skew, delays, response sizes, parser speed, Bloom false positives, store outages, and crawl priority. Show frontier age, host concurrency, fetch QPS, policy violations, duplicate ratio, bytes, retry attempts, and parser lag. Workspace nodes should include Seed API, Frontier, Scheduler, Fetcher, Robots Policy, Parser, Object Store, and Index.

@@ -1,0 +1,189 @@
+---
+type: lesson
+id: 10-09-multi-tenancy-and-isolation
+slug: multi-tenancy-and-isolation
+title: Multi-Tenancy and Isolation
+description: Keep tenant identity, data, caches, queues, and resources separated while balancing cost, blast radius, and noisy-neighbor fairness.
+module: security
+order: 9
+difficulty: advanced
+estimatedMinutes: 34
+prerequisites:
+  - 10-05-rbac-and-abac
+  - 10-07-secrets-management
+  - 10-08-api-abuse-prevention
+  - 04-09-partitioning-and-sharding
+  - 08-06-bulkhead
+tags:
+  - multi-tenancy
+  - isolation
+  - tenant-boundaries
+  - noisy-neighbor
+  - fairness
+  - data-protection
+objectives:
+  - Identify cross-tenant trust boundaries across request, data, cache, queue, blob, and telemetry paths.
+  - Compare pooled, schema/partition, and dedicated isolation models.
+  - Prevent tenant confusion, cache leakage, IDOR, and cross-tenant background work.
+  - Design quotas, bulkheads, key boundaries, offboarding, and compromise response.
+relatedLessons:
+  - 10-01-authentication-and-authorization
+  - 10-05-rbac-and-abac
+  - 10-08-api-abuse-prevention
+  - 08-06-bulkhead
+---
+
+# Multi-Tenancy and Isolation
+
+> A tenant boundary is a system invariant, not a column in one table: identity, storage, caches, queues, keys, logs, and capacity must preserve it under failure and scale.
+
+## Why This Exists
+
+Multi-tenant services share code and infrastructure while serving organizations that must not see or starve one another. The naive design authenticates a request, accepts a `tenant_id` field from the client, and filters one database query. It fails through IDOR, missing filters, cache-key collisions, background jobs without tenant context, shared object paths, logs, or a large tenant exhausting a common worker pool.
+
+Isolation is both confidentiality/integrity and availability. Threat assumptions include an honest but buggy tenant, a malicious tenant with valid credentials, a compromised application worker, and an operator or dependency that can read shared storage. Choose the boundary according to data sensitivity, tenant count, workload skew, regulatory needs, and recovery goals. No model eliminates application authorization bugs; stronger physical separation only narrows the blast radius.
+
+## Mental Model
+
+```text
+verified principal → tenant context → policy + resource ownership
+        ├─ database rows/partitions/schemas
+        ├─ cache/session keys
+        ├─ queues/blobs/search indexes
+        ├─ encryption keys and backups
+        └─ quotas, pools, and observability
+```
+
+Common isolation choices form a spectrum:
+
+| Model | Security/failure boundary | Cost and operations |
+| --- | --- | --- |
+| Pooled rows with tenant key | weakest physical separation; policy/filter correctness critical | lowest cost, highest shared blast radius |
+| Schema/partition per tenant | clearer ownership and migration boundary | more objects and routing metadata |
+| Database/cluster per tenant | strong storage and performance isolation | higher cost, provisioning, backup, and fleet management |
+| Dedicated service/region | strongest tailored boundary | expensive; cross-tenant features and operations are harder |
+
+Hybrid tiers are often sensible: most tenants share pooled infrastructure while high-sensitivity or high-volume tenants receive dedicated partitions/pools.
+
+## How It Works
+
+1. Derive tenant context from an authenticated principal or trusted service delegation. Reject mismatched client-supplied tenant IDs; do not let a path parameter override identity.
+2. Carry tenant context through every synchronous and asynchronous boundary, including retries, outbox events, scheduled jobs, cache calls, blob paths, search documents, and audit records.
+3. Enforce tenant scope at the resource owner. Use database constraints/row policies or query builders as defense in depth, but still test object-level authorization and avoid dynamic SQL/filter bypasses.
+4. Namespace every shared key: cache/session keys, queue topics/partitions, object paths, idempotency keys, metrics dimensions, and search indexes. Prevent cross-tenant cache hits and message consumption.
+5. Isolate capacity with per-tenant quotas, concurrency pools, queue partitions, priority, and backpressure. Measure usage and fairness; avoid one global retry or worker pool for all tenants.
+6. Assign encryption/key scope and backup access according to isolation tier. Offboarding revokes credentials, stops jobs, deletes/retains data under policy, removes caches/indexes, and proves no residual access.
+7. Test compromise and recovery: a tenant credential, worker, cache node, query bug, or backup copy should have a known blast radius and detection path.
+
+Tenant context is not a secret by itself, but it is security-sensitive metadata. Sign or derive delegated context across service boundaries and include the authenticated issuer/subject. Logs and metrics need a privacy/cardinality policy; an operator should diagnose one tenant without exposing another’s data.
+
+## Example
+
+A SaaS document service uses pooled storage for standard tenants. The API derives `tenant=acme` from the authenticated subject, and each document query includes tenant scope plus a unique object ownership check. Cache keys begin with a canonical tenant ID; blob paths and search documents carry the same namespace. An indexing message contains a signed tenant context and document ID; the consumer rechecks ownership before reading.
+
+Acme’s bulk export gets a dedicated worker quota and queue partition so it cannot consume interactive capacity for Beta. A high-sensitivity tenant uses a dedicated database and encryption key. During offboarding, the system disables the tenant principal, revokes service credentials, stops scheduled jobs, removes cache/index entries, and preserves encrypted backups only for the documented retention period. A query bug in pooled storage triggers a cross-tenant access investigation and a temporary read freeze rather than assuming row filters were sufficient.
+
+## Visualization We Eventually Want
+
+Model two tenants sharing API, database, cache, queue, worker pool, blob store, and keys. Controls should switch isolation tiers, alter cache/queue namespacing, inject a missing filter, tenant-header spoof, large-tenant burst, worker compromise, and offboarding. Display allowed/denied data, cache hits, message routing, per-tenant latency/queue age, resource shares, key access, and blast radius under each failure.
+
+## Scaling Behavior
+
+Pooled models scale tenant count cheaply but make cardinality, noisy-neighbor fairness, migrations, and policy testing harder. Per-tenant schemas/databases improve isolation but increase connection pools, backup jobs, routing metadata, and operational fan-out. Dedicated regions reduce blast radius and regulatory risk but complicate global search, shared features, failover, and cost.
+
+Capacity controls must account for burst, retries, fan-out, storage, egress, and background work. Per-tenant quotas need durable accounting and a safe failover policy; local region limits can overshoot a global plan during partitions. Avoid using raw tenant IDs as high-cardinality metrics labels without aggregation/redaction; retain a separate secure audit path for tenant-specific investigation.
+
+## Failure Modes
+
+- **Tenant spoofing:** client-controlled header/path becomes authoritative context.
+- **Filter omission:** one query, export, or admin path returns another tenant’s object.
+- **Cache collision:** shared key omits tenant and serves private data across boundaries.
+- **Async context loss:** worker processes a job under a default/global tenant.
+- **Blob/search leakage:** object paths or index documents are not namespaced.
+- **Noisy neighbor:** one tenant exhausts workers, connections, memory, or rate budget.
+- **Shared key compromise:** one tenant/service can decrypt another’s data.
+- **Offboarding residue:** credentials, jobs, caches, backups, or replicas remain accessible.
+- **Observability leak:** dashboards/logs reveal sensitive tenant content or identifiers broadly.
+
+## Trade-offs
+
+Shared pooling is cost-efficient and makes cross-tenant analytics easier, but a bug or noisy tenant has broad impact. Dedicated isolation narrows blast radius and allows tailored limits, but costs more and multiplies operations. Strong tenant-aware policy at every path improves security but increases latency, testing, and context propagation complexity. Per-tenant keys improve compromise response but make rotation, backup recovery, and key inventory harder.
+
+## Alternatives
+
+- **Single-tenant deployments:** simplest isolation for a small number of high-value customers; expensive to operate at large count.
+- **Pooled storage with defense-in-depth constraints:** good default for many SaaS workloads when tested rigorously.
+- **Partitioned placement:** balances scale and isolation; rebalancing and cross-partition queries become harder.
+- **Encryption-only separation:** protects storage copies but does not stop an authorized application path from crossing tenants.
+- **Process/sandbox isolation:** useful for untrusted tenant code; still needs data and resource policy outside the sandbox.
+
+## When to Use
+
+Use explicit tenant context and isolation when one service serves multiple organizations, accounts, or security domains. Choose pooled, partitioned, or dedicated boundaries from threat, compliance, workload, and recovery requirements—not only infrastructure cost.
+
+## When Not to Use
+
+Do not call a single database filter “multi-tenant isolation” without covering caches, queues, blobs, logs, backups, and capacity. Avoid dedicated infrastructure when tenant scale and data sensitivity do not justify the operational cost; use strong defense-in-depth in a pooled model instead.
+
+## Common Misconceptions
+
+- **“Tenant ID in the URL is isolation.”** It is untrusted input until derived/validated from identity and policy.
+- **“Database row filters solve everything.”** Async, cache, blob, search, logs, and quotas can still cross boundaries.
+- **“Dedicated database eliminates cross-tenant bugs.”** Shared APIs, credentials, caches, and operators can still leak.
+- **“Fairness is separate from security.”** A noisy tenant can deny service to others even without reading data.
+- **“Offboarding means deleting one row.”** Credentials, jobs, replicas, indexes, caches, and retention copies need lifecycle handling.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I derive tenant context from authenticated identity and carry it through storage, cache, queue, blob, search, and audit paths. The resource owner enforces object scope with defense-in-depth constraints; every shared key is namespaced. I choose pooled, partitioned, or dedicated isolation from threat/compliance and workload skew, then add per-tenant quotas, bulkheads, key boundaries, offboarding, and compromise tests so one tenant cannot read or starve another.
+
+### When to Introduce It
+
+Introduce tenant isolation as soon as a design serves more than one security or billing domain. Ask what happens if one tenant is malicious, buggy, huge, or offboarded.
+
+### Common Follow-Ups
+
+- Where is tenant context derived and verified?
+- How do caches and asynchronous jobs preserve isolation?
+- How do you prevent a noisy neighbor?
+- Which tenant data and keys remain after offboarding?
+
+### Common Candidate Mistakes
+
+- Trusting client tenant headers.
+- Forgetting queue/blob/search/cache namespaces.
+- Choosing one global worker/connection pool with no fairness.
+- Treating dedicated storage as a substitute for authorization.
+
+## Summary
+
+Multi-tenancy is an end-to-end invariant. Derive and propagate tenant context, enforce ownership at resource boundaries, namespace every shared path, isolate capacity and keys, and design offboarding and compromise response. Isolation strength is a trade-off among blast radius, cost, and operational complexity.
+
+## Quiz Seeds
+
+1. Why is a client-supplied tenant ID not authoritative?
+2. Name three non-database places where tenant context must be preserved.
+3. Compare pooled rows and dedicated databases for blast radius and operations.
+4. How can a cache key leak data across tenants?
+5. What controls prevent a noisy neighbor from exhausting a shared worker pool?
+6. Which credentials/keys must be revoked during offboarding?
+7. Why can dedicated storage still suffer cross-tenant authorization bugs?
+
+## Related Topics
+
+- [Authentication and Authorization](./authentication-and-authorization.mdx)
+- [RBAC and ABAC](./rbac-and-abac.mdx)
+- [API Abuse Prevention](./api-abuse-prevention.mdx)
+- [Bulkhead](../08-reliability/bulkhead.mdx)
+- [Partitioning and Sharding](../04-databases/partitioning-and-sharding.mdx)
+
+## References
+
+### Documentation / Articles
+
+- [Multi-Tenant Application Security Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Multi_Tenant_Security_Cheat_Sheet.html) — covers tenant context, database/cache/blob isolation, offboarding, and monitoring.
+- [Authorization Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html) — grounds object-level authorization, least privilege, and deny-by-default enforcement.
+- [Zero Trust Architecture (SP 800-207)](https://csrc.nist.gov/pubs/sp/800/207/final) — frames explicit identity and policy at every resource boundary.
+- [Multi-tenancy patterns](https://learn.microsoft.com/azure/architecture/guide/multitenant/approaches/storage-data) — compares pooled, partitioned, and dedicated data-isolation choices (architecture reference, not a product prescription).

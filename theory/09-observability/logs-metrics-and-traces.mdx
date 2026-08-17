@@ -1,0 +1,185 @@
+---
+type: lesson
+id: 09-01-logs-metrics-and-traces
+slug: logs-metrics-and-traces
+title: Logs, Metrics, and Traces
+description: Choose the telemetry signal that answers an operational question while preserving context, bounded cost, and useful fidelity.
+module: observability
+order: 1
+difficulty: core
+estimatedMinutes: 28
+prerequisites:
+  - 01-03-latency-vs-throughput
+  - 02-01-request-lifecycle
+  - 08-01-timeouts
+tags:
+  - observability
+  - logs
+  - metrics
+  - traces
+  - telemetry
+  - cardinality
+objectives:
+  - Match logs, metrics, and traces to debugging and capacity questions.
+  - Explain why structured fields, correlation identifiers, and bounded cardinality matter.
+  - Design telemetry for synchronous requests and asynchronous messages without leaking secrets.
+  - Balance sampling and retention cost against the need to investigate rare failures.
+relatedLessons:
+  - 09-02-distributed-tracing
+  - 09-03-golden-signals
+  - 06-09-backpressure
+---
+
+# Logs, Metrics, and Traces
+
+> Observability is a decision aid: use metrics to see that a population is unhealthy, traces to follow one request, and logs to inspect the detailed evidence.
+
+## Why This Exists
+
+A dashboard that says “CPU is 85%” does not explain why a checkout failed. A raw application log may contain the answer, but searching millions of unstructured lines during an incident is slow and misses relationships between services. A distributed request can cross a gateway, cart service, inventory, payment provider, and an asynchronous outbox; each component sees only part of the story.
+
+The naive design emits a line of text at every interesting branch and asks an operator to grep after the fact. It fails in three ways: there is no stable aggregation for alerting, there is no request-wide context, and high-volume detail overwhelms storage. The improvement is to treat logs, metrics, and traces as complementary projections of the same behavior, with common resource and request context.
+
+## Mental Model
+
+```text
+many requests ──aggregate──> metrics: “is the population healthy?”
+one request ─────follow──────> trace:   “where did this request wait?”
+one operation ───inspect─────> logs:    “what did this component observe?”
+```
+
+Metrics are numeric time series with dimensions. They are cheap to aggregate and ideal for rates, ratios, latency distributions, queue depth, and saturation. Traces are graphs of timed spans for a request or workflow. Logs are timestamped, structured records of events; they can carry details that do not make sense as a metric label.
+
+No signal is a complete truth. A metric can show an error ratio without a useful example. A trace can omit an unsampled request. A log can be emitted after the response and therefore not prove a user received success. Observability combines evidence and states the measurement boundary.
+
+## How It Works
+
+Instrument at stable boundaries: ingress, service handlers, outbound calls, queue publish/consume, storage calls, and important state transitions. Attach low-cardinality fields such as service, operation, route template, status class, region, and deployment version. Carry a request or trace identifier, but do not turn unbounded user IDs, raw URLs, or message bodies into metric labels.
+
+Use a structured event rather than a sentence assembled from strings:
+
+```json
+{
+  "event": "inventory_reservation",
+  "outcome": "conflict",
+  "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+  "order_id_hash": "...",
+  "service": "inventory",
+  "duration_ms": 41
+}
+```
+
+The trace ID correlates evidence; it is not authorization and should not be trusted as an identity claim. For asynchronous work, create a new span linked to the producer span or continue the trace context in message headers. Keep the business event ID separate from the telemetry trace ID: one identifies a domain operation, the other an observation context.
+
+Sampling is a cost and fidelity decision. Head sampling chooses at ingress before the outcome is known, which is inexpensive but can miss rare errors. Tail sampling waits for more span data and keeps slow or failed traces, but requires buffering and a collector decision point. Keep unsampled counters and error metrics so sampling never changes the reported SLO denominator. Bound dimensions and enforce cardinality limits; a metric with one time series per user or request ID can exhaust memory before traffic itself is large.
+
+## Example
+
+For `POST /checkout`, the edge records request count and latency by route template and outcome. The checkout service starts a trace span, emits a structured log when it selects inventory, and creates a child span for the payment call. If payment is accepted asynchronously through a queue, the producer records publish latency and message ID; the consumer starts a processing span linked to the producer and records age-at-consume and outcome.
+
+During an incident, the operator first sees checkout error rate and p99 latency rise. A trace for a failed order shows 900 ms waiting on inventory. Logs for that trace reveal a reservation conflict, while a separate metric shows queue age is normal. The conclusion is different from “the database is slow”: the failure is business contention, and the mitigation may be inventory capacity or request behavior rather than more checkout servers.
+
+## Visualization We Eventually Want
+
+Show one request flowing through gateway, checkout, inventory, payment, and a queue. Let the learner toggle each signal, inject a timeout or rejected reservation, set trace sampling rate, and add a high-cardinality label. Display the metric aggregates, a trace waterfall, correlated log rows, collector buffer usage, and which evidence disappears under head sampling. An async preset should show producer and consumer timestamps separately so queue wait is not mistaken for handler latency.
+
+## Scaling Behavior
+
+Metrics scale with the number of unique label combinations, not merely request volume; cardinality is the controlling variable. Logs scale with event volume and payload size, so severity, retention tiers, redaction, and dynamic sampling matter. Traces scale with spans per request and fan-out width; a single request that calls 50 downstreams can create a large trace.
+
+At high volume, aggregate at the edge or collector, retain full detail for errors and a small representative sample, and downsample old data. Preserve exemplars or trace IDs on metric points when the backend supports it so a metric spike can lead to a concrete trace without storing every trace.
+
+## Failure Modes
+
+- **Missing context:** an intermediary drops propagation, splitting one request into unrelated traces.
+- **Cardinality explosion:** user IDs, unbounded URL paths, or message IDs become metric dimensions and exhaust memory or query capacity.
+- **Sampling bias:** head sampling keeps easy successes and misses rare failures; sampled rates must not replace complete counters.
+- **Secret leakage:** tokens, passwords, payment data, or message bodies appear in logs or trace attributes.
+- **Telemetry outage:** a collector or backend is unavailable; application work must not block indefinitely on exporting telemetry.
+- **Clock confusion:** host clocks differ, making cross-process timestamps misleading; span duration and causal context are more reliable than wall-clock ordering alone.
+- **Async orphaning:** a queue consumer has no producer link, so queue delay and processing time cannot be separated.
+
+## Trade-offs
+
+More detail improves diagnosis but costs CPU, network, storage, query time, and privacy review. Metrics are compact and alertable but lose per-request context. Logs are flexible but expensive to index and aggregate. Traces reveal causality and tail behavior but need propagation, sampling, and a collector. Synchronous export gives fast visibility at the cost of request latency; buffered or asynchronous export protects the request path but can lose telemetry during a crash.
+
+## Alternatives
+
+- **Metrics-only:** suitable for a small batch job with stable failure modes, but weak for a novel distributed incident.
+- **Log-centric debugging:** reasonable for low-volume single-process tools; it becomes costly and ambiguous as fan-out grows.
+- **Always-on full tracing:** useful for a low-throughput, high-value workflow; usually too expensive for broad production traffic.
+- **External black-box probes:** valuable for measuring the user-visible boundary and detecting a completely broken telemetry pipeline; they cannot replace internal context.
+
+## When to Use
+
+Use all three signals when a request crosses process or queue boundaries, when tail latency matters, or when operators must distinguish user impact from internal activity. Start with a small set of user-facing metrics, structured logs for important decisions, and trace propagation at every boundary.
+
+## When Not to Use
+
+Do not add a unique metric label or a verbose log line merely because a field exists. Do not emit secrets to make debugging convenient. A one-off local script may need only a short log and an exit status; production architecture needs the signal whose answer is actionable.
+
+## Common Misconceptions
+
+- **“More telemetry always means more observability.”** Unbounded, uncorrelated data can make the answer harder to find.
+- **“A trace ID authenticates a caller.”** It is correlation metadata and must not be treated as an identity or authorization credential.
+- **“Metrics and logs are interchangeable.”** A metric answers population questions efficiently; a log preserves event detail.
+- **“Sampling makes error rates inaccurate.”** Error and request counters can remain unsampled; sampling primarily affects detailed traces/logs.
+- **“Async work is outside the request trace.”** It needs an explicit propagation or link; otherwise the workflow is merely harder to diagnose.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I instrument stable request and message boundaries with metrics, structured logs, and traces. Metrics show population-level traffic, errors, latency, and saturation; traces connect one request across services and async hops; logs explain local decisions. I propagate context, keep labels bounded, redact secrets, preserve complete SLO counters, and sample detailed data while retaining rare failures.
+
+### When to Introduce It
+
+Introduce the three signals when the design has multiple services, asynchronous work, or a user-impact objective that cannot be inferred from a single host metric. Name the questions the operator must answer before choosing fields and retention.
+
+### Common Follow-Ups
+
+- How would you trace a message processed hours after publication?
+- Which fields are safe metric labels, and how do you control cardinality?
+- How do you retain rare failures without tracing every request?
+- What happens if the telemetry collector is down?
+
+### Common Candidate Mistakes
+
+- Listing a dashboard without naming a decision it enables.
+- Counting sampled traces as the SLO denominator.
+- Logging raw tokens or personal data.
+- Forgetting queue wait, retries, and propagation boundaries.
+
+## Summary
+
+Metrics, traces, and logs are different views of one system. Design the correlation and measurement boundaries first, keep metric cardinality and payload privacy bounded, and use sampling only after preserving complete user-impact counters. Async paths need explicit context just like synchronous hops.
+
+## Quiz Seeds
+
+1. Which signal best answers “what fraction of checkout requests exceeded the latency objective,” and which signal finds one slow order?
+2. Why is a raw URL path a risky metric label?
+3. How can tail sampling preserve a rare failed trace that head sampling missed?
+4. What is the difference between a business event ID and a trace ID?
+5. What telemetry should remain complete even when traces are sampled?
+6. A queue consumer has no producer context. Which diagnosis becomes ambiguous?
+7. Why should telemetry export be buffered or bounded rather than block the request path indefinitely?
+
+## Related Topics
+
+- [Distributed Tracing](./distributed-tracing.mdx)
+- [Golden Signals](./golden-signals.mdx)
+- [Backpressure](../06-messaging/backpressure.mdx)
+- [Timeouts](../08-reliability/timeouts.mdx)
+
+## References
+
+### Documentation / Articles
+
+- [Observability primer](https://opentelemetry.io/docs/concepts/observability-primer/) — defines logs, metrics, spans, traces, and user-oriented observability questions.
+- [Metrics](https://opentelemetry.io/docs/concepts/signals/metrics/) — explains metric aggregation and why cardinality bounds protect memory.
+- [Sampling](https://opentelemetry.io/docs/concepts/sampling/) — describes head and tail sampling choices and their trade-offs.
+- [Trace Context](https://www.w3.org/TR/trace-context/) — specifies interoperable propagation of trace context across HTTP boundaries.
+
+### Papers
+
+- [Dapper, a Large-Scale Distributed Systems Tracing Infrastructure](https://research.google/pubs/dapper-a-large-scale-distributed-systems-tracing-infrastructure/) — original large-scale tracing design and sampling rationale.

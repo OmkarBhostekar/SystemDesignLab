@@ -1,0 +1,189 @@
+---
+type: lesson
+id: 11-03-distributed-scheduler
+slug: distributed-scheduler
+title: Distributed Scheduler
+description: Run durable jobs across workers with ownership, leases, retries, and duplicate-safe execution.
+module: building-blocks
+order: 3
+difficulty: advanced
+estimatedMinutes: 45
+prerequisites:
+  - 06-02-message-queue-fundamentals
+  - 06-06-delivery-semantics
+  - 06-07-idempotent-consumers
+  - 07-05-leases-and-fencing-tokens
+  - 08-02-retries
+tags:
+  - scheduler
+  - job-queue
+  - leases
+  - retries
+  - idempotency
+objectives:
+  - Model a scheduled job as durable state plus a claim/execute/complete protocol.
+  - Compare polling, delayed queues, timing wheels, and external scheduler triggers.
+  - Explain lease expiry, duplicate execution, fencing, retries, dead letters, and misfire policy.
+  - Choose a partition and ownership strategy that bounds due-job scan cost and hot tenants.
+relatedLessons:
+  - 07-04-distributed-locks
+  - 07-05-leases-and-fencing-tokens
+  - 06-08-dead-letter-queues
+  - 06-09-backpressure
+---
+
+# Distributed Scheduler
+
+> A distributed scheduler is a durable state machine that makes a best-effort time trigger safe to execute across many workers; “run at 10:00” is not the same as “run exactly once at 10:00.”
+
+## Why This Exists
+
+A single process with an in-memory timer can schedule reminders, but a restart loses them and one process becomes the throughput and availability boundary. A database poller improves durability, yet multiple workers may observe the same due row and execute it twice. A queue improves distribution, but a delayed message can be duplicated, arrive late, or be invisible during a consumer failure.
+
+The improvement separates durable job intent from worker execution. The scheduler claims due work, gives ownership a bounded lifetime, and records attempts and outcomes. The new trade-offs are duplicate execution, clock/timing precision, lease races, retry storms, storage scans, and the need for idempotent handlers.
+
+## Mental Model
+
+```text
+job intent ─> due/ready ─> claim(epoch) ─> execute ─> complete
+                   │            │             ├─ retry with backoff
+                   │            │             └─ dead letter / operator action
+                   └────────────┴─ lease expiry allows recovery (not cancellation)
+```
+
+A job record should distinguish **scheduled time**, **eligible time**, **attempt**, **owner**, **lease expiry**, **fencing/epoch**, **status**, and **next retry**. A lease gives liveness: another worker can recover after expiry. It does not stop a paused old worker. A fencing token or resource-side version check prevents that old worker from committing stale output.
+
+## How It Works
+
+One durable design uses a transactional claim:
+
+```sql
+UPDATE jobs
+SET status = 'running', owner = :worker, lease_until = :deadline,
+    epoch = epoch + 1, attempts = attempts + 1
+WHERE id = :id AND status IN ('ready','retry') AND due_at <= now()
+  AND (lease_until IS NULL OR lease_until < now())
+RETURNING id, epoch;
+```
+
+Only the returned owner may renew or complete the job, and completion checks the epoch atomically. Workers scan an index such as `(status, due_at)` or consume a ready queue. Claim batches should be bounded; a large transaction can lock out other workers and turn one tenant into a hot range.
+
+Polling is simple and durable but adds scan load and timing granularity. Delayed queues reduce polling but make visibility, cancellation, and long delays dependent on broker semantics. Timing wheels efficiently manage many nearby timers but require durable recovery. An external scheduler can trigger a service, yet the durable job record and idempotent completion still belong to the application.
+
+“Exactly once” is generally an end-to-end property that requires a transactional effect or a provider idempotency contract. A scheduler can provide at-most-once attempts by marking before execution, but a crash then loses work. It can provide at-least-once execution by marking after completion, but retries can duplicate effects. Most business systems choose at-least-once attempts plus idempotent handlers.
+
+## Example
+
+A billing service schedules 10 million invoice jobs for the first of the month. The naive design has every worker query `WHERE due_at <= now()` and then send invoices. All workers return the same rows, the email provider sees duplicates, and the database suffers a thundering scan.
+
+The improvement partitions jobs by tenant/time bucket, uses an indexed ready state, claims small batches with an epoch, and publishes claimed work to workers. The handler stores an idempotency key `(invoice_id, billing_period)` with the send outcome. A worker that pauses past its lease cannot complete with an old epoch. If the provider times out, the job moves to retry with exponential backoff and a maximum age; after exhaustion it goes to a dead-letter state for reconciliation.
+
+The new trade-off is that a single invoice may be attempted more than once, and a schedule at 10:00 may execute at 10:00:20 when the queue is saturated. The product must define misfire policy: skip, coalesce missed occurrences, or run every missed occurrence.
+
+## Visualization We Eventually Want
+
+Build a **Scheduler Ownership Timeline** with durable rows, a ready queue, three workers, and an external side-effect box. Controls should set job count, due-time skew, poll interval, lease duration, work duration, crash point, provider timeout, retry policy, partition count, and idempotency on/off. Show claims, renewals, stale completions rejected by epoch, duplicate effects, queue age, scan work, retry backlog, and dead letters. Scenarios should include worker pause, database failover, a hot tenant, clock skew, and a burst of due jobs. Learners should be able to step from “due” through “complete” and inspect each state transition.
+
+## Scaling Behavior
+
+Polling cost is roughly the number of workers × poll frequency × rows examined; index due jobs, use bounded batches, and back off when no work is ready. A delayed queue shifts cost to broker timer storage. Partition by due time and a stable workload key, but avoid one global “now” partition that all workers hammer at the same second. Shard ownership so a failed worker affects a bounded set of jobs.
+
+Long-running jobs need renewal traffic and a lease longer than normal work plus jitter. Short leases improve recovery but increase false expiry and duplicate starts. Large fan-out schedules should be expanded asynchronously rather than inserting millions of rows in the request path. Observe schedule lag, oldest ready age, claim contention, execution duration, retry age, and completion ambiguity.
+
+## Failure Modes
+
+- **Duplicate claim:** claim is not conditional or ownership expires while work continues.
+- **Stale completion:** an old worker commits after a new owner takes over.
+- **Lost job:** record is marked done before its effect commits.
+- **Retry storm:** all failures retry at the same time without backoff/jitter.
+- **Clock/misfire surprise:** scheduler time and business time zone disagree.
+- **Hot partition:** one tenant or due-time bucket dominates scans.
+- **Poison job:** deterministic failure consumes workers indefinitely.
+- **Cancellation race:** a job is cancelled while a claimed worker is already running.
+
+Use conditional updates, fencing or idempotency, bounded retries, dead letters, time-zone policy, cancellation state checks, and per-tenant quotas. Cancellation should prevent new attempts; stopping an in-flight external action may be impossible.
+
+## Trade-offs
+
+Database polling is transparent and transactional but can create scan load. Queues improve decoupling and backpressure but add visibility and replay semantics. Lease recovery improves liveness while admitting duplicates. Strong time precision costs coordination and infrastructure; most systems choose bounded lateness. Durable expansion improves recovery but increases write volume.
+
+## Alternatives
+
+- **Single host cron:** choose for low-value, low-scale work where restart loss is acceptable or jobs can be rebuilt.
+- **Delayed message queue:** choose when trigger precision is moderate and queue delivery already exists.
+- **Timing wheel:** choose for huge volumes of near-term timers with a durable checkpoint/rebuild path.
+- **Workflow engine:** choose for multi-step stateful workflows, compensation, and human waits rather than simple one-shot jobs.
+- **Database native scheduler:** choose when the work and transaction are local to one database and operational coupling is acceptable.
+
+## When to Use
+
+Use a distributed scheduler when jobs must survive worker restarts, run across many workers, or support retries, cancellation, and operational inspection. State the lateness/misfire guarantee and the idempotency boundary.
+
+## When Not to Use
+
+Do not build a scheduler for a one-off maintenance script with a human operator. Do not promise exact-once external effects from a lease alone. Do not poll a primary database every second when a durable queue or event trigger can carry the workload.
+
+## Common Misconceptions
+
+- **“A lease prevents duplicate execution.”** It enables takeover; a paused owner may still run.
+- **“Marking done before sending gives exactly once.”** A crash can lose the send.
+- **“A cron expression is a schedule guarantee.”** It says when work becomes eligible, not when capacity executes it.
+- **“Retries fix transient failures automatically.”** Without idempotency and backoff they amplify failure.
+- **“A scheduler must use a database.”** Queues, timing wheels, and workflow engines are alternatives with different guarantees.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I persist job intent and status, make due work claimable by one owner at a time, use a bounded lease plus fencing or idempotent completion, and retry with backoff before dead-lettering. The scheduler offers at-least-once attempts and bounded lateness, not magic exactly-once side effects. I partition due work, cap claim batches, define time-zone/misfire behavior, and monitor schedule lag and duplicate outcomes.
+
+### When to Introduce It
+
+Introduce it when scheduled work must survive process failure, exceed one worker, or expose retry/cancellation/inspection semantics.
+
+### Common Follow-Ups
+
+- How do workers claim without racing?
+- What happens if a worker pauses after claiming?
+- How do you prevent duplicate email/payment effects?
+- How do you handle millions of jobs due at once?
+- What does “on time” mean under overload?
+
+### Common Candidate Mistakes
+
+They equate lease ownership with cancellation, omit an idempotency key, scan the entire table, or say “exactly once” without naming the transactional boundary.
+
+## Summary
+
+Separate durable intent, eligibility, ownership, execution, and completion. Use leases for recovery, fencing/idempotency for stale or duplicate work, and explicit backoff/dead-letter/misfire policies. Capacity and correctness are both part of scheduling.
+
+## Quiz Seeds
+
+1. Why does marking a job complete before its side effect risk lost work?
+2. What does a fencing epoch add beyond a lease expiry?
+3. Compare polling and delayed queues for 10 million monthly jobs.
+4. How should a worker behave after its lease expires during a long task?
+5. What is a sensible policy for a poison job?
+6. Why are due-time buckets prone to hotspots?
+7. What must a billing handler use to make at-least-once attempts safe?
+8. Distinguish schedule time, eligibility time, and completion time.
+
+## Related Topics
+
+- [Leases and fencing tokens](../07-distributed-coordination/leases-and-fencing-tokens.mdx) protects against stale owners.
+- [Idempotent consumers](../06-messaging/idempotent-consumers.mdx) makes retries and duplicate delivery safe.
+- [Dead-letter queues](../06-messaging/dead-letter-queues.mdx) handles poison work.
+- [Distributed locks](../07-distributed-coordination/distributed-locks.mdx) compares lock ownership and scheduler leases.
+
+## References
+
+### Documentation / Articles
+
+- [Temporal workflow durable execution](https://docs.temporal.io/workflows) — demonstrates durable workflow state, retries, timers, and recovery semantics beyond a simple cron trigger.
+- [Quartz Scheduler JDBC job store](https://www.quartz-scheduler.org/documentation/quartz-2.3.0/configuration/ConfigJobStoreTX.html) — documents durable job storage and the transaction boundary behind clustered scheduling.
+- [Google Cloud Tasks retry configuration](https://cloud.google.com/tasks/docs/configuring-queues) — grounds delayed delivery, retry limits, and queue rate controls in a production task service.
+- [Amazon EventBridge Scheduler](https://docs.aws.amazon.com/scheduler/latest/UserGuide/what-is-scheduler.html) — shows a managed trigger model and the need to reason about targets, retries, and time zones.
+
+### Papers
+
+- [Hashed and hierarchical timing wheels](https://dl.acm.org/doi/10.1145/359012.359025) — explains an efficient timer data structure and why timer volume changes the scheduler implementation choice.
