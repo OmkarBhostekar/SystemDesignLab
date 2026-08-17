@@ -1,0 +1,187 @@
+---
+type: lesson
+id: 08-01-timeouts
+slug: timeouts
+title: Timeouts
+description: Bound waiting and propagate deadlines so one slow dependency cannot consume every caller resource.
+module: reliability
+order: 1
+difficulty: core
+estimatedMinutes: 25
+prerequisites:
+  - 01-04-percentiles-tail-latency
+  - 03-04-health-checks-and-failover
+  - 07-03-consensus-and-raft-intuition
+tags:
+  - timeouts
+  - deadlines
+  - cancellation
+  - tail-latency
+  - overload
+objectives:
+  - Distinguish a client timeout, server deadline, connection timeout, and queue timeout.
+  - Derive a bounded per-hop deadline from an end-to-end latency budget.
+  - Explain deadline propagation, cancellation, and why timed-out work may continue consuming resources.
+  - Choose timeout behavior and fallback semantics for a concrete synchronous request.
+relatedLessons:
+  - 08-02-retries
+  - 08-04-retry-storms-and-cascading-failures
+  - 01-04-percentiles-tail-latency
+---
+
+# Timeouts
+
+> A timeout is a resource-protection and user-contract decision: stop waiting before the caller's budget and capacity are exhausted, then define what happens to work already in flight.
+
+## Why This Exists
+
+An order API calls inventory, payment, and pricing. If payment stops responding and the API waits forever, request threads, memory, sockets, and database connections remain occupied. As more clients arrive, the service queues until even health checks fail. The naive fix—set one enormous timeout at the load balancer—still lets inner calls consume the whole request budget and may return a response after the user has already retried.
+
+Timeouts bound waiting, but they do not make a remote operation stop. A design needs a deadline budget, cancellation/abort semantics where possible, and a reconciliation path when the remote side may have completed.
+
+## Mental Model
+
+Think of a request as carrying a shrinking time budget:
+
+```text
+client budget 500 ms
+  gateway 40 ms
+  ├─ inventory 150 ms
+  ├─ price     100 ms
+  └─ response serialization + queue 80 ms
+remaining margin 130 ms
+```
+
+Separate timer types:
+
+| Timer | Bounds | Why it matters |
+| --- | --- | --- |
+| Connection timeout | DNS/TCP/TLS setup | Prevents a dead endpoint from holding connection slots. |
+| Queue timeout | Waiting for a worker/connection | Rejects work that cannot finish before its deadline. |
+| Request deadline | End-to-end caller wait | Defines the user-visible contract. |
+| Read/idle timeout | Silence during a response/stream | Detects a stalled peer without killing active long work. |
+| Cancellation | Work after caller no longer cares | Releases downstream resources when the protocol supports it. |
+
+An absolute deadline is safer across hops than independent “500 ms per service” timers. Each hop subtracts elapsed time and reserves enough budget for its own work; it must not extend a caller's deadline silently.
+
+## How It Works
+
+1. The edge assigns or receives an absolute deadline, such as `t=12:00:00.500`.
+2. Each service computes remaining time on receipt and passes the deadline to downstream RPCs.
+3. Queue acquisition, connection acquisition, remote work, and serialization observe the remaining budget.
+4. On expiry, the caller cancels the request where supported and returns a bounded error/fallback (`504`, `deadline exceeded`, stale cache, or partial response).
+5. The downstream service checks cancellation before expensive stages and avoids starting work that cannot finish.
+
+Do not allocate the entire budget to one dependency when independent calls can run in parallel. Conversely, do not launch calls that have no time left. Timeout values should come from p95/p99 behavior, capacity tests, and the user SLO—not a round number copied across every endpoint.
+
+## Example
+
+The checkout endpoint has a 700 ms p95 target and a 1-second absolute deadline. It validates cart state locally, calls inventory and price in parallel with a 250 ms child deadline, and gives payment 500 ms because it is on the critical path. If payment reaches 480 ms, the service cancels optional recommendation work and returns a pending-payment state only if the payment API supports idempotency/reconciliation.
+
+If the client deadline expires at 1 second but the payment service keeps processing, the order API cannot assume payment failed. It records operation ID `pay-123`, returns “processing,” and reconciles later. A timeout is not a transaction rollback.
+
+## Visualization We Eventually Want
+
+Show a request traversing gateway, services, queue, and database with a countdown deadline. Controls should set end-to-end budget, per-hop latency distribution, queue depth, cancellation support, and parallel/serial fan-out. Display remaining budget, in-flight work after timeout, resource occupancy, fallback result, and abandoned work. Presets should compare independent timers with propagated deadlines and show a slow payment call consuming connections even after the client leaves.
+
+## Scaling Behavior
+
+Longer timeouts increase the maximum number of in-flight requests by Little's Law (`concurrency ≈ arrival rate × service time`). At 2,000 QPS and a 2-second wait, roughly 4,000 requests can occupy resources before responses return; a 200 ms timeout would bound that wait but may reject legitimate slow work. Timeout budgets must include peak concurrency, connection pools, queues, and retry amplification.
+
+Fan-out increases tail risk: a request often waits for the slowest branch. Short child deadlines protect capacity but can cause partial results and more retries. Per-tenant or per-operation timeout classes may be necessary; one global value rarely matches uploads, reads, and writes.
+
+## Failure Modes
+
+- **No timeout:** hung sockets and threads exhaust capacity.
+- **Too short:** healthy but variable operations fail, increasing user retries and load.
+- **Too long:** work continues after the caller gives up and crowds out useful requests.
+- **Timer mismatch:** an inner call waits longer than its parent deadline and returns useless work.
+- **No cancellation:** downstream continues expensive computation after upstream timeout.
+- **Partial side effect:** a timed-out write may have succeeded; retrying blindly duplicates it.
+- **Timeout as health check:** one slow dependency causes every endpoint to look dead if probes share the same pool.
+
+## Trade-offs
+
+Short deadlines protect capacity and improve failure detection but increase false failures and partial responses. Long deadlines improve completion probability for slow work but consume resources and worsen tail latency. Cancellation saves work when supported but requires propagation and cleanup; deadlines without cancellation still provide a caller contract but not immediate resource release.
+
+## Alternatives
+
+- **Asynchronous acceptance:** return a job/operation ID and process long work outside the request deadline.
+- **Streaming/heartbeats:** use idle timeouts for long-lived responses rather than a short total timeout.
+- **Circuit breaker:** stop initiating calls after sustained failure; it complements rather than replaces a deadline.
+- **Queue timeout/dead-letter:** bound waiting work in asynchronous systems.
+- **Graceful fallback:** return cached/partial data when the optional dependency misses its budget.
+
+## When to Use
+
+Set explicit connection, queue, request, and downstream deadlines for every remote call. Propagate absolute deadlines, reserve budget for cleanup/serialization, and define retry/reconciliation behavior for writes.
+
+## When Not to Use
+
+Do not use a single tiny timeout for every operation or assume timeout means cancellation. Do not let infrastructure silently rewrite application deadlines. For long uploads/downloads, use streaming/idle policies and resumability rather than an arbitrary short total timeout.
+
+## Common Misconceptions
+
+- **“A timeout fails the remote operation.”** It usually only ends the caller's wait.
+- **“More timeout means more reliability.”** It can turn a partial outage into resource exhaustion.
+- **“Per-hop timeout equals end-to-end budget.”** Serial hops can multiply waiting unless deadlines are propagated.
+- **“Retry after timeout is safe.”** The original write may have committed.
+- **“Cancellation is automatic.”** It needs protocol and application support.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I set an end-to-end deadline from the user SLO, propagate the remaining budget to every dependency, and bound connection and queue waits separately. On expiry I cancel downstream work where possible and return a defined fallback or operation ID. For writes, a timeout is ambiguous, so I use idempotency and reconciliation rather than blindly retrying.
+
+### When to Introduce It
+
+Introduce timeouts as soon as the design crosses a network or queue boundary, before discussing retries or failover. Ask what user budget and resource pool the timer protects.
+
+### Common Follow-Ups
+
+- How do you divide a 1-second budget across parallel dependencies?
+- What happens to downstream work after the caller times out?
+- Which errors are safe to retry after a timeout?
+- How do you pick values from p99 data rather than guesses?
+
+### Common Candidate Mistakes
+
+- Omitting timeouts on internal calls because the network is “reliable.”
+- Setting each hop to the full top-level timeout.
+- Treating timeout as proof of failure or cancellation.
+- Ignoring queue and connection acquisition time.
+
+## Summary
+
+Timeouts bound waiting and protect resource pools; deadlines express the end-to-end contract. Propagate remaining time, cancel where possible, and reconcile ambiguous writes. Choose values from tail behavior and capacity, and pair timeouts with fallback, retry, and overload policies.
+
+## Quiz Seeds
+
+1. Why should a downstream RPC receive the remaining deadline instead of a fresh full timeout?
+2. At 2,000 QPS with 0.5 s average wait, what rough in-flight request count follows from Little's Law?
+3. Why is a write timeout ambiguous?
+4. Which timer protects a saturated connection pool before a remote call begins?
+5. How can independent fan-out branches affect the caller's timeout?
+6. When is an asynchronous operation ID better than extending a synchronous timeout?
+7. What resource problem can an overly forgiving timeout create during a dependency outage?
+
+## Related Topics
+
+- [Retries](./retries.mdx)
+- [Retry Storms and Cascading Failures](./retry-storms-and-cascading-failures.mdx)
+- [Percentiles and Tail Latency](../01-foundations/percentiles-tail-latency.mdx)
+- [Health Checks and Failover](../03-traffic-and-services/health-checks-and-failover.mdx)
+
+## References
+
+### Documentation / Articles
+
+- [Timeouts, retries, and backoff with jitter](https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/) — AWS Builders’ Library connects timeout selection, retries, and overload behavior.
+- [Handling Overload](https://sre.google/sre-book/handling-overload/) — Google SRE explains deadlines, queueing, and wasted work after a caller gives up.
+- [Deadlines](https://grpc.io/docs/guides/deadlines/) — gRPC documents deadline propagation and cancellation semantics for RPCs.
+- [HTTP Semantics (RFC 9110)](https://www.rfc-editor.org/rfc/rfc9110.html) — the HTTP specification grounds status/error semantics at request boundaries.
+
+### Papers
+
+- [The Tail at Scale](https://research.google/pubs/the-tail-at-scale/) — Google research explains why fan-out and tail latency make deadline budgets essential.

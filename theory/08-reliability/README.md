@@ -1,6 +1,6 @@
 # Module 08 — Reliability and Failure Engineering
 
-**Status:** Scaffold only. Failure-focused theory and simulations are not yet authored.
+**Status:** Theory complete — 10 Markdown-first lessons. Interactive failure simulations and structured quizzes remain future application work.
 
 ## Purpose
 
@@ -30,6 +30,25 @@ Timeouts through graceful degradation are **Core** interview knowledge. Disaster
 9. `08-09-backups-rpo-rto` — Recovery point objective, recovery time objective, restore validation, and the cost of stronger targets.
 10. `08-10-multi-region-and-region-failover` — Active/passive, active/active, geo-routing, replication latency, data residency, and failover trade-offs.
 
+## Completed lesson coverage
+
+Each lesson starts from a failure pressure and carries the reasoning through mechanics, concrete backend behavior, scaling limits, recovery choices, trade-offs, interview framing, quiz seeds, annotated references, and a behavior-oriented future visualization specification.
+
+| Lesson | Completed teaching focus |
+| --- | --- |
+| [Timeouts](./timeouts.mdx) | Connection/queue/request timers, absolute deadlines, cancellation, fan-out budgets, and ambiguous timed-out writes. |
+| [Retries and Error Classification](./retries.mdx) | Permanent, transient, throttling, and ambiguous errors; bounded attempts, retry ownership, idempotency, and reconciliation. |
+| [Exponential Backoff and Jitter](./exponential-backoff-and-jitter.mdx) | Immediate/fixed/exponential schedules, full/equal/decorrelated jitter, caps, deadlines, and retry-wave load. |
+| [Retry Storms and Cascading Failures](./retry-storms-and-cascading-failures.mdx) | Positive feedback between latency, retries, queues, health checks, failover, capacity, and controlled recovery. |
+| [Circuit Breaker](./circuit-breaker.mdx) | Closed/open/half-open state behavior, probe budgets, scope, fallback semantics, and breaker limitations. |
+| [Bulkhead](./bulkhead.mdx) | Resource-pool, tenant, priority, and cell isolation; reserve/borrow policies, fairness, and fragmentation costs. |
+| [Load Shedding and Graceful Degradation](./load-shedding-and-graceful-degradation.mdx) | Admission control, priorities, bounded queues, cached/partial responses, retry semantics, and recovery reserve. |
+| [Disaster Recovery](./disaster-recovery.mdx) | Scenario-based recovery, HA versus DR, fencing, dependency/runbook ordering, validation, traffic shift, and failback. |
+| [Backups, RPO, RTO, and Restore Validation](./backups-rpo-rto.mdx) | Recovery objectives, snapshots/logs/replicas, retention and isolation, restore integrity, and measured recovery time. |
+| [Multi-Region and Region Failover](./multi-region-and-region-failover.mdx) | Active/passive versus active/active, routing, replication lag, ownership/fencing, conflicts, residency, capacity, and failback. |
+
+The lessons treat retries, failover, and multi-region as conditional tools rather than universal improvements. They specify what is shed, what is degraded, what data may be lost, and how recovery is validated; they do not implement a production resilience library or disaster-recovery controller.
+
 ## Downstream connections
 
 - [`09-observability`](../09-observability/README.md) measures the latency, errors, saturation, and budget burn that reveal failure.
@@ -39,5 +58,4 @@ Timeouts through graceful degradation are **Core** interview knowledge. Disaster
 
 ## Authoring boundary
 
-The planned lessons do not assert that retries are always helpful or that multi-region is always worth its cost. Future lessons should make failure injection, capacity exhaustion, recovery time, and user-visible degradation explicit, while respecting reduced-motion accessibility in eventual simulations.
-
+The completed lessons do not assert that retries are always helpful or that multi-region is always worth its cost. They make failure injection, capacity exhaustion, recovery time, and user-visible degradation explicit. Future simulations must preserve those semantics and respect reduced-motion accessibility.

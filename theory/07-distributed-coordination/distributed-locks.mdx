@@ -1,0 +1,173 @@
+---
+type: lesson
+id: 07-04-distributed-locks
+slug: distributed-locks
+title: Distributed Locks
+description: Coordinate exclusive ownership of a shared resource when many application instances can act at once.
+module: distributed-coordination
+order: 4
+difficulty: advanced
+estimatedMinutes: 30
+prerequisites:
+  - 07-02-leader-election
+  - 01-10-consistency-models
+  - 03-08-service-boundaries
+tags:
+  - distributed-locks
+  - mutual-exclusion
+  - ownership
+  - idempotency
+  - coordination
+objectives:
+  - Identify the shared resource and critical section that motivate a distributed lock.
+  - Compare a lease-backed lock, database lock, and queue ownership model.
+  - Explain why lock acquisition, release, expiry, and crash recovery need explicit semantics.
+  - Recognize when a lock is insufficient without fencing, idempotency, or a durable transaction.
+relatedLessons:
+  - 07-05-leases-and-fencing-tokens
+  - 07-06-distributed-transactions-and-2pc
+  - 07-02-leader-election
+---
+
+# Distributed Locks
+
+> A distributed lock is a coordination protocol for temporary ownership, not a guarantee that a paused or disconnected holder has stopped acting.
+
+## Why This Exists
+
+Imagine two API instances both try to rebuild the same search index or reserve the last seat. A process-local mutex protects only one process. The naive distributed fix is a shared `lock:resource` key: whoever creates it wins, and the winner deletes it afterward. That sounds simple until the winner crashes, its delete is delayed, or its lock expires while its work is still running.
+
+The real question is often narrower than “make all work mutually exclusive”: can operations be idempotent, partitioned by key, serialized in a database transaction, or assigned through a queue? A lock is useful when a small critical section needs one active owner, but it adds waiting, deadlock, and stale-holder failure modes.
+
+## Mental Model
+
+Separate four things:
+
+1. **Resource:** what must not be concurrently mutated (for example, inventory row `sku-7`).
+2. **Owner identity:** a unique random token or session identifying the claimant.
+3. **Authority:** the shared service that decides whether the claim is current.
+4. **Critical section:** the bounded work performed while ownership is believed valid.
+
+```text
+worker A ── acquire(resource, token A) ──> lock service
+worker A ── critical work ───────────────> resource
+worker A ── release(resource, token A) ──> lock service
+```
+
+The lock service's “A owns it” response is a snapshot. Network delay, process pauses, and partitions can make that snapshot stale before the resource receives a write. A lock can serialize attempts at the coordinator while the resource still needs version checks or fencing.
+
+## How It Works
+
+A robust lock operation has atomic acquire semantics: create the record only if absent, or compare-and-set a version. The record includes owner token, acquisition time/lease deadline, and possibly a fencing sequence. Release must delete only if the token matches; an old process must not delete a newer owner's lock.
+
+With a lease, the owner renews before expiry. A crash eventually allows another owner to acquire. The system must choose what happens when renewal is uncertain: stop work conservatively, or continue while a downstream resource enforces fencing. Lock acquisition should have a deadline and bounded wait; otherwise callers pile up and consume threads/connections.
+
+Use a single authoritative coordinator or a consensus-backed store for lock state. A “lock” implemented by racing writes to eventually replicated caches can grant ownership to two workers under a partition. If the critical section updates a database row, prefer an atomic database transaction or conditional update when possible; it reduces the distributed surface.
+
+## Example
+
+An order service has three instances and a nightly task that compacts one customer ledger at a time. A database advisory lock or row-level lock can serialize compaction for a customer without a separate lock service. If the work spans object storage and an external provider, a lease-backed coordinator may prevent duplicate starts, but it cannot roll back a provider call.
+
+Worker A acquires token `a7`, pauses during a runtime stop-the-world event, and its lease expires. Worker B acquires token `b9` and starts compaction. A resumes and sends an old write. A lock service that merely says “A had acquired the lock” cannot stop that write. Add a fencing token and require the ledger writer to accept only the latest token (the next lesson develops this case).
+
+## Visualization We Eventually Want
+
+Show two or three workers, a lock coordinator, and one resource. Controls should acquire/release, pause a worker, delay renewal, partition the coordinator, change lease duration, and choose token-checking at the resource. Display owner token, remaining lease, waiters, critical-section duration, duplicate writes, and rejected stale writes. A **“pause while holding lock”** preset should show why expiry alone is unsafe and why compare-and-delete prevents an old owner from releasing a new owner's lock.
+
+## Scaling Behavior
+
+A single hot lock serializes all contenders and becomes a throughput bottleneck. Partition lock keys by resource; keep critical sections short; use queues or sharded ownership for high-volume work. High contention creates a convoy: when a holder releases, many waiters wake and race. Backoff and a queue can reduce load.
+
+Lock renewal traffic scales with active holders and lease frequency. A lock service spread across regions pays cross-region latency and partition risk. Keep coordination close to the resource or use region-local ownership with an explicit global conflict policy.
+
+## Failure Modes
+
+- **Crash after acquire:** lease expiry or an operator recovery path must release ownership eventually.
+- **Pause beyond lease:** a stale process may resume and perform writes unless fencing exists.
+- **Lost release response:** the owner may retry release; token matching keeps it from deleting a new owner's lock.
+- **Coordinator outage:** acquisition may fail closed; continuing with cached ownership can create split brain.
+- **Clock assumptions:** client wall clocks must not decide authority; use server-side deadlines/epochs where possible.
+- **Deadlock:** two locks acquired in inconsistent order can wait forever; use lock ordering or one composite resource.
+- **Long critical section:** renewal failures and contention increase; redesign as a resumable workflow.
+
+## Trade-offs
+
+Locks simplify a small exclusive section but reduce concurrency, add a coordination dependency, and still require a stale-holder defense. Lease duration balances recovery speed against renewal traffic and false expiry. Database locks offer transactional proximity and strong semantics but consume database resources. External coordinators isolate lock state but add network hops and operational complexity.
+
+## Alternatives
+
+- **Optimistic concurrency:** use a version condition and retry when conflicts are rare.
+- **Database row/advisory lock:** use when state and critical work fit one database transaction.
+- **Queue with one consumer per key:** use when work can be asynchronous and ordering is more important than immediate response.
+- **Leader election:** use when one owner coordinates a whole partition or role, not one arbitrary short critical section.
+- **Idempotent operations:** use when duplicate work is safe and cheaper than blocking.
+
+## When to Use
+
+Use a distributed lock for a bounded, clearly identified critical section where duplicate concurrent execution is harmful and alternatives cannot provide the needed semantics. Specify the authority, owner token, lease/release behavior, fencing, wait deadline, and observability.
+
+## When Not to Use
+
+Do not lock an entire request path when a conditional write or idempotency key solves the race. Do not use a cache lock as a correctness boundary. Avoid a global lock for independent keys or long workflows; it hides a data-model/ownership problem.
+
+## Common Misconceptions
+
+- **“The lock expires, so the old worker is harmless.”** Expiry changes the coordinator's view; it does not stop a paused process.
+- **“Delete the lock key to release.”** An old owner can delete a newer owner's lock without token matching.
+- **“Redis/DB lock means exactly once.”** External side effects and crashes still create ambiguity.
+- **“More lock retries improve reliability.”** Unbounded wait can amplify overload and contention.
+- **“Leader and lock are identical.”** A leader is a role for a group; a lock is ownership of a resource/critical section.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I first name the shared resource and ask whether a conditional write, queue, or idempotency can avoid a lock. If a lock is needed, acquisition is atomic, ownership carries a unique token, release compares that token, and waiting/renewal have deadlines. A lease does not stop a paused holder, so writes to the protected resource need a fencing token or version check.
+
+### When to Introduce It
+
+Introduce a lock after showing a concrete duplicate-execution race, such as two schedulers claiming one job or two booking requests mutating one inventory item. Keep the critical section and failure contract explicit.
+
+### Common Follow-Ups
+
+- Where is lock state stored and what happens if it is unavailable?
+- What if the holder pauses longer than the lease?
+- How do you prevent an old holder from deleting a new lock?
+- Why not use a database transaction or queue instead?
+
+### Common Candidate Mistakes
+
+- Treating a successful acquire response as permanent authority.
+- Omitting unique owner tokens and compare-and-delete.
+- Using one global lock for all customers/keys.
+- Forgetting lock metrics, wait deadlines, and orphan recovery.
+
+## Summary
+
+Distributed locks coordinate temporary ownership but do not halt stale processes. Prefer local atomicity or idempotency when possible; otherwise use authoritative atomic acquire/release, owner tokens, bounded waits, leases, and fencing/version checks at the resource.
+
+## Quiz Seeds
+
+1. Why must a release operation verify the owner's token?
+2. What happens if a worker pauses beyond its lease and resumes afterward?
+3. Which alternative fits a rare conflict on one database row: lock or optimistic version check, and why?
+4. Why does a hot global lock limit throughput even when workers are otherwise scalable?
+5. What should a client do when lock renewal gets a timeout response?
+6. How can a queue provide per-key serialization without a lock on the request path?
+7. Why does a lock not provide exactly-once external payment execution?
+
+## Related Topics
+
+- [Leader Election](./leader-election.mdx)
+- [Leases and Fencing Tokens](./leases-and-fencing-tokens.mdx)
+- [Distributed Transactions and 2PC](./distributed-transactions-and-2pc.mdx)
+- [Health Checks and Failover](../03-traffic-and-services/health-checks-and-failover.mdx)
+
+## References
+
+### Documentation / Articles
+
+- [The Chubby Lock Service for Loosely-Coupled Distributed Systems](https://research.google/pubs/the-chubby-lock-service-for-loosely-coupled-distributed-systems/) — describes a production lock/name service and its session-oriented failure model.
+- [How to do distributed locking](https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html) — analyzes lease pauses, fencing, and why a lock service alone cannot protect an unaware resource.
+- [Distributed locks with Redis](https://redis.io/docs/latest/develop/clients/patterns/distributed-locks/) — documents one implementation pattern and explicitly surfaces its assumptions and limitations.
+- [ZooKeeper Recipes and Solutions](https://zookeeper.apache.org/doc/current/recipes.html) — shows lock recipes, ephemeral nodes, and recovery considerations.

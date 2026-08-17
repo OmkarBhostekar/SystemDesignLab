@@ -1,0 +1,189 @@
+---
+type: lesson
+id: 08-10-multi-region-and-region-failover
+slug: multi-region-and-region-failover
+title: Multi-Region and Region Failover
+description: Compare active/passive and active/active regions while accounting for replication lag, routing, ownership, conflicts, and recovery cost.
+module: reliability
+order: 10
+difficulty: advanced
+estimatedMinutes: 40
+prerequisites:
+  - 08-08-disaster-recovery
+  - 08-09-backups-rpo-rto
+  - 03-04-health-checks-and-failover
+  - 07-03-consensus-and-raft-intuition
+tags:
+  - multi-region
+  - active-passive
+  - active-active
+  - region-failover
+  - replication-lag
+  - geo-routing
+objectives:
+  - Compare active/passive, warm standby, and active/active region topologies against RPO/RTO and cost.
+  - Explain traffic routing, write ownership, replication lag, failover fencing, and conflict handling.
+  - Design a region-failure sequence that avoids split brain and uncontrolled recovery load.
+  - Identify data-residency, latency, operational, and testing trade-offs before choosing multi-region.
+relatedLessons:
+  - 08-08-disaster-recovery
+  - 08-09-backups-rpo-rto
+  - 07-03-consensus-and-raft-intuition
+---
+
+# Multi-Region and Region Failover
+
+> A second region changes failure and consistency boundaries; active/passive simplifies ownership, while active/active lowers some latency and RTO at the cost of conflict, routing, and operational complexity.
+
+## Why This Exists
+
+A regional outage can remove compute, storage, network, and control-plane access together. A single-region multi-zone design may not meet the business RTO. The naive answer is “run the same stack in two regions and route users to the nearest one.” If both regions accept writes without a conflict policy, a partition creates divergent orders, inventory, or ledger entries; if the standby is cold, traffic fails over faster on paper than it can actually serve.
+
+Multi-region is a set of explicit choices: where reads/writes go, how data replicates, who owns each key, how the old region is fenced, what stale/partial service is allowed, and how operators validate/fail back. Geography adds latency and data-residency constraints; it does not remove distributed-systems trade-offs.
+
+## Mental Model
+
+### Active/passive
+
+```text
+users → routing → Region A (writer/serving)
+                    │ async/sync replication
+              Region B (warm/cold standby)
+```
+
+One region is authoritative for writes. On failure, fence A, promote B at a known replication point, shift traffic, and reconcile the RPO gap. Ownership is simpler, but failover incurs a detection/promotion/routing/warmup delay and standby capacity costs.
+
+### Active/active
+
+```text
+users ──geo/latency routing──> Region A ↔ replicated state ↔ Region B
+         key/tenant ownership or conflict-free writes
+```
+
+Both regions serve normal traffic. Writes need a conflict strategy: single-home a key/tenant, use synchronous quorum (with latency/availability cost), use last-writer/merge semantics where safe, or redesign as an append/CRDT workflow. Active/active reduces some failover load but increases correctness and testing complexity.
+
+## How It Works
+
+1. Define region failure and network-partition scenarios plus RPO/RTO per data class.
+2. Choose routing (DNS/anycast/global LB), health signals, TTL/connection behavior, and drain/failover thresholds.
+3. Define data replication: synchronous/asynchronous, log/CDC, conflict/version handling, and lag visibility.
+4. Define write ownership and fencing. A region that loses quorum/connectivity must stop authoritative writes before another region takes over.
+5. Keep configuration, identity, secrets, queues, schemas, and observability available in the recovery plane.
+6. Fail over gradually: declare, fence old region, promote/choose owners, validate data/capacity, route traffic, and reconcile ambiguous work.
+7. Plan failback as a new migration: replicate newer writes, validate, drain, transfer ownership, then re-open the old region.
+
+Geo-routing is not a consistency protocol. DNS caches and existing connections delay movement; health checks are sampled and may disagree. The data plane must remain safe if routing is stale.
+
+## Example
+
+A global ticketing service chooses active/passive for inventory because overselling is unacceptable and booking writes are concentrated in one home region per event. Catalog reads are served from both regions via asynchronous replication. If Region A fails, the control plane fences A's booking writer, waits until B's inventory log reaches a safe point, promotes B, updates routing, and admits bookings gradually. The RPO may be a few seconds; customers see a temporary read-only/queue state while ownership changes.
+
+An active/active social feed can home user writes by region and merge append-only posts; feed projections tolerate lag. It should not use the same topology for a strongly serialized wallet ledger without a cross-region quorum/ledger design. One topology does not fit every data class.
+
+## Visualization We Eventually Want
+
+Show two regions, routing, data streams, write owners, lag, and user traffic. Controls should toggle active/passive versus active/active, replication mode/lag, DNS TTL, health thresholds, data residency, key ownership, partition/conflict policy, standby capacity, and region failure. Display RPO gap, RTO phases, stale reads, rejected writes, conflict count, capacity after failover, and reconciliation status. Presets should compare a single-region outage, cross-region partition, and planned failover/failback.
+
+## Scaling Behavior
+
+Cross-region synchronous writes pay round-trip latency and can lose availability during partitions. Asynchronous replication scales better but increases lag and recovery loss. Active/active doubles normal serving capacity but may require per-key routing, conflict indexes, duplicate queues, and global observability.
+
+Routing and failover traffic can overwhelm the target region if it was sized only for normal local load. Reserve capacity or shed/degrade noncritical work. More regions multiply deployment, schema, secrets, runbook, and drill combinations; start with the minimum topology that meets objectives.
+
+## Failure Modes
+
+- **Split brain:** both regions accept writes after a partition or stale routing.
+- **Replication lag:** promoted region is behind the RPO or misses dependent events.
+- **Conflict loss:** last-writer-wins silently overwrites inventory/ledger state.
+- **DNS/connection inertia:** users continue reaching the failed region after routing changes.
+- **Target overload:** all traffic shifts to a warm/cold region without enough capacity.
+- **Control-plane dependence:** routing/promote/secret systems fail with the primary region.
+- **Data residency violation:** replication or failover moves data outside permitted boundaries.
+- **Failback loss:** newer writes are overwritten when the old region returns.
+
+## Trade-offs
+
+Active/passive is easier to reason about and avoids concurrent writes but costs standby capacity and has failover downtime/RPO. Active/active improves normal latency and can reduce RTO but requires conflict/ownership semantics, more operations, and broader testing. Synchronous cross-region replication lowers RPO but adds latency/partition unavailability; asynchronous replication improves availability but loses recent writes on failover. Geo-routing improves locality but does not guarantee immediate or consistent movement.
+
+## Alternatives
+
+- **Single region, multi-zone HA:** prefer when regional failure is outside the target and lower complexity matters.
+- **Backup/restore or pilot light:** prefer for relaxed RTO/RPO and rebuildable data.
+- **Active/passive warm standby:** prefer for strong single-writer invariants and predictable recovery.
+- **Partitioned active/active:** prefer when tenants/keys can be assigned one owner and cross-owner writes are rare.
+- **Global strongly consistent database:** consider when the business can pay latency/cost for a provider-managed consistency model; still test region failure and backups.
+
+## When to Use
+
+Use multi-region only when a business RTO/RPO, latency, residency, or regional-availability requirement justifies its complexity. For every data class, specify topology, writer ownership, replication lag, failover fencing, routing, and conflict/reconciliation policy.
+
+## When Not to Use
+
+Do not duplicate stateless servers into a second region without a data/recovery plan. Avoid active/active for a strictly serialized invariant unless the protocol and cost are understood. Do not choose regions as a prestige signal when tested backup/restore meets the target.
+
+## Common Misconceptions
+
+- **“Active/active means no downtime.”** Routing, data promotion, capacity, and dependencies still fail.
+- **“Nearest region is always best.”** Latency may conflict with consistency, residency, and ownership.
+- **“Async replication means zero data loss.”** Promotion can lose the lag window.
+- **“DNS failover is fencing.”** It does not stop the old region from accepting stale writes.
+- **“Same code/config means same service.”** Capacity, secrets, queues, schema, and operator access must be ready too.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I choose active/passive or active/active from explicit RPO/RTO, latency, residency, and conflict requirements. Active/passive keeps one writer and simplifies correctness but incurs promotion time and standby cost. Active/active improves locality/availability only when ownership or conflict resolution is safe. Failover fences the old region, validates replication/capacity/dependencies, shifts traffic gradually, and reconciles the lag window; DNS alone is not enough.
+
+### When to Introduce It
+
+Introduce multi-region after quantifying the regional failure requirement and data invariants. Start by choosing which data can be rebuilt or stale, then choose topology per workload.
+
+### Common Follow-Ups
+
+- What happens to a write during cross-region partition?
+- How do you fence the old writer?
+- What is the RPO at promotion and how is lag measured?
+- Can the target region carry 100% traffic plus recovery work?
+
+### Common Candidate Mistakes
+
+- Saying “active/active” without conflict/ownership rules.
+- Ignoring DNS cache/connection and control-plane delays.
+- Failing over a database without queue/idempotency reconciliation.
+- Assuming a warm standby is production-capacity equivalent.
+
+## Summary
+
+Multi-region is a consistency and recovery decision, not just duplicated infrastructure. Active/passive favors single-writer correctness and simpler failover; active/active favors locality/availability with higher conflict and operations cost. Define replication, ownership, fencing, routing, capacity, RPO/RTO, and failback—and rehearse them.
+
+## Quiz Seeds
+
+1. Why can active/active oversell inventory during a partition?
+2. Which RPO does asynchronous replication impose on promotion?
+3. What must happen before a standby region accepts writes?
+4. Why is DNS failover not an ownership/fencing mechanism?
+5. When is active/passive a better choice than active/active?
+6. Which data could be active/active while a wallet ledger remains single-home?
+7. What capacity must the target region reserve for failover and replay?
+
+## Related Topics
+
+- [Disaster Recovery](./disaster-recovery.mdx)
+- [Backups, RPO, RTO, and Restore Validation](./backups-rpo-rto.mdx)
+- [Health Checks and Failover](../03-traffic-and-services/health-checks-and-failover.mdx)
+- [Consensus and Raft Intuition](../07-distributed-coordination/consensus-and-raft-intuition.mdx)
+
+## References
+
+### Documentation / Articles
+
+- [Disaster recovery architecture on AWS: Strategies for recovery](https://aws.amazon.com/blogs/architecture/disaster-recovery-dr-architecture-on-aws-part-i-strategies-for-recovery-in-the-cloud/) — compares multi-site active/passive/active-active recovery strategies and their RPO/RTO implications.
+- [Amazon Route 53 health checks and DNS failover](https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/dns-failover.html) — documents health-based DNS routing while illustrating why TTL/cache behavior matters.
+- [Disaster recovery planning guide](https://cloud.google.com/architecture/dr-scenarios-planning-guide) — Google Cloud guidance for regional failure scenarios, replication, and recovery testing.
+- [PostgreSQL Logical Replication Failover](https://www.postgresql.org/docs/17/logical-replication-failover.html) — concrete documentation for preparing logical replication subscribers for publisher failover.
+- [Spanner instance configurations](https://cloud.google.com/spanner/docs/instance-configurations) — a provider example of regional/multi-region placement and latency/availability trade-offs.
+
+### Papers
+
+- [Managing Critical State: Distributed Consensus for Reliability](https://sre.google/sre-book/managing-critical-state/) — explains quorum/consensus considerations when failover must preserve authoritative state.

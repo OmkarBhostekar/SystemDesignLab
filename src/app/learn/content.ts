@@ -20,7 +20,7 @@ import {
 /**
  * Content is authored on disk and indexed deterministically at build time.
  * React's request/build cache prevents each route segment from reparsing the
- * same 29 records while preserving a synchronous, testable loader contract.
+ * same production records while preserving a synchronous, testable loader contract.
  */
 export const getReaderIndex = cache((): ContentIndex => loadContentIndex());
 

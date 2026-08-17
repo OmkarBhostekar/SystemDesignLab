@@ -1,0 +1,165 @@
+---
+type: lesson
+id: 05-05-eviction-and-ttl
+slug: eviction-and-ttl
+title: Eviction and TTL
+description: Match expiration and memory-eviction policies to workload reuse, freshness, and bounded cache capacity.
+module: caching
+order: 5
+difficulty: core
+estimatedMinutes: 30
+prerequisites:
+  - 05-03-cache-aside
+  - 05-02-local-and-distributed-cache
+  - 01-03-latency-vs-throughput
+tags:
+  - ttl
+  - eviction
+  - lru
+  - lfu
+  - cache-capacity
+objectives:
+  - Distinguish time-based expiration from capacity-based eviction.
+  - Explain when LRU, LFU, random, and no-eviction policies fit different access patterns.
+  - Estimate cache memory from distinct keys, value size, metadata, and replication.
+  - Reason about expiry bursts, memory pressure, and stale-data bounds.
+relatedLessons:
+  - 05-06-cache-invalidation
+  - 05-07-cache-stampede
+  - 05-08-hot-keys
+---
+
+# Eviction and TTL
+
+> TTL answers “when is this value no longer acceptable?” while eviction answers “which value leaves when memory cannot hold everything?”
+
+## Why This Exists
+
+A cache has finite memory. The naive policy stores every response forever, eventually failing writes or consuming memory needed by the process. Adding TTL bounds staleness but does not guarantee memory fits; a large cold key can still displace a frequently used key. Capacity eviction is the improvement, and the new trade-off is that a cache miss can happen for either a freshness reason or a capacity reason.
+
+## Mental Model
+
+```text
+entry admitted → fresh until TTL → expired/reload
+       │
+       └── memory pressure → eviction candidate → miss/reload
+```
+
+TTL is usually attached to an entry and measured from a write or refresh. Eviction is a policy over all resident entries. LRU favors recent access, LFU favors repeated access, random avoids tracking cost, and no-eviction preserves existing entries by rejecting new writes. “Expired” and “evicted” should be separate metrics because their mitigations differ.
+
+## How It Works
+
+Let `D` be distinct keys touched during a TTL window, `V` average value bytes, `K` key bytes, and `m` metadata/allocator overhead:
+
+```text
+memory ≈ D × (K + V) × (1 + m) × replica count
+```
+
+This is a sizing estimate, not a guarantee. Large-value variance, fragmentation, expiration metadata, and failover headroom can dominate. TTL does not mean the server removes the entry at the exact second; many systems use active and lazy expiration, so the effective memory and stale behavior need measurement.
+
+If the workload follows a skewed popularity distribution, LRU often retains a useful recency window. LFU can keep a long-lived popular key even after a traffic pattern changes, so decay or bounded history matters. Random eviction can be acceptable when all keys have similar reuse. A `volatile-*` policy that considers only expiring keys can behave like no-eviction if many keys lack TTL.
+
+## Example
+
+An autocomplete service caches 5 million prefixes with average 400-byte values and 25% metadata overhead. A first estimate is about `5,000,000 × 400 × 1.25 = 2.5 GB`, before key bytes, replicas, and safety headroom. A 10-minute TTL limits stale suggestions, while `allkeys-lfu` can preserve popular prefixes under a scan of one-off prefixes. If the cache is full, monitor evictions and source miss QPS rather than declaring the TTL “working.”
+
+The naive fixed TTL of 60 seconds expires a huge cohort created by a deploy at the same time. Jittering each TTL reduces synchronization but changes the exact freshness bound, so choose the jitter range within the product's allowed staleness window.
+
+## Visualization We Eventually Want
+
+Build an **Eviction Policy Playground** with a fixed memory budget and replayable key-access trace. Controls should include key popularity distribution, value-size distribution, TTL, policy, cache capacity, expiry jitter, and workload phase change. Show resident keys, hit ratio, expiry misses, capacity evictions by policy, rejected writes, memory overhead, and source QPS. A preset should switch from one hot set to another so learners see LRU and LFU adaptation differences.
+
+## Scaling Behavior
+
+More keys or larger values increase memory linearly until metadata and fragmentation become material. More replicas multiply physical memory. Increasing TTL can improve hits for reusable keys but expands the resident set and stale window. Sharding increases aggregate capacity but requires topology, rebalancing, and hot-key analysis. Track resident bytes, fragmentation, TTL distribution, eviction rate, expiry rate, hit ratio by key class, and source load after evictions.
+
+## Failure Modes
+
+- Expiry cohort causes a synchronized miss burst.
+- A capacity policy evicts hot values, creating churn and source overload.
+- No-eviction rejects fills and silently turns expected hits into misses.
+- TTL is longer than a business freshness bound, so stale data persists.
+- A large value or tenant monopolizes memory.
+- Clock or expiration behavior differs across layers, creating surprising effective TTL.
+
+Mitigate with capacity headroom, size limits, TTL jitter, per-tenant quotas, hot-key protection, and alerts on evictions/rejections rather than only memory percentage.
+
+## Trade-offs
+
+Short TTL lowers staleness and memory residence but increases source traffic. Long TTL improves hit rate but requires reliable invalidation. LRU is simple and often robust for recency-heavy reuse; LFU can protect stable popularity but adapt slowly; random saves policy overhead but may waste useful entries. No-eviction avoids unexpected deletion but makes admission failures visible as write errors.
+
+## Alternatives
+
+- **Explicit invalidation with long TTL:** high hit rate when writes can identify all dependent keys.
+- **Versioned immutable keys:** avoid in-place invalidation for published assets; garbage-collect old versions later.
+- **Bounded read model:** store only the active tenant or time window in a purpose-built database.
+- **Disk-backed cache:** increase capacity for warm but less latency-sensitive data at the cost of slower reads.
+
+## When to Use
+
+Use TTL when a maximum stale window is easy to state or as a safety net around invalidation. Choose eviction from measured reuse and value size. Size for warm operation plus cold-start and failover headroom.
+
+## When Not to Use
+
+Do not treat TTL as a correctness mechanism for values that require immediate visibility. Do not choose LRU or LFU by habit when all accesses are unique, and do not enable eviction for data whose loss is unacceptable unless the application can reload it.
+
+## Common Misconceptions
+
+- **TTL and eviction are the same.** TTL is time eligibility; eviction is capacity admission.
+- **A 60-second TTL means exactly 60 seconds of residency.** Expiration can be lazy, early due to eviction, or refreshed.
+- **LFU always beats LRU.** Workload phase changes and counters affect the result.
+- **No evictions means no cache failure.** Memory pressure can reject writes or exhaust the process.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> TTL bounds freshness and limits how long an entry is eligible to remain, while eviction chooses what to remove when finite memory fills. I size from distinct keys, value and metadata bytes, replicas, and headroom, then select LRU, LFU, random, or no-eviction from access behavior. I watch expiry and capacity evictions separately and add jitter or invalidation to avoid synchronized misses.
+
+### When to Introduce It
+
+Introduce TTL and eviction after stating freshness tolerance, working-set size, value variance, and what the application does on a miss.
+
+### Common Follow-Ups
+
+- How do you prevent a synchronized expiry burst?
+- What if the working set is larger than memory?
+- Which metrics show churn?
+- Why might no-eviction be safer for a mixed-use store?
+
+### Common Candidate Mistakes
+
+They use one global TTL, ignore entry overhead and replicas, and conflate a cache eviction with data loss when the source is authoritative.
+
+## Summary
+
+- TTL and eviction solve different constraints: freshness versus finite capacity.
+- Size for keys, values, metadata, replicas, fragmentation, and failure headroom.
+- LRU, LFU, random, and no-eviction encode workload assumptions.
+- Measure expiration, eviction, rejection, hit ratio, and source impact separately.
+
+## Quiz Seeds
+
+1. Why can a cache with a TTL still run out of memory?
+2. Estimate memory for 2 million 1 KB entries with 30% overhead and two replicas.
+3. Which policy is likely to retain a stable popular key across a scan of one-off keys: LRU or LFU? What is the trade-off?
+4. Why does TTL jitter reduce load bursts?
+5. What is the difference between an expired entry and a capacity-evicted entry operationally?
+6. Why can a volatile-only eviction policy behave like no-eviction?
+7. Which value class should use immutable versioned keys instead of short TTLs?
+
+## Related Topics
+
+- [Cache invalidation](cache-invalidation.mdx) reduces stale windows without waiting for TTL.
+- [Cache stampede](cache-stampede.mdx) handles synchronized expiry and miss coordination.
+- [Hot keys](hot-keys.mdx) explains skewed access and per-key overload.
+- [Cache-aside](cache-aside.mdx) defines what a miss does.
+
+## References
+
+### Documentation / Articles
+
+- [Key eviction](https://redis.io/docs/latest/develop/reference/eviction/) — documents memory limits and LRU, LFU, random, TTL, and no-eviction policies.
+- [Data eviction policies](https://redis.io/docs/latest/operate/rc/databases/configuration/data-eviction-policies/) — explains policy choices and replication considerations in managed Redis.
+- [Caching strategies for Memcached](https://docs.aws.amazon.com/AmazonElastiCache/latest/dg/Strategies.html) — shows TTL and lazy-loading behavior in a cache integration.
+- [Cache-Control header](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Cache-Control) — provides the HTTP analogue for max-age and stale windows.

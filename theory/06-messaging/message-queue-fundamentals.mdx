@@ -1,0 +1,167 @@
+---
+type: lesson
+id: 06-02-message-queue-fundamentals
+slug: message-queue-fundamentals
+title: Message Queue Fundamentals
+description: Model producers, brokers, queues, consumers, acknowledgments, visibility, retention, and durable work ownership.
+module: messaging
+order: 2
+difficulty: core
+estimatedMinutes: 35
+prerequisites:
+  - 06-01-sync-vs-async
+  - 01-03-latency-vs-throughput
+  - 02-04-http-evolution
+tags:
+  - message-queue
+  - broker
+  - acknowledgment
+  - visibility-timeout
+  - retention
+objectives:
+  - Describe the lifecycle of a message from publish through processing and acknowledgment.
+  - Distinguish durable retention from in-flight visibility and consumer ownership.
+  - Explain how crashes and acknowledgment timing create redelivery or loss.
+  - Choose queue settings for a concrete job workload and state their limits.
+relatedLessons:
+  - 06-03-pub-sub-and-topics
+  - 06-06-delivery-semantics
+  - 06-08-dead-letter-queues
+  - 06-09-backpressure
+---
+
+# Message Queue Fundamentals
+
+> A queue is a durable handoff and an ownership protocol: a broker retains work, gives a delivery to a consumer, and removes or re-delivers it according to acknowledgment rules.
+
+## Why This Exists
+
+The naive worker pool reads jobs directly from a database table and marks rows complete. Polling contention, lock duration, retry scans, and accidental deletion make ownership hard to reason about. A queue makes the handoff explicit, but it does not decide whether a job's side effect is duplicate-safe or whether the broker's retention is long enough.
+
+## Mental Model
+
+```text
+producer → broker/queue → delivery (in flight) → consumer
+                              │                     │
+                       visibility lease       ack / nack / timeout
+                              └──────────────→ retain, retry, or dead-letter
+```
+
+Important terms:
+
+- **Retention:** how long an unconsumed message remains available.
+- **Delivery:** a broker gives one consumer a message, often without removing it permanently.
+- **Visibility timeout or lease:** a period during which the delivery is hidden from other consumers.
+- **Acknowledgment:** consumer confirmation that processing reached the chosen boundary.
+- **Redelivery:** the broker offers work again after a timeout, nack, or connection loss.
+
+## How It Works
+
+A producer publishes a message and waits for a broker acknowledgment or publisher confirm if it needs to know the broker accepted the data. A consumer receives the message, performs work, and acknowledges only after the required side effect is durable. If the process crashes before the acknowledgment, the broker can re-deliver it. If it acknowledges before the side effect, the message may be lost from the queue.
+
+Visibility must exceed normal processing time with headroom, but an excessively long lease delays recovery after a crash. Long jobs can extend their lease or be broken into smaller commands. A queue can be push-based, pull-based, or log-based; the contract matters more than the API shape.
+
+## Example
+
+An invoice-rendering queue retains commands for 24 hours. A worker receives `invoice_id=9`, the message becomes invisible for 2 minutes, renders a PDF into object storage, writes a durable result record, then acknowledges. If the worker crashes after upload but before ack, the message is redelivered; object storage write uses an idempotency key so the duplicate does not create an inconsistent result.
+
+The naive “ack on receive” implementation loses invoices when the worker crashes. The improvement is manual acknowledgment after durable completion. The new trade-off is redelivery after a crash point, so workers need idempotency and a DLQ for poison jobs.
+
+## Visualization We Eventually Want
+
+Build a **Queue Lifecycle Simulator** with producer, broker, consumers, visibility leases, and retention. Controls should include arrival rate, worker service time, retention, visibility timeout, ack point, crash probability, queue capacity, and retry/DLQ policy. Show available, in-flight, completed, redelivered, expired, and dead-lettered counts; backlog age; and duplicate side effects.
+
+## Scaling Behavior
+
+A single queue can become limited by broker throughput, storage, network, partition count, or consumer concurrency. More consumers reduce backlog only while work is parallelizable and downstream capacity remains. Long visibility leases increase in-flight inventory and can hit quotas. Large messages spend more bandwidth and retention storage; store large blobs separately and queue references.
+
+## Failure Modes
+
+- Publish acknowledgment is lost, so the producer retries and may duplicate a message.
+- Consumer crashes after side effect but before ack, causing redelivery.
+- Visibility timeout is too short, so two consumers process one job concurrently.
+- Visibility timeout is too long, so failed jobs wait too long to retry.
+- Retention expires before workers recover.
+- A poison message loops forever and blocks or consumes all worker capacity.
+
+Use publisher confirms, durable retention, manual acknowledgments, idempotent handlers, bounded retries, DLQs, and queue-age alerts.
+
+## Trade-offs
+
+Queues decouple producer and consumer timing, absorb bursts for a finite period, and make retry/ownership visible. They add storage cost, backlog latency, duplicate delivery, operational capacity, and a new failure domain. A queue that preserves every message forever behaves more like a log and needs retention/replay governance.
+
+## Alternatives
+
+- **Database outbox plus poller:** durable with local transaction, but polling and cleanup add load.
+- **Stream/log:** replayable, partitioned history for many consumers; consumers manage offsets.
+- **In-process work queue:** low overhead but lost on process failure unless the work is reconstructable.
+- **Workflow engine:** better for timers, compensation, and long-running state than a single job queue.
+
+## When to Use
+
+Use a queue for deferred work, burst absorption, retryable jobs, and ownership handoff. Define message size, retention, acknowledgment boundary, and failure behavior before choosing a product.
+
+## When Not to Use
+
+Do not use a queue as the only source of truth for critical data without durable retention and recovery. Avoid putting an unbounded stream of events into a queue whose semantics discard acknowledged messages if replay is required.
+
+## Common Misconceptions
+
+- **A received message is gone.** Many brokers keep it invisible until acknowledgment.
+- **Acknowledgment proves side effect exactly once.** It only marks the broker-side delivery boundary.
+- **Longer visibility is safer.** It delays redelivery and increases in-flight pressure.
+- **A queue guarantees order globally.** Parallel consumers, partitions, and retries can change observed order.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> A queue retains a command, hands it to a consumer under an ownership/visibility lease, and removes it only after an acknowledgment boundary. Ack after the required durable side effect; otherwise crashes can lose work, while ack-after-side-effect can redeliver duplicates. I size retention and visibility from processing time and recovery goals, then add idempotency, retry limits, and a DLQ.
+
+### When to Introduce It
+
+Introduce queue fundamentals when work can be deferred, bursts exceed worker capacity, or retries should be isolated from user requests.
+
+### Common Follow-Ups
+
+- When is the message deleted?
+- What if a worker dies after the side effect?
+- How do you size visibility timeout?
+- How long can backlog wait?
+
+### Common Candidate Mistakes
+
+They ack on receipt, confuse retention with in-flight visibility, and omit redelivery, message size, or poison-job behavior.
+
+## Summary
+
+- Retention, delivery, visibility, and acknowledgment are separate broker concepts.
+- Ack timing determines loss versus redelivery at crash points.
+- Visibility needs processing-time headroom but should not hide failures indefinitely.
+- A queue needs idempotent consumers, bounded retries, DLQs, and backlog-age monitoring.
+
+## Quiz Seeds
+
+1. What happens if a worker crashes after writing the PDF but before acknowledging?
+2. Why can a 10-second visibility timeout be unsafe for a 30-second p99 job?
+3. How do publisher confirms differ from consumer acknowledgments?
+4. What resource grows when producers outpace consumers for an hour?
+5. Why should large blobs usually be referenced rather than embedded in messages?
+6. When would a replayable log be preferable to a queue?
+7. What does an acknowledgment guarantee and what does it not guarantee?
+
+## Related Topics
+
+- [Sync versus async](sync-vs-async.mdx) motivates the durable handoff.
+- [Delivery semantics](delivery-semantics.mdx) formalizes loss and duplicate guarantees.
+- [Dead-letter queues](dead-letter-queues.mdx) handles poison and retry-exhausted work.
+- [Backpressure](backpressure.mdx) controls producer and consumer rates.
+
+## References
+
+### Documentation / Articles
+
+- [RabbitMQ reliability guide](https://www.rabbitmq.com/docs/reliability) — defines publisher confirms, consumer acknowledgments, responsibility transfer, and redelivery.
+- [RabbitMQ consumer acknowledgments and publisher confirms](https://www.rabbitmq.com/docs/next/confirms) — documents ack/nack, prefetch, and the in-flight delivery window.
+- [Amazon SQS visibility timeout](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-visibility-timeout.html) — explains invisibility, redelivery, timeout sizing, and in-flight quotas.
+- [Apache Kafka design](https://kafka.apache.org/42/design/design/) — contrasts queue-like consumption with durable log retention and delivery semantics.

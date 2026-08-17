@@ -1,0 +1,170 @@
+---
+type: lesson
+id: 05-06-cache-invalidation
+slug: cache-invalidation
+title: Cache Invalidation
+description: Coordinate changed source data and cached copies without pretending deletion, updates, or events are atomic.
+module: caching
+order: 6
+difficulty: core
+estimatedMinutes: 35
+prerequisites:
+  - 05-03-cache-aside
+  - 05-05-eviction-and-ttl
+  - 01-10-consistency-models
+tags:
+  - invalidation
+  - freshness
+  - versioning
+  - cache-consistency
+  - events
+objectives:
+  - Compare delete, update, versioned-key, namespace, and event-driven invalidation.
+  - Trace stale-write races between source commits, cache fills, and invalidation delivery.
+  - Use versions, epochs, or ordering metadata to reject older cached values.
+  - State a measurable freshness contract and its operational fallback.
+relatedLessons:
+  - 05-03-cache-aside
+  - 05-05-eviction-and-ttl
+  - 05-07-cache-stampede
+  - 06-03-pub-sub-and-topics
+  - 01-10-consistency-models
+---
+
+# Cache Invalidation
+
+> Invalidation is the protocol that makes a cached copy stop winning after the source changes; it is a distributed update problem, not a `DEL` command.
+
+## Why This Exists
+
+The naive cache-aside write path updates the database and assumes the old cache entry will expire soon. A customer changes an address, but one API instance serves the old address for the full TTL. Replacing delete with “write the new value to cache” seems better, yet concurrent fills, multiple key shapes, and failed cache writes still leave copies out of sync. The improvement is to choose an explicit invalidation mechanism and freshness bound; the new trade-off is event ordering, fan-out, and repair work.
+
+## Mental Model
+
+```text
+source commit v42 ──→ invalidation/update ──→ local/distributed copies reject v41
+       │                         │
+       └── authoritative history └── may be delayed, duplicated, or lost
+```
+
+A cache is correct for a read only relative to a declared contract: no stale data, bounded staleness, monotonic versions, or merely best effort. Deleting a key is a useful operation, but it carries no version by itself. An old reader can refill the deleted key unless the fill is ordered or version-checked.
+
+## How It Works
+
+Common approaches:
+
+| Approach | Strength | Cost |
+| --- | --- | --- |
+| Delete on write | Simple; next read reloads | Delete can fail; old fills can race |
+| Update on write | Warm and often fresh | Must compute every representation; dual-write gap |
+| Versioned keys | Old values cannot overwrite a newer namespace | Garbage collection and key indirection |
+| Namespace/epoch bump | Invalidates a whole tenant or dataset | Broad cache misses and stampede risk |
+| Change event | Decouples writers from many readers | Delivery, ordering, replay, and ownership |
+
+The source commit should establish the version before publishing an invalidation. Consumers compare `entry.version` with the current or observed epoch and refuse to install an older version. If the event stream is at-least-once, duplicate invalidations are harmless; missing events require TTL, reconciliation scans, or a source-version check.
+
+## Example
+
+An inventory service commits product quantity version 42 and emits `ProductChanged(product_id=123, version=42)` through a durable outbox. Catalog API instances remove local `product:123` entries. A reader that loaded version 41 before the commit tries to refill after the event; the cache set is conditional on version >= 42, so version 41 cannot overwrite the newer entry. Checkout still reads the inventory authority because catalog projections are intentionally stale-tolerant.
+
+The naive broad namespace bump for every catalog change invalidates millions of keys and overloads the database. The improvement is targeted keys plus a periodic reconciliation scan. The new trade-off is more dependency mapping: a product update may affect product, category, search, and recommendation keys.
+
+## Visualization We Eventually Want
+
+Build an **Invalidation Race Simulator** with source, writer, cache nodes, local copies, and an event bus. Let learners schedule commit, fill, delete, update, duplicate, delayed, and lost invalidation events. Controls should include version checks, TTL, namespace scope, event lag, and reconciliation interval. Show stale-read age, rejected old fills, cache miss bursts, event backlog, and convergence time.
+
+## Scaling Behavior
+
+Invalidation fan-out grows with the number of readers, regions, derived projections, and affected keys. Per-key events are precise but numerous; namespace epochs are compact but cause broad misses. Multi-region invalidation adds propagation delay and partitions. Keep invalidation payloads small, partition by entity, retain events long enough to replay, and measure freshness by key class rather than only event delivery success.
+
+## Failure Modes
+
+- Delete/update fails after a source commit.
+- Event is duplicated, delayed, reordered, or lost.
+- A stale fill arrives after a newer invalidation.
+- A namespace bump creates a cold-cache storm.
+- One consumer is offline and resumes with an old cache.
+- A derived key is not listed in the invalidation dependency graph.
+
+Use durable outbox or CDC, idempotent consumers, version checks, TTL safety bounds, repair scans, and metrics for cache age and event-to-visibility lag.
+
+## Trade-offs
+
+Delete is simple but causes a miss and depends on a later load. Update keeps a key warm but couples the writer to representation and cache availability. Versioned keys simplify ordering at the cost of indirection and garbage collection. Event-driven invalidation scales fan-out and decouples services but requires delivery, replay, schema, and observability. A shorter TTL reduces the impact of missed invalidations while increasing source load.
+
+## Alternatives
+
+- **Read-through validation:** attach a source version or ETag and revalidate before serving sensitive data.
+- **Immutable content-addressed objects:** avoid invalidating published bytes; change the pointer.
+- **No cache for mutable authority:** pay source latency to remove an invalidation problem.
+- **Transactional outbox or CDC:** make source-change publication recoverable rather than a best-effort dual write.
+
+## When to Use
+
+Use targeted invalidation when data changes are identifiable and stale windows matter. Use versioning when concurrent writers or multiple representations make deletes unsafe. Use namespace epochs for tenant/configuration changes where broad invalidation is acceptable and warm-up is controlled.
+
+## When Not to Use
+
+Do not promise immediate global freshness from an asynchronous invalidation bus without measuring propagation and repair. Do not invalidate every cache key on every write when a projection or versioned pointer can narrow the blast radius.
+
+## Common Misconceptions
+
+- **Delete is atomic with the database.** It is a separate operation that can fail and race.
+- **An event means every copy is fresh.** Consumers may be offline or process events out of order.
+- **TTL solves invalidation.** It bounds damage but may violate a stricter freshness requirement.
+- **Updating one key updates every representation.** Query parameters, locales, tenants, and derived lists create multiple keys.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I define the source commit version and the freshness contract first. Then I choose delete, update, versioned keys, namespace epochs, or change events. Because invalidation can be delayed, duplicated, or lost, I use idempotent consumers, version checks, TTL safety bounds, and reconciliation. I avoid claiming atomic cache/database consistency unless a real transaction or validation protocol spans the boundary.
+
+### When to Introduce It
+
+Introduce invalidation when a write can make a cached response wrong before TTL and the user or business process cares about that window.
+
+### Common Follow-Ups
+
+- How do you handle an invalidation event that is lost?
+- What if a stale reader refills after deletion?
+- How do you invalidate lists and derived projections?
+- What does the client see while replicas converge?
+
+### Common Candidate Mistakes
+
+They draw a cache delete as part of the database transaction, ignore old-fill races, and use a global flush as the default repair strategy.
+
+## Summary
+
+- Invalidation is a distributed protocol with ordering and recovery costs.
+- Source versions, epochs, and conditional writes prevent old data from winning races.
+- Events need idempotency, retention, replay, and reconciliation; TTL is a safety bound.
+- Broad invalidation trades implementation simplicity for cold-cache load.
+
+## Quiz Seeds
+
+1. Why can a stale read refill a key after a writer deletes it?
+2. What fields would you include in a versioned invalidation event?
+3. How does a namespace bump differ from targeted invalidation operationally?
+4. What can repair a missed invalidation event?
+5. Why are duplicate invalidation events usually safer than duplicate cache updates?
+6. A product update affects a product page, category list, and search result. How do you discover and bound the dependency graph?
+7. Which freshness metric is more useful than “event successfully published”?
+
+## Related Topics
+
+- [Cache-aside](cache-aside.mdx) defines the source-first write baseline.
+- [Eviction and TTL](eviction-and-ttl.mdx) supplies safety bounds and expiry behavior.
+- [Cache stampede](cache-stampede.mdx) explains the load caused by broad expiry.
+- [Pub/sub and topics](../06-messaging/pub-sub-and-topics.mdx) provides an event fan-out mechanism.
+- [Consistency models](../01-foundations/consistency-models.mdx) frames freshness promises.
+
+## References
+
+### Documentation / Articles
+
+- [Redis client-side caching](https://redis.io/docs/latest/develop/clients/client-side-caching/) — describes server-assisted invalidation and the requirement that clients evict stale local copies.
+- [Database caching strategies using Redis](https://docs.aws.amazon.com/whitepapers/latest/database-caching-strategies-using-redis/caching-patterns.html) — grounds cache validity and explicit expiration choices.
+- [HTTP caching](https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/Caching) — explains validators, revalidation, and cache freshness at HTTP boundaries.
+- [HTTP caching (RFC 9111)](https://www.rfc-editor.org/rfc/rfc9111.html) — provides the protocol-level definitions for freshness, validation, and stored responses.

@@ -1,0 +1,193 @@
+---
+type: lesson
+id: 04-09-partitioning-and-sharding
+slug: partitioning-and-sharding
+title: Partitioning and Sharding
+description: Split a dataset across owners for scale while controlling routing, rebalancing, cross-shard work, and hot partitions.
+module: databases
+order: 9
+difficulty: core
+estimatedMinutes: 45
+prerequisites:
+  - 04-01-data-modeling-from-access-patterns
+  - 04-08-replication
+  - 01-02-horizontal-vs-vertical-scaling
+  - 03-02-load-balancing-algorithms
+tags:
+  - partitioning
+  - sharding
+  - rebalancing
+  - hot-partitions
+  - routing
+objectives:
+  - Compare range, hash, and directory-based partitioning against workload and query shape.
+  - Choose a partition key with distribution, locality, growth, and transaction scope in mind.
+  - Describe routing, migration, cutover, and rebalancing without losing writes or serving duplicates.
+  - Diagnose hot partitions and cross-shard fan-out as separate scaling problems.
+relatedLessons:
+  - 04-10-consistent-hashing
+  - 04-08-replication
+  - 04-01-data-modeling-from-access-patterns
+  - 01-02-horizontal-vs-vertical-scaling
+---
+
+# Partitioning and Sharding
+
+> Partitioning changes who owns a slice of data; a successful shard design makes ownership, routing, movement, and cross-slice behavior explicit.
+
+## Why This Exists
+
+A single database can run out of storage, I/O, CPU, connections, or write capacity even after vertical scaling and indexes. The naive horizontal design adds nodes but sends every request to every node. That is replication or fan-out, not partitioning. The improvement assigns each key/range to an owner so aggregate capacity grows with partitions. The new trade-off is routing, rebalancing, hot keys, cross-shard queries, and a harder transaction boundary.
+
+“Partitioning” can mean splitting tables inside one database; “sharding” usually means distributing ownership across independent database instances. The mechanics and guarantees differ, but the reasoning is the same: choose a partition key and make its worst-case behavior survivable.
+
+## Mental Model
+
+| Strategy | Ownership rule | Strength | Risk |
+| --- | --- | --- | --- |
+| Range | Key interval, such as tenant ID or time | Range scans and locality; easy to split an interval | Sequential writes/hot ranges; uneven historical data |
+| Hash | `hash(key)` bucket/range | Even distribution for point keys | Range queries fan out; changing bucket count needs movement |
+| Directory | Lookup maps logical key to physical shard | Flexible moves, tenant placement, exceptions | Directory availability/consistency and an extra lookup |
+| Composite/bucketed | Hash/tenant plus time or salt | Balances skew while preserving bounded locality | Reads may fan out across buckets; more write/read coordination |
+
+The key has at least four jobs: distribute traffic/bytes, keep related records local, support the dominant query, and define the transaction owner. A key that is “uniform” on average can still concentrate a celebrity tenant or current time bucket.
+
+## How It Works
+
+A routed request typically follows:
+
+```text
+logical key → partition map/hash → owner shard → local index/transaction
+```
+
+The map may be static configuration, a metadata service, a directory table, or a ring. Every shard usually has its own replicas; partitioning and replication solve different problems. A query without a shard key becomes scatter-gather: route to many owners, run local work, merge/sort, and tolerate the slowest response.
+
+Rebalancing is a data migration protocol, not a metadata edit. A safe high-level sequence is:
+
+1. Define the new ownership and reserve capacity.
+2. Copy a snapshot/range while tracking changes after the snapshot.
+3. Stream or dual-write the delta, verify checksums/counts/versions, and monitor source/destination load.
+4. Cut over routing at a versioned boundary, with idempotent writes and a rollback/fence plan.
+5. Drain old ownership and reclaim data only after readers and replicas are safe.
+
+The exact order differs by engine. A “dual write” can lose or duplicate updates without an ordering/version protocol; a cutover should not claim zero downtime without defining in-flight requests and retries.
+
+## Example
+
+An event platform stores events for many tenants and needs “latest events for tenant T” plus “events across all tenants in a time interval.”
+
+The naive range key `event_time` makes the current time range the hot partition: all writers hit today’s shard. Pure hash on `tenant_id` balances tenants, but one enterprise tenant can still dominate and a global time query fans out to every shard. A first improvement uses `(hash(tenant_id), time_bucket)` and a bounded bucket. If one tenant is still hot, split it into salted sub-buckets or assign it to multiple directory entries. Reads for that tenant now fan out across salts and merge by time.
+
+Suppose a new shard is added. With a directory, move tenant T during a bounded migration and route new writes by a version. With range partitioning, split the largest interval and stream half the rows. During either migration, the service must handle a write racing a copy, a retry sent to the old owner, and a reader seeing source plus destination. Versioned records/idempotent writes and a cutover fence are more meaningful than simply saying “re-shard online.”
+
+## Visualization We Eventually Want
+
+Build a **shard map and migration simulator**. Let learners choose range/hash/directory/composite keys, node count, tenant/time skew, request mix, shard capacity, replication factor, and migration bandwidth.
+
+Show ownership, partition bytes/QPS, hotness, scatter-gather fan-out, p50/p99 latency, migration backlog, dual-write conflicts, and data verified/cut over. Presets should include a hot current range, one celebrity tenant, node add/remove, and a failed migration destination. Let the learner pause before cutover, replay a write, and roll back; provide a text event log, keyboard controls, and reduced-motion mode.
+
+## Scaling Behavior
+
+Partitioning increases aggregate capacity only when requests are routable and load is balanced. More shards also mean more connections, replicas, metadata, operational units, and possible fan-out. Small shards make movement and hotspots manageable but increase routing/metadata overhead; large shards reduce overhead but make recovery/rebalance slower.
+
+Plan for growth in both data and traffic. A partition that is balanced today can become hot after a tenant or time-window surge. Estimate migration duration from bytes and sustained safe bandwidth, then reserve headroom for foreground traffic and replication. Cross-shard transactions and global uniqueness need an owner, coordination protocol, or a different key/model.
+
+## Failure Modes
+
+- **Hot partition:** One key/range saturates while other shards are idle.
+- **Scatter-gather tail:** A query waits for the slowest of many shards and multiplies failure probability.
+- **Map inconsistency:** Routers disagree after a move, causing misses, duplicates, or writes to stale ownership.
+- **Migration write loss:** Snapshot copy misses a concurrent write or dual writes arrive out of order.
+- **Rebalance storm:** Moving data consumes the I/O/network needed by foreground requests.
+- **Cross-shard invariant:** A transaction/unique constraint spans owners with no safe protocol.
+- **Shard failure:** One shard's replicas fail while unrelated shards remain healthy; blast radius is uneven.
+
+Mitigate with skew tests, bounded partitions, versioned metadata, idempotent/versioned writes, migration throttling, per-shard SLOs, and explicit degraded behavior for fan-out.
+
+## Trade-offs
+
+Sharding increases aggregate storage/write capacity and can isolate tenants or failure domains. It costs routing, metadata, migrations, cross-shard queries/transactions, uneven recovery, and operational complexity. Range favors locality and scans; hash favors distribution. Directory placement gives control but creates a metadata dependency. Bucketing/salting reduces hotspots but increases read fan-out and merge work.
+
+## Alternatives
+
+- **Vertical scaling/indexing:** Prefer while one owner has headroom and the bottleneck is not fundamental.
+- **Read replicas:** Prefer for read pressure with one write owner; they do not solve write hot spots.
+- **Consistent hashing:** Prefer when nodes change and minimizing remapping matters; still plan for hot keys.
+- **Tenant isolation:** Give very large tenants dedicated shards or clusters when predictable blast radius matters.
+- **Archive/time-series store:** Move old or append-only data rather than keeping every epoch in the hot OLTP shard.
+
+## When to Use
+
+Use partitioning when a measured single-owner limit remains after access-pattern/index fixes and the workload has a key that can route the critical path. State the largest key, fan-out cases, migration plan, and transaction scope.
+
+## When Not to Use
+
+Do not shard before identifying a stable ownership key, or solely to look scalable. Do not use hash partitioning when the main query is an unbounded range unless a deliberate fan-out/secondary model is affordable.
+
+## Common Misconceptions
+
+- **More shards always mean more throughput.** Hot keys, routing, fan-out, and shared dependencies can dominate.
+- **Sharding is replication.** Sharding divides ownership; replication makes copies for availability/read scale.
+- **Changing a modulo count is a harmless scale event.** It can move most keys and cause a cache/data storm.
+- **Online migration means no risk.** Copy/delta/cutover ordering, retries, and rollback still need design.
+- **A uniform hash solves all skew.** Entity popularity and request cost can be non-uniform even with uniform keys.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I shard only after measuring a single-owner limit and writing the access patterns. I choose range for locality/scans, hash for point-key distribution, or a directory for controlled placement, then state the worst hot key, fan-out behavior, transaction owner, and rebalancing protocol. Migration is snapshot plus change tracking, verification, versioned cutover, and safe cleanup—not just moving a metadata entry.
+
+### When to Introduce It
+
+Introduce sharding when data, writes, or recovery exceed one owner after indexing/replication, and the access path has a routable key.
+
+### Common Follow-Ups
+
+- What is the partition key and worst-case skew?
+- How does a global query work?
+- How do you move a live tenant/range?
+- What happens to a write during cutover?
+- Which invariant or uniqueness check crosses shards?
+
+### Common Candidate Mistakes
+
+- Saying “hash by ID” without analyzing range queries and hot entities.
+- Confusing replicas with shards.
+- Ignoring metadata availability and migration load.
+- Claiming global transactions/uniqueness without a protocol.
+- Using average partition size instead of the largest and hottest case.
+
+## Summary
+
+- A shard is an ownership and routing boundary, not merely another database node.
+- Range, hash, and directory strategies trade locality, distribution, flexibility, and fan-out.
+- Hot partitions and cross-shard work are separate problems from aggregate capacity.
+- Safe rebalancing needs copy, delta, verification, versioned cutover, and cleanup/fencing.
+
+## Quiz Seeds
+
+1. Why does a time-range partition become hot for an append-heavy workload?
+2. When would a directory strategy be preferable to pure hashing?
+3. What is the difference between a local query and a scatter-gather query?
+4. Describe a safe high-level shard migration sequence.
+5. How can salting a hot tenant reduce writes and increase reads?
+6. Why does adding replicas not solve a write-hot partition?
+7. Which transaction/uniqueness requirements become harder after sharding?
+8. How would you estimate migration time and protect foreground p99?
+
+## Related Topics
+
+- [Consistent hashing](consistent-hashing.mdx)
+- [Replication](replication.mdx)
+- [Data modeling from access patterns](data-modeling-from-access-patterns.mdx)
+- [Load-balancing algorithms](../03-traffic-and-services/load-balancing-algorithms.mdx)
+
+## References
+
+### Documentation / Articles
+
+- [PostgreSQL: Table partitioning](https://www.postgresql.org/docs/current/ddl-partitioning.html) — documents range/list/hash partitioning, pruning, maintenance, and partition-management trade-offs.
+- [Amazon DynamoDB: Partitions and data distribution](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/HowItWorks.Partitions.html) — explains partition-key distribution, capacity, and the consequences of uneven access.
+- [Vitess 23.0: Sharding](https://vitess.io/docs/23.0/reference/features/sharding/) — describes a production sharding layer, routing, resharding, and the constraints around cross-shard operations.
+- [Bigtable: A Distributed Storage System for Structured Data](https://research.google/pubs/bigtable-a-distributed-storage-system-for-structured-data/) — grounds tablets, range ownership, splitting, and load balancing in a distributed storage design.

@@ -1,0 +1,179 @@
+---
+type: lesson
+id: 07-10-event-sourcing-and-cqrs
+slug: event-sourcing-and-cqrs
+title: Event Sourcing and CQRS
+description: Separate command decisions from read projections and, when justified, retain an immutable event history as the source of state.
+module: distributed-coordination
+order: 10
+difficulty: deep-dive
+estimatedMinutes: 40
+prerequisites:
+  - 07-08-transactional-outbox
+  - 07-09-change-data-capture
+  - 01-10-consistency-models
+tags:
+  - event-sourcing
+  - cqrs
+  - projections
+  - event-history
+  - read-models
+objectives:
+  - Distinguish CQRS (separate command/query models) from event sourcing (events as the authoritative state history).
+  - Explain append, optimistic version checks, projection lag, replay, snapshots, and event schema evolution.
+  - Choose read models for a concrete query workload while exposing staleness and rebuild behavior.
+  - State why event sourcing and CQRS are deliberate domain choices, not a default microservice bundle.
+relatedLessons:
+  - 07-08-transactional-outbox
+  - 07-09-change-data-capture
+  - 07-07-saga-pattern
+---
+
+# Event Sourcing and CQRS
+
+> CQRS separates the model that accepts decisions from the model that serves queries; event sourcing goes further by treating an ordered event history as the authoritative record of state changes.
+
+## Why This Exists
+
+A booking system may receive a small number of carefully validated commands but serve millions of reads: availability pages, audit history, support timelines, and analytics all want different shapes. The naive CRUD table can become a compromise schema with expensive joins, duplicated reporting logic, and no faithful history of how state changed.
+
+CQRS permits a command model and one or more query projections optimized for their jobs. Event sourcing can make the event history the source of truth so current state and past states are reconstructable. The improvement is flexibility and auditability; the new costs are eventual projection consistency, event evolution, replay/repair operations, storage growth, and a harder mental model.
+
+## Mental Model
+
+```text
+command → aggregate/version check → append Event 1, Event 2, ...
+                                      ↓
+                              projection workers
+                              ↙       ↓        ↘
+                         current view  audit  analytics
+```
+
+CQRS is a boundary of responsibility, not necessarily two services or two databases. A team can use separate read/write code paths over one relational database. Event sourcing is a persistence choice: instead of overwriting `balance=90`, append `Deposited(100)` and `Withdrawn(10)` and derive the balance.
+
+The event log is authoritative only if the domain defines event meaning and ordering. A projection is a materialized view that can lag or be rebuilt. Commands should validate against the current aggregate version and append conditionally so two writers do not both create an invalid next event.
+
+## How It Works
+
+1. A command arrives with aggregate ID and expected version.
+2. The command handler loads state by replaying from a snapshot plus later events, validates the business invariant, and emits one or more domain events.
+3. The event store appends events atomically if the expected version matches; otherwise it rejects a concurrency conflict.
+4. Projectors consume the committed stream and update query models idempotently, tracking event position/version.
+5. Queries read a projection. The API states whether the result may lag and can return a position/version for read-your-writes workflows.
+6. Snapshots compact replay; event schema upcasters or versioned handlers preserve old events. Rebuilds run into a new projection before an atomic cutover.
+
+CQRS without event sourcing can use ordinary command writes and publish change events. Event sourcing without CQRS can replay into one model. Combining them is useful when both history and divergent read workloads are real requirements; combining them by default creates unnecessary operational surfaces.
+
+## Example
+
+A digital wallet stores `MoneyDeposited`, `MoneyReserved`, `PaymentCaptured`, and `MoneyReleased` events per account. The command side checks an expected sequence and available balance; the query side builds a balance view, transaction list, and fraud-analysis projection. If the fraud projection is down, wallet commands may still succeed, but the system must define whether a fraud check is part of the command invariant.
+
+If a projector crashes after updating a row but before recording its offset, it reprocesses the event. The projection update uses `(aggregateId, eventVersion)` uniqueness or a compare-and-set to remain idempotent. To add a new `currency` field, retain old event versions and upcast them during replay rather than rewriting history. To rebuild a corrupted view, replay into a new table and switch readers after validation.
+
+## Visualization We Eventually Want
+
+Show an aggregate event stream, command/version check, snapshot, and three projections. Controls should issue valid/conflicting commands, pause or slow a projector, corrupt a projection, replay from snapshot, evolve an event schema, and compare CRUD versus event-sourced history. Display event position, aggregate version, projection lag, query staleness, rebuild progress, and rejected concurrency conflicts. A **“new read model”** preset should show how a projection can be rebuilt without changing the event history or executing external side effects.
+
+## Scaling Behavior
+
+Partition events by aggregate ID to preserve per-aggregate order and scale append/projector workers. Hot aggregates remain serial bottlenecks; redesign the aggregate or accept contention rather than sharding events arbitrarily. Projections scale independently by query shape and retention, but each adds storage, backfill, and lag.
+
+Event history grows indefinitely unless archived/compacted according to audit and replay requirements. Snapshots reduce read/replay cost but are derived data that must be validated. Global cross-aggregate transactions and ordering are difficult; use explicit process managers/sagas rather than assuming one event log is globally serial.
+
+## Failure Modes
+
+- **Projection lag/staleness:** reads do not immediately reflect a committed command.
+- **Duplicate event:** projector replays after offset loss; updates must be idempotent.
+- **Concurrent append:** expected-version check rejects one command; the client retries/rebases.
+- **Schema evolution:** old events cannot be parsed by new code without versioning/upcasters.
+- **Corrupt projection:** rebuild from trusted history and validate before cutover.
+- **Replay side effect:** a projector accidentally sends email/charges a provider during rebuild.
+- **Event store loss:** backups, replication, and integrity checks are more critical because the log is source of truth.
+- **Unbounded event volume:** storage, replay duration, and privacy/retention requirements grow.
+
+## Trade-offs
+
+Event sourcing gives audit/history, temporal reconstruction, replay, and multiple projections, but it makes domain evolution, debugging, privacy deletion, and queries harder. CQRS allows read/write scaling and tailored models, but creates synchronization lag and multiple data stores. CRUD is easier for straightforward transactional state and can still publish an outbox event for integration.
+
+## Alternatives
+
+- **CRUD plus audit table:** prefer when current state is authoritative and a limited history suffices.
+- **Transactional outbox + read models:** prefer when reliable integration events are needed without event history as source of truth.
+- **Database temporal tables/change history:** prefer when the database can provide point-in-time audit with less application complexity.
+- **Materialized views over a stream:** prefer when the source stream already exists but event sourcing semantics are not required.
+- **CQRS only:** separate commands/queries in code or stores without making events the canonical state.
+
+## When to Use
+
+Use event sourcing when immutable domain history, replay, temporal audit, or multiple independently rebuildable projections is a first-class requirement and the team can operate the event store. Use CQRS when command and query models have materially different scale/consistency/access patterns; do not require event sourcing to get that separation.
+
+## When Not to Use
+
+Do not event-source a basic profile CRUD service because “microservices use events.” Avoid it when strict immediate queries, frequent destructive data deletion, or a small team cannot support schema/replay/repair operations. Do not use a projection for a write-path invariant unless its lag and correctness are explicitly acceptable.
+
+## Common Misconceptions
+
+- **“CQRS means two microservices.”** It is a separation of command/query responsibilities.
+- **“Event sourcing means publish every database row change.”** Domain events are intentional state-change facts.
+- **“A projection is always current.”** It is usually eventually consistent and can lag.
+- **“Replay is free.”** It consumes storage, CPU, time, and must suppress external effects.
+- **“Events can be edited like rows.”** Historical event meaning should be preserved; use new corrective events or versioned upcasters.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> CQRS separates write decisions from read models; event sourcing stores the domain’s accepted events as the source of truth and rebuilds projections from them. It enables audit, replay, and independently scaled queries, but projections lag, events need schema evolution, and replay/retention/repair become operational responsibilities. I use it only when those benefits justify the complexity; CRUD plus outbox is often enough.
+
+### When to Introduce It
+
+Introduce CQRS when command and query workloads or models diverge significantly. Introduce event sourcing only after a concrete need for immutable history, point-in-time reconstruction, or projection rebuilds is established.
+
+### Common Follow-Ups
+
+- How do you handle two commands against one aggregate concurrently?
+- How do you rebuild a projection and avoid duplicate external side effects?
+- What happens if a query must be read-your-writes consistent?
+- How do you evolve an event schema and satisfy privacy deletion?
+
+### Common Candidate Mistakes
+
+- Treating CQRS/event sourcing as synonymous.
+- Claiming projections are strongly consistent without a read barrier.
+- Ignoring hot aggregates, snapshots, and event retention.
+- Replaying events through code that sends external effects.
+
+## Summary
+
+CQRS is a read/write model separation; event sourcing is an event-history persistence model. They can be combined, but neither is a default architecture. Make versions, projection lag, replay safety, event evolution, retention, and recovery explicit before accepting the complexity.
+
+## Quiz Seeds
+
+1. Which requirement justifies event sourcing beyond ordinary CQRS?
+2. Why does a projection need an offset/version and idempotent update?
+3. How should a command handle an expected-version conflict?
+4. What does a snapshot optimize, and why is it not the source of truth?
+5. Why can a read model be stale after a successful command?
+6. How would you rebuild a projection without sending duplicate emails?
+7. When is CRUD plus outbox preferable?
+
+## Related Topics
+
+- [Transactional Outbox](./transactional-outbox.mdx)
+- [Change Data Capture](./change-data-capture.mdx)
+- [Saga Pattern](./saga-pattern.mdx)
+- [Consistency Models](../01-foundations/consistency-models.mdx)
+
+## References
+
+### Documentation / Articles
+
+- [Event sourcing pattern](https://docs.aws.amazon.com/prescriptive-guidance/latest/cloud-design-patterns/event-sourcing-pattern.html) — AWS documents event history, projections, replay, snapshots, schema evolution, and eventual consistency.
+- [Event Sourcing](https://martinfowler.com/eaaDev/EventSourcing.html) — Martin Fowler separates event history from state storage and discusses replay/projection trade-offs.
+- [CQRS](https://martinfowler.com/bliki/CQRS.html) — explains CQRS as a model-separation choice rather than a mandatory two-service architecture.
+- [CQRS Pattern](https://learn.microsoft.com/en-us/azure/architecture/patterns/cqrs) — Microsoft covers separate models, synchronization, consistency, and when the pattern is inappropriate.
+- [Decompose monoliths using CQRS and event sourcing](https://docs.aws.amazon.com/prescriptive-guidance/latest/patterns/decompose-monoliths-into-microservices-by-using-cqrs-and-event-sourcing.html) — an AWS migration example with explicit limitations and independent command/query scaling.
+
+### Papers
+
+- [Event Sourcing](https://martinfowler.com/eaaDev/EventSourcing.html) — a practitioner reference that grounds the event-history model; this lesson does not treat it as an original research paper.

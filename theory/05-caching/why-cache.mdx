@@ -1,0 +1,169 @@
+---
+type: lesson
+id: 05-01-why-cache
+slug: why-cache
+title: Why Cache
+description: Use a cache to keep a working set close to readers while making freshness, memory, and failure costs explicit.
+module: caching
+order: 1
+difficulty: core
+estimatedMinutes: 25
+prerequisites:
+  - 01-03-latency-vs-throughput
+  - 01-04-percentiles-tail-latency
+  - 03-01-reverse-proxy-and-load-balancer
+tags:
+  - caching
+  - working-set
+  - hit-ratio
+  - latency
+  - database-load
+objectives:
+  - Explain why repeated reads can justify a cache without assuming a universal latency win.
+  - Distinguish cache hits, misses, bypasses, and stale responses in a request path.
+  - Estimate backend load reduction from hit ratio and identify what the estimate leaves out.
+  - Name the freshness, memory, availability, and invalidation costs that accompany a cache.
+relatedLessons:
+  - 05-02-local-and-distributed-cache
+  - 05-03-cache-aside
+  - 05-09-multi-layer-caching
+---
+
+# Why Cache
+
+> A cache is a deliberately incomplete, faster copy of data whose value comes from avoiding repeated work; the copy is useful only if its freshness and failure behavior fit the requirement.
+
+## Why This Exists
+
+The naive product-catalog request reads the primary database for every `GET /products/{id}`. That is simple and authoritative, but a popular product can cause the same row, joins, serialization, and network path to be paid for thousands of times. As concurrency rises, the database connection pool and tail latency become the bottleneck even though the logical data changed only occasionally.
+
+Adding a cache near the reader is the improvement: a hit can return a previously computed value without repeating the database work. The new trade-off is that the system now has two copies, bounded memory, a new dependency, and a freshness policy. A cache outage can turn a fast path into a database overload, so “add Redis” is not a complete design.
+
+## Mental Model
+
+Think of a cache as a filter in front of a slower source:
+
+```text
+request → cache lookup ── hit ──→ response
+                  │
+                  └── miss/bypass → source of truth → optional cache fill → response
+```
+
+The **working set** is the subset of keys likely to be requested during the useful freshness window. Hit ratio is `hits / (hits + misses)` for a defined population and period; it is not a property of the cache product alone. A hit ratio of 80% means roughly 20% of those reads still reach the source, before stampedes, invalidations, and bypasses.
+
+## How It Works
+
+For read rate `R` and hit ratio `h`, a first-order estimate is:
+
+```text
+source read rate ≈ R × (1 − h)
+```
+
+The estimate is only valid when hits and misses cost similar application work and the cache itself has enough capacity. A miss may be more expensive than a normal source read because many callers miss together. A cache lookup adds network, serialization, and CPU work; if the value is rarely reused or the cache is remote across a slow boundary, it can make the path worse.
+
+Freshness is a contract, not an implementation detail. “May be 30 seconds old,” “must reflect a committed price before checkout,” and “immutable after publication” lead to different cache policies. A cache can serve a stale value, return a miss, or fail closed; the product requirement decides which is acceptable.
+
+## Example
+
+Suppose a catalog endpoint receives 2,000 reads/s, and load testing shows 80% of requests repeat a small product working set. A warm cache would leave about `2,000 × 0.2 = 400` source reads/s, but memory must hold the distinct keys and their metadata, and the source must survive a cold-cache restart. If price changes must be visible before a checkout decision, cache the browse projection but re-read authoritative inventory during checkout.
+
+The naive improvement of caching every response creates unbounded key cardinality and can evict useful products. Caching only active keys with a bounded TTL reduces memory, but the first reader after expiry pays the source cost and may expose stale data until refresh. That is the trade-off to carry into later cache-aside and stampede lessons.
+
+## Visualization We Eventually Want
+
+Build a **Cache Pressure Explorer** with controls for request rate, distinct-key distribution, hit ratio, value size, TTL, cache capacity, source capacity, cold-start state, and cache outage. Show hit/miss/bypass counters, source QPS, p50/p99 latency, memory occupancy, evictions, and stale responses over time. Presets should include a small hot working set, a uniform scan, a cold restart, and an overloaded source. The explanation panel should point to the assumption that changed when a metric moves.
+
+## Scaling Behavior
+
+More readers help only when the cache absorbs repeated work. More distinct keys increase memory and miss traffic; larger values increase network and serialization cost. A single cache node can become a throughput or memory bottleneck, while per-process caches duplicate memory across instances. A distributed cache adds shared capacity but every request now crosses a network hop. Measure hit ratio by key class, source QPS, cache latency, evictions, memory fragmentation, and cold-start recovery time.
+
+## Failure Modes
+
+- **Cold cache:** a deploy or restart sends the full working set to the source.
+- **Cache outage:** fallback traffic overloads the database or callers receive degraded responses.
+- **Eviction churn:** the working set does not fit, so useful entries are removed immediately.
+- **Stale or poisoned value:** a bad fill is served until invalidation or expiry.
+- **Serialization mismatch:** a rolling deploy cannot read entries written by the previous version.
+- **Hot key:** one popular key overloads a cache shard even when aggregate capacity looks healthy.
+
+Use bounded fallback concurrency, versioned values, per-key coalescing, and source load-shedding rather than assuming a cache failure is harmless.
+
+## Trade-offs
+
+Caching can reduce source work and latency for repeated reads, but costs memory, cache operations, invalidation complexity, stale reads, warm-up time, and operational capacity. It can improve availability for stale-tolerant data during a source incident, or reduce availability if the cache becomes a mandatory single dependency. The useful unit of analysis is the requirement and workload, not the cache hit ratio in isolation.
+
+## Alternatives
+
+- **Database indexes or replicas:** preferable when the source query is the real bottleneck and freshness must be authoritative.
+- **Precomputed read models:** good when computation is expensive and asynchronous staleness is acceptable.
+- **CDN or HTTP caching:** good for cacheable responses close to users; less useful for personalized or private data.
+- **Request coalescing without persistence:** good for collapsing simultaneous duplicate work but does not retain results between requests.
+
+## When to Use
+
+Use a cache when reads repeat, the working set is bounded enough for the chosen placement, the source is a measurable bottleneck, and the product can state a freshness rule. Start with a measured hot path and a fallback plan.
+
+## When Not to Use
+
+Do not cache values that are highly unique, immediately invalidated, security-sensitive without an isolation design, or cheaper to compute than to cache. Avoid a cache when the source already meets the SLO and the added stale-data and failure surface has no value.
+
+## Common Misconceptions
+
+- **A cache always lowers latency.** A remote miss, serialization, or cache outage can add work.
+- **A high hit ratio proves correctness.** It says nothing about freshness, wrong keys, or a poisoned entry.
+- **A cache is a database.** Unless durability and recovery semantics are explicitly provided, treat it as disposable state.
+- **The cache absorbs every spike.** Cold starts, expiry, hot keys, and synchronized misses can amplify a spike.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I add a cache when a bounded working set causes repeated expensive reads and the source is the bottleneck. I define hit/miss behavior, value freshness, capacity, invalidation, and what happens if the cache is cold or unavailable. The cache reduces source load approximately by the hit ratio, but it introduces stale copies, memory/eviction policy, and a failure path that the source must survive.
+
+### When to Introduce It
+
+Introduce caching after stating the read/write mix, source bottleneck, working-set shape, and freshness requirement. Do not introduce it as an unexplained box.
+
+### Common Follow-Ups
+
+- What happens on a cold restart or cache outage?
+- How do you invalidate a changed value?
+- What is the working set and how do you size memory?
+- Can one hot key overload a cache shard?
+
+### Common Candidate Mistakes
+
+They quote a universal cache latency or hit ratio, cache every response, and omit stale data, warm-up, invalidation, and fallback capacity.
+
+## Summary
+
+- A cache trades repeated source work for a bounded, possibly stale copy.
+- Hit ratio is workload-specific; source load is roughly `reads × (1 − hit ratio)` only under stated assumptions.
+- Working-set size, key popularity, TTL, invalidation, and cold-start behavior determine whether caching helps.
+- Every cache needs a freshness contract and a failure plan.
+
+## Quiz Seeds
+
+1. Why can a cache with a 90% hit ratio still overload a database during a cold restart?
+2. At 2,000 reads/s and 75% hit ratio, what first-order source rate remains, and which assumptions make the estimate unsafe?
+3. What product requirement would make caching browse prices acceptable but caching checkout inventory unsafe?
+4. How can a remote cache increase latency for a low-reuse workload?
+5. Which metrics distinguish eviction churn from a genuinely cold working set?
+6. Why is cache capacity based on distinct keys and value size rather than only QPS?
+7. What should happen if the cache is unavailable and the source is already near capacity?
+
+## Related Topics
+
+- [Local and distributed cache](local-and-distributed-cache.mdx) compares placement and failure boundaries.
+- [Cache-aside](cache-aside.mdx) turns the miss path into an explicit read/write protocol.
+- [Multi-layer caching](multi-layer-caching.mdx) extends the model to browsers, CDNs, and application layers.
+- [Latency versus throughput](../01-foundations/latency-vs-throughput.mdx) supplies the rate and service-time vocabulary.
+
+## References
+
+### Documentation / Articles
+
+- [Redis cache-aside](https://redis.io/docs/latest/develop/use-cases/cache-aside/) — connects working-set caching, bounded staleness, source-load relief, and stampede risk.
+- [Caching strategies for Memcached](https://docs.aws.amazon.com/AmazonElastiCache/latest/dg/Strategies.html) — compares cache-aside and write-through behavior in a managed cache guide.
+- [Cache-Control header](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Cache-Control) — grounds freshness, revalidation, and stale-response directives at HTTP boundaries.
+- [HTTP caching](https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/Caching) — explains browser and intermediary caching behavior without assuming a particular backend store.

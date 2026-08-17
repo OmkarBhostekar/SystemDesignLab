@@ -1,0 +1,202 @@
+---
+type: lesson
+id: 07-01-clocks-and-ordering
+slug: clocks-and-ordering
+title: Clocks and Ordering
+description: Build useful event-ordering signals when independent machines cannot share one perfectly synchronized clock.
+module: distributed-coordination
+order: 1
+difficulty: advanced
+estimatedMinutes: 30
+prerequisites:
+  - 01-09-cap
+  - 01-10-consistency-models
+tags:
+  - distributed-clocks
+  - logical-clocks
+  - vector-clocks
+  - causality
+  - ordering
+objectives:
+  - Explain why a wall-clock timestamp alone cannot safely order events from independent machines.
+  - Use Lamport happened-before reasoning to construct a causal order and describe its limits.
+  - Explain what vector clocks add when a system must detect concurrent updates.
+  - Choose an ordering signal for a concrete backend workflow without claiming stronger guarantees than it provides.
+relatedLessons:
+  - 07-02-leader-election
+  - 07-05-leases-and-fencing-tokens
+  - 01-10-consistency-models
+---
+
+# Clocks and Ordering
+
+> Distributed clocks do not make time globally true; they give a system a bounded, explicit way to reason about causality and conflict.
+
+## Why This Exists
+
+Two services can observe the same business activity in different orders. A browser submits a profile edit to replica A while a mobile client submits another edit to replica B. If each service stamps the event with its local wall clock, a clock skew or an NTP correction can make the later event appear earlier. The naive rule—sort by `timestamp`—quietly turns a local observation into a global claim.
+
+The pressure is not always “find the exact global order.” Often the system needs one of three narrower properties:
+
+- **Causal order:** if event A influenced event B, everyone should be able to place A before B.
+- **A deterministic total order:** choose a repeatable tie-break for a log or UI, even when events are concurrent.
+- **Conflict detection:** know that two updates were concurrent so a merge policy can decide what to do.
+
+Each property costs different metadata and coordination. A clock is useful only when its promise matches the decision being made.
+
+## Mental Model
+
+Treat events as a graph, not as points on one universal timeline. A local process orders its own operations. Sending a message creates an edge from the send to the receive. The **happened-before** relation is the transitive closure of those local and message edges:
+
+```text
+client A:  edit ──send──> service A ───────────────┐
+                                                   │ message
+client B:  refresh <──receive──────────────────────┘
+```
+
+If there is a path from A to B, A causally precedes B. If neither can reach the other, they are concurrent; “which happened first” is not a fact available from the distributed observations.
+
+A wall clock approximates physical time and is valuable for expiration, metrics, and human-readable timestamps. A logical clock is metadata attached to events to preserve ordering relationships. It is not a measurement of elapsed seconds.
+
+## How It Works
+
+### Lamport logical clocks
+
+Each process keeps an integer `L`:
+
+1. Increment `L` before a local event.
+2. Include `L` in an outgoing message.
+3. On receipt of a message with timestamp `m`, set `L = max(L, m) + 1`.
+
+If A happened before B, then `L(A) < L(B)`. To obtain a deterministic total order for concurrent events, add a stable process ID as a tie-break, such as `(lamportTime, nodeId)`.
+
+The implication is one-way. `L(A) < L(B)` does **not** prove that A caused B; concurrent events can receive ordered scalar timestamps. Lamport clocks therefore provide a causal-preserving order, not concurrency detection.
+
+### Vector clocks
+
+With a small known set of participants, a vector clock stores one counter per participant. A vector `v` is less than `w` when every component of `v` is less than or equal to the corresponding component of `w`, and at least one is smaller. Then `v` happened before `w`. If neither vector dominates the other, the events are concurrent.
+
+For example, with nodes A and B:
+
+```text
+A edits: [1, 0]
+B edits independently: [0, 1]
+
+[1, 0] and [0, 1] are incomparable → concurrent updates.
+```
+
+After A receives B's event, A may advance to `[2, 1]`; that vector dominates both earlier events. Real systems often use version vectors, dotted version vectors, or bounded approximations rather than an unbounded vector per node.
+
+### Physical and hybrid clocks
+
+Physical clocks can be synchronized within an error bound, but the bound is an operational assumption, not a proof of perfect order. Hybrid logical clocks combine a physical-time component with a logical counter so timestamps remain close to wall time while preserving a causal order under the model. They are useful when storage and debugging benefit from time-shaped IDs, but they still do not remove network partitions or clock uncertainty.
+
+## Example
+
+Consider a collaborative shopping cart replicated in two regions. The cart has a `quantity` edit and a `remove item` edit. Region A receives quantity `3` at local time 10:00:00.100. Region B receives remove at local time 10:00:00.090, but B's clock is 200 ms ahead. Sorting wall clocks makes remove appear later even though it was the user-visible continuation of an earlier action—or may reverse two genuinely concurrent edits.
+
+A Lamport timestamp can preserve explicit request/reply causality: a client retry carrying the cart version is later than the response that supplied that version. If A and B both accept offline edits, vector metadata can tell the merge service that the edits are concurrent. The product policy may then prefer removal, merge quantities, or ask the user; the vector clock detects the conflict but does not choose the business answer.
+
+Do not use a logical timestamp as an authorization or expiration deadline. Use a physical deadline for “lease expires at 10:00,” and use a fencing token or version check to protect the resource from a stale worker.
+
+## Visualization We Eventually Want
+
+Show three nodes with independent event lanes. Controls should toggle message delay, clock skew, process pause, and the chosen metadata: wall clock, Lamport, or vector clock. A step button should create local events, send messages, and merge replicas. Highlight happened-before edges, concurrent events, the selected total-order tie-break, and the number of metadata entries. A **“conflicting cart edits”** preset should show that Lamport order can choose a deterministic display order while vector clocks expose concurrency. The text panel must state which guarantees are simulated and which are assumptions.
+
+## Scaling Behavior
+
+Lamport metadata is constant-size per event, but it loses concurrency information. A vector with `n` participants is `O(n)` and becomes expensive when nodes are dynamic or events travel through many replicas. Version vectors can grow with replica membership; pruning or dotted representations trade exact conflict history for bounded storage. A globally ordered stream can avoid per-event vectors, but it introduces a coordinator or partition leader and its availability/latency costs.
+
+At high event rates, persist only the metadata needed by the merge or replay boundary. Do not put a full causal vector on every user-facing record if a database version, sequence per aggregate, or single-writer partition already supplies the required guarantee.
+
+## Failure Modes
+
+- **Clock skew or rollback:** wall-clock ordering can invert events, especially after a correction or VM resume.
+- **Delayed messages:** a receiver can learn an event long after a local event; ordering must not assume arrival time equals creation time.
+- **Dropped metadata:** treating an event without its causal context as independent can create false conflicts or lost updates.
+- **Dynamic membership:** vector entries for departed or short-lived nodes grow without bound unless the protocol defines compaction.
+- **Misread total order:** a tie-broken Lamport order is deterministic, but it does not prove causality between tied concurrent events.
+
+## Trade-offs
+
+Logical clocks avoid a central time service and tolerate arbitrary message delay, but they add metadata and cannot tell how long ago an event happened. Vector clocks detect concurrency more precisely, at `O(n)` or membership-dependent cost. A centralized sequencer gives simple monotonically increasing positions, but it adds a bottleneck and a failure/partition decision. Hybrid clocks make records easier to inspect by humans, but rely on clock-discipline assumptions.
+
+## Alternatives
+
+- **Database version per aggregate:** prefer when one storage system serializes updates to an entity and cross-entity causality is not needed.
+- **Single-writer partition or leader log:** prefer when the requirement is one order for a key and the system can pay for leader coordination.
+- **Physical timestamp plus UUID:** prefer for approximate sorting or deduplication where causal correctness is not required.
+- **CRDT merge metadata:** prefer for explicitly designed commutative data types; a vector clock alone does not provide a merge function.
+
+## When to Use
+
+Introduce logical clocks when events cross processes and the design needs causal display, replay, conflict handling, or a deterministic log position without a global sequencer. Introduce vector clocks when concurrent writes must be detected rather than silently tie-broken.
+
+## When Not to Use
+
+Do not add vectors to a CRUD service whose database already serializes each record. Do not use Lamport timestamps for TTLs, latency measurement, or ordering across systems that never exchange causal context. Do not claim a vector clock resolves a conflict; it only supplies evidence for a policy.
+
+## Common Misconceptions
+
+- **“The server timestamp is the truth.”** It is one machine's observation and can be skewed.
+- **“Lamport timestamps reveal concurrency.”** Scalar order cannot distinguish concurrent events.
+- **“Vector clocks are global time.”** They describe partial order, not elapsed time.
+- **“A total order means a causal order.”** A deterministic tie-break may order concurrent events arbitrarily.
+- **“NTP makes distributed ordering safe.”** Synchronization improves estimates but does not eliminate delay, pause, or partition uncertainty.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> Wall clocks on different machines can be skewed and message arrival is not event order. I use happened-before reasoning and Lamport clocks when I need a causal-preserving scalar order; I use vector clocks when I must detect concurrent updates. Neither mechanism chooses a business conflict policy, and a physical deadline or fencing token is still needed for expiration and ownership.
+
+### When to Introduce It
+
+Mention clocks when the prompt includes offline writes, replicated conflict resolution, event replay, a distributed log, or claims that “latest timestamp wins.” Ask whether the requirement is causality, a per-key order, approximate time, or concurrency detection.
+
+### Common Follow-Ups
+
+- Why is `timestamp + node ID` not enough for causality?
+- What is the metadata cost of a vector clock as replicas grow?
+- Could a single leader sequence all events, and what would that cost?
+- How do you combine event ordering with idempotency and version checks?
+
+### Common Candidate Mistakes
+
+- Treating arrival order as creation order.
+- Using a logical timestamp as a lease expiry.
+- Claiming Lamport clocks detect concurrent writes.
+- Adding vector clocks without a bounded membership or compaction plan.
+
+## Summary
+
+Use the weakest ordering mechanism that satisfies the requirement: physical time for human/expiry semantics, a database or leader sequence for one writer order, Lamport clocks for causal-preserving scalar order, and vector clocks for concurrency detection. Always state the failure and membership assumptions behind the guarantee.
+
+## Quiz Seeds
+
+1. Two events have Lamport timestamps 7 and 8. What can—and cannot—be inferred about causality?
+2. Given vectors `[2, 1, 0]` and `[2, 2, 0]`, which event happened after the other?
+3. Why can a clock rollback cause a “latest write wins” implementation to lose an update?
+4. What metadata would you choose for one ordered stream partition, and why not a vector per message?
+5. A vector clock has incomparable versions. What business policies could resolve the conflict?
+6. Why should a lease use a physical deadline plus fencing rather than a Lamport timestamp?
+7. What happens to vector metadata when short-lived replicas join and leave frequently?
+
+## Related Topics
+
+- [Consistency models](../01-foundations/consistency-models.mdx)
+- [CAP theorem](../01-foundations/cap.mdx)
+- [Leader Election](./leader-election.mdx)
+- [Leases and Fencing Tokens](./leases-and-fencing-tokens.mdx)
+
+## References
+
+### Documentation / Articles
+
+- [Time, Clocks, and the Ordering of Events in a Distributed System](https://lamport.azurewebsites.net/pubs/time-clocks.pdf) — Lamport's original paper defines happened-before and logical clocks.
+- [Amazon Dynamo: A Highly Available Key-value Store](https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf) — the Dynamo paper shows version vectors used to detect divergent replicas.
+- [Hybrid Logical Clocks](https://cse.buffalo.edu/tech-reports/2014-04.pdf) — Kulkarni, Demirbas, et al. describe combining physical time with logical causality.
+
+### Papers
+
+- [Time, Clocks, and the Ordering of Events in a Distributed System](https://lamport.azurewebsites.net/pubs/time-clocks.pdf) — original research grounding the happened-before relation.

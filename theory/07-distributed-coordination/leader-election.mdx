@@ -1,0 +1,181 @@
+---
+type: lesson
+id: 07-02-leader-election
+slug: leader-election
+title: Leader Election
+description: Choose one active coordinator for a task while handling crashes, delayed observations, and split membership views.
+module: distributed-coordination
+order: 2
+difficulty: advanced
+estimatedMinutes: 30
+prerequisites:
+  - 07-01-clocks-and-ordering
+  - 01-05-availability
+  - 01-08-redundancy-and-fault-tolerance
+tags:
+  - leader-election
+  - failure-detection
+  - quorum
+  - coordination
+  - single-writer
+objectives:
+  - Explain why a replicated worker group may need one leader for a partition, schedule, or write path.
+  - Describe candidate, vote, heartbeat, and lease-style election mechanics without treating failure detection as perfect.
+  - Distinguish selecting a leader from reaching consensus on the state that leader manages.
+  - Design a safe handoff and stale-leader response for a concrete backend workflow.
+relatedLessons:
+  - 07-03-consensus-and-raft-intuition
+  - 07-04-distributed-locks
+  - 07-01-clocks-and-ordering
+---
+
+# Leader Election
+
+> Leader election creates a temporary single writer or coordinator; it is safe only when followers can recognize stale leadership and the system defines what happens during uncertainty.
+
+## Why This Exists
+
+Suppose ten workers poll a due-jobs table. With no coordination, all ten can claim the same job, or each can race on a global schedule. The naive fix is to configure one “primary” worker manually. That becomes a single point of failure: when it dies, the schedule stops until a human changes configuration.
+
+Leader election lets multiple nodes be ready while one node performs a role. The role may be “assign partitions,” “advance a scheduler,” or “accept writes for a shard.” Election is not a magic availability feature: choosing a leader takes time, may be impossible during a partition, and does not by itself replicate the leader's state.
+
+## Mental Model
+
+Think of a group of candidates and one **term/epoch** at a time:
+
+```text
+normal:   leader A ──heartbeats──> followers B C D
+failure:  B C D stop hearing A
+election: candidates ask for votes in a newer term
+result:   one candidate obtains the required quorum
+handoff:  new leader fences or supersedes old work
+```
+
+The most important question is not “which node wins?” but “under what evidence may a node act as leader?” A timeout is a suspicion, not proof of death. If a partition leaves two groups each believing the other is gone, a quorum rule or fencing mechanism must prevent two writers from committing conflicting work.
+
+## How It Works
+
+A simplified election uses:
+
+1. A current leader sends periodic heartbeats.
+2. A follower that misses a randomized election timeout becomes a candidate and increments an epoch/term.
+3. It requests votes from peers. A peer votes at most once per term and rejects stale terms.
+4. The candidate acts as leader after a quorum (for example, 3 of 5) grants votes.
+5. The leader sends heartbeats and includes the term in commands or log entries.
+6. A node that observes a higher term steps down; a leader that loses contact with a quorum must stop making authoritative progress.
+
+Randomized timeouts reduce simultaneous candidacies, while quorum voting prevents two leaders from both having a majority in a five-node group. The exact protocol matters. ZooKeeper's recipe uses ephemeral sequential znodes and watches only the next lower candidate to avoid a notification herd. Raft combines election with a replicated log and has stronger, explicit safety rules; a home-grown “heartbeat plus majority” is not automatically Raft.
+
+Election state should be durable or recoverable. If a node restarts and forgets the current term, it can accidentally accept stale messages. A leader also needs a handoff contract: stop accepting new work, finish or cancel in-flight work, and publish ownership/fencing information before another node takes over.
+
+## Example
+
+An email scheduler has five identical workers and one queue of due notifications. Every worker can send email, but only one should advance a global partition assignment. Worker A is leader in term 12. A network issue cuts A off from B, C, and D while A can still reach an external provider.
+
+If the election rule is “whoever times out becomes leader,” A and B can both send. With a majority quorum, B must obtain three votes in term 13. A cannot obtain a majority and must stop assigning new jobs once it learns it lacks quorum. Jobs already sent need idempotency/provider deduplication because election does not rewind an external side effect.
+
+When B wins, it writes a term-13 assignment and workers reject assignments from term 12. If the store cannot fence term-12 work, add a monotonically increasing fencing token to each claim and make the queue/database reject stale tokens.
+
+## Visualization We Eventually Want
+
+Show five nodes with state (`follower`, `candidate`, `leader`), current term, election deadlines, heartbeat arrows, and vote responses. Controls should step time, pause one node, partition links, delay messages, change quorum size, and choose deterministic or randomized timeouts. A **“leader loses quorum”** preset should show a stale leader ceasing authoritative work, a new candidate gathering votes, and a job claim rejected because its term/token is old. The visualization must label the educational simplifications; it should not imply that network timeout proves process death.
+
+## Scaling Behavior
+
+Election traffic is roughly proportional to members and heartbeat frequency; large groups increase vote and failure-detection work. A coordinator group is usually kept small, while data-plane workers scale separately. More regions increase round-trip time and the probability of a partition, so election timeout and quorum placement are tied to latency and failure domains.
+
+An odd number of voters improves fault tolerance: a 3-voter group tolerates one unavailable voter; a 5-voter group tolerates two, assuming the remaining voters can communicate. Adding observers/non-voters can improve read locality without changing the quorum, but the protocol must distinguish them from voters.
+
+## Failure Modes
+
+- **Split brain:** two leaders act because the protocol lacks quorum/fencing, or because each side can reach a different majority due to misconfiguration.
+- **False suspicion:** a long GC pause or slow network triggers election even though the old leader is alive.
+- **Election storm:** synchronized timeouts or an overloaded coordinator cause repeated candidacies and no stable leader.
+- **Stale leader:** a paused leader resumes and writes after a new term; term checks or fencing must reject it.
+- **No quorum:** the system stays available only for reads or non-authoritative work, depending on the design; forcing progress can violate consistency.
+- **Unsafe handoff:** the new leader repeats external side effects because the old leader's in-flight result was unknown.
+
+## Trade-offs
+
+Leader-based coordination simplifies per-key ordering and reduces write conflicts, but introduces leader load, failover delay, and a quorum dependency. Randomized timeouts improve convergence but make detection less deterministic. A lease can lower steady-state heartbeat traffic but relies on bounded timing and fencing; a consensus-backed term is stronger but costs round trips and durable coordination.
+
+## Alternatives
+
+- **Stateless work stealing:** prefer when duplicate execution is cheap and idempotent; no global leader is required.
+- **Partitioned ownership:** prefer when each key has an independent owner and a central leader would bottleneck the workload.
+- **External coordinator:** ZooKeeper/etcd/consensus service can supply membership and election; it becomes a dependency with its own quorum and operations.
+- **Manual or DNS failover:** acceptable for rare human-controlled recovery, not for per-second scheduling decisions.
+
+## When to Use
+
+Use election when exactly one active coordinator simplifies correctness: partition assignment, scheduler tick ownership, metadata mutation, or a single-writer shard. Define the quorum, failure detector, epoch, handoff, and side-effect deduplication before introducing the leader box.
+
+## When Not to Use
+
+Do not elect a leader just because the architecture has multiple services. Avoid one global leader for independent keys when partitioned ownership scales better. Do not use a leader alone to guarantee durable history; pair it with replicated state or an authoritative store.
+
+## Common Misconceptions
+
+- **“The first node that times out is leader.”** It must win the protocol's vote/quorum rules.
+- **“A heartbeat proves the leader is alive everywhere.”** It proves only an observed communication path.
+- **“Leader election is consensus.”** Election chooses a coordinator; consensus also agrees on a safe replicated history/state.
+- **“A new leader cancels old side effects.”** External calls may already have succeeded; idempotency and reconciliation remain necessary.
+- **“No quorum means choose the freshest node.”** Without a safe quorum/term rule, freshness may be unknown under partition.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I use leader election when one active owner simplifies a shared task. Followers detect a missed heartbeat, candidates request votes in a newer term, and a quorum makes leadership unambiguous. Election is not proof of failure and not the same as consensus, so the design must stop a leader that loses quorum, fence stale terms, and reconcile in-flight external work.
+
+### When to Introduce It
+
+Introduce election after identifying a single-writer or singleton-scheduler requirement and before drawing a “primary” box. Ask what failure detector, quorum, term, and handoff semantics make that box safe.
+
+### Common Follow-Ups
+
+- Why do you need an odd number of voters?
+- What happens during a region partition?
+- How does a restarted old leader avoid writing stale state?
+- What is stored durably, and how does a new leader rebuild ownership?
+
+### Common Candidate Mistakes
+
+- Confusing a health check with quorum leadership.
+- Ignoring the old leader's delayed messages.
+- Claiming failover is instantaneous and lossless.
+- Making every worker watch one node and causing a thundering herd.
+
+## Summary
+
+Election is a temporary authority decision under imperfect failure detection. Use terms/epochs, quorum rules, randomized timeouts, safe handoff, and fencing for stale leaders. Pair it with replicated state or a durable source of truth when the role controls data, and keep the coordination group small enough to converge predictably.
+
+## Quiz Seeds
+
+1. Why can two nodes both believe they are leader after a network partition if no quorum rule exists?
+2. What does a term/epoch protect against when an old leader resumes?
+3. Why are randomized election timeouts useful?
+4. What is the difference between a leader election result and a committed replicated log entry?
+5. A five-node group loses two nodes. Can it elect a leader? What changes if it loses three?
+6. Why must a scheduler still deduplicate a job after a successful election handoff?
+7. When might partitioned ownership be better than one global leader?
+
+## Related Topics
+
+- [Clocks and Ordering](./clocks-and-ordering.mdx)
+- [Consensus and Raft Intuition](./consensus-and-raft-intuition.mdx)
+- [Distributed Locks](./distributed-locks.mdx)
+- [Leases and Fencing Tokens](./leases-and-fencing-tokens.mdx)
+
+## References
+
+### Documentation / Articles
+
+- [ZooKeeper Recipes and Solutions](https://zookeeper.apache.org/doc/current/recipes.html) — the official recipe explains ephemeral sequential election nodes and avoiding a watch herd.
+- [ZooKeeper Internals](https://zookeeper.apache.org/doc/current/zookeeperInternals.html) — describes quorum-based leader election and atomic broadcast in a production coordinator.
+- [The Chubby Lock Service for Loosely-Coupled Distributed Systems](https://research.google/pubs/the-chubby-lock-service-for-loosely-coupled-distributed-systems/) — Google’s paper grounds a long-lived coordination service and its failure model.
+- [etcd: Why etcd](https://etcd.io/docs/v3.5/learning/why/) — explains why a strongly consistent key-value store is used for configuration and coordination.
+
+### Papers
+
+- [In Search of an Understandable Consensus Algorithm](https://raft.github.io/raft.pdf) — Raft's election model is a useful reference for terms, votes, and leader state, though this lesson deliberately remains conceptual.

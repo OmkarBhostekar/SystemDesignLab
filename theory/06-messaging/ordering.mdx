@@ -1,0 +1,161 @@
+---
+type: lesson
+id: 06-05-ordering
+slug: ordering
+title: Message Ordering
+description: Match global, partition, per-key, and causal ordering guarantees to the business invariant that actually needs sequence.
+module: messaging
+order: 5
+difficulty: core
+estimatedMinutes: 35
+prerequisites:
+  - 06-04-partitions-and-consumer-groups
+  - 01-10-consistency-models
+  - 03-08-service-boundaries
+tags:
+  - ordering
+  - sequence
+  - partition-key
+  - causality
+  - reordering
+objectives:
+  - Distinguish global, partition, per-key, causal, and best-effort order.
+  - Identify the smallest business invariant that needs sequencing.
+  - Explain how retries, multiple consumers, and partitions can expose out-of-order effects.
+  - Design sequence checks, reorder buffers, or idempotent state transitions where needed.
+relatedLessons:
+  - 06-04-partitions-and-consumer-groups
+  - 06-06-delivery-semantics
+  - 06-07-idempotent-consumers
+---
+
+# Message Ordering
+
+> “Ordered” is incomplete until it names the scope, key, observer, and failure behavior; global order is often far more expensive than per-entity order.
+
+## Why This Exists
+
+An account ledger cannot apply `debit` after `close`, while independent accounts can update in parallel. The naive global queue preserves one sequence by serializing all accounts. It is correct for the narrow invariant but caps throughput and lets one slow account block everyone. The improvement is to order only the key that needs it, with sequence checks at the consumer. The new trade-off is cross-key coordination and a more nuanced user-visible order.
+
+## Mental Model
+
+| Guarantee | What is ordered | Typical cost |
+| --- | --- | --- |
+| Global | Every record in one stream | One serialized lane or global coordination |
+| Partition | Records in one partition | Key routing and partition ceiling |
+| Per-key | Records sharing an entity key | Hot-key risk; cross-key order absent |
+| Causal | Events with a happens-before relation | Metadata, clocks, or workflow coordination |
+| Best effort | Arrival/processing observation only | Highest parallelism; weakest guarantee |
+
+Ordering can differ between broker append order, consumer delivery order, side-effect commit order, and what a client observes. State the one the invariant uses.
+
+## How It Works
+
+Use a stable key to route related events to one partition and process that partition sequentially. Include a sequence number or version in the payload. A consumer can reject or buffer `version=43` until version 42 arrives, or apply only monotonic updates when missing intermediate events do not matter. A retry can complete after a newer message unless the consumer fences old work or serializes side effects per key.
+
+If a workflow spans keys, an event bus does not provide a free global order. Use a coordinator, transaction, join, or a derived stream with a deterministic merge. Reordering by wall-clock timestamp is unsafe under clock skew; event IDs, source sequence, or causal metadata are stronger signals.
+
+## Example
+
+An account topic is keyed by `account_id`. `Deposit(42)`, `Withdraw(43)`, and `Close(44)` stay in one partition and the consumer applies them in sequence. Events for account 7 can run on another partition. If an older retry for 42 arrives after 43, the consumer's compare-and-set on `last_applied_version` rejects it. A fraud analytics stream can accept out-of-order events and correct aggregates later, so it need not share the ledger's serialization.
+
+The naive global ordering for all accounts reduces throughput to one slow account. The improvement uses per-account order. The new trade-off is a hot account and the need for a separate coordination rule if a transfer touches two accounts.
+
+## Visualization We Eventually Want
+
+Build an **Ordering Scope Explorer** with events, keys, partitions, consumer concurrency, retries, and side-effect latency. Controls should toggle global/per-key order, duplicate delivery, delayed events, clock skew, sequence gaps, and cross-key transfers. Show append, delivery, commit, and observed orders separately, plus blocked keys, reorder-buffer age, and throughput.
+
+## Scaling Behavior
+
+Global order scales poorly because every record shares a lane. Per-key order scales with key cardinality and partition distribution until hot keys dominate. Reorder buffers consume memory and delay output; larger lateness windows improve completeness but increase latency. Cross-key coordination often becomes the actual bottleneck rather than the broker.
+
+## Failure Modes
+
+- A retry completes after a newer event and overwrites state.
+- A missing sequence gap blocks one key indefinitely.
+- A partition is ordered, but side effects run concurrently and commit out of order.
+- Key skew makes one entity a serial bottleneck.
+- Clock timestamps cause false ordering across machines.
+- A cross-key workflow assumes a global order the stream does not provide.
+
+Use monotonic versions, compare-and-set state transitions, bounded gap timeouts, repair/replay, per-key serialization, and explicit compensation for cross-key work.
+
+## Trade-offs
+
+Stronger ordering simplifies state reasoning but reduces parallelism, increases buffering and coordination, and can magnify hot keys. Weaker ordering improves throughput and availability but requires commutative operations, version checks, or correction. The right guarantee is the smallest one that protects a business invariant.
+
+## Alternatives
+
+- **Idempotent commutative updates:** avoid strict order for counters and set-union facts.
+- **Database serializable transaction:** use when the invariant is local to one store and throughput permits.
+- **Actor per entity:** serialize state transitions behind one logical owner.
+- **Watermarked event-time processing:** order windows by event timestamps while accepting bounded lateness.
+
+## When to Use
+
+Use per-key ordering for entity state machines, ledgers, inventory reservations, or lifecycle transitions. Use global order only when a real global invariant or audit sequence demands it and the throughput ceiling is acceptable.
+
+## When Not to Use
+
+Do not require global order for independent analytics events. Do not trust timestamps alone, and do not claim a partition order if consumer side effects are concurrent.
+
+## Common Misconceptions
+
+- **Kafka order is global.** Kafka orders within a partition.
+- **Same partition means side effects finish in order.** The consumer can parallelize work incorrectly.
+- **More partitions improve ordered throughput indefinitely.** A single key remains serial.
+- **A retry is just another ordered delivery.** Its completion can occur later than newer work.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I first name the invariant and its smallest ordering key. I route that key to one partition or actor, include a source sequence/version, and make side effects monotonic or serialized. Global order is a deliberate throughput trade-off; independent keys should stay parallel. For cross-key workflows I use coordination or compensation rather than pretending a partitioned stream has total order.
+
+### When to Introduce It
+
+Introduce ordering when events represent state transitions, sequence-sensitive operations, or user-visible causality.
+
+### Common Follow-Ups
+
+- What exactly must be ordered?
+- What if an event is missing or delayed?
+- Can two accounts share a transfer order?
+- How do retries interact with sequence numbers?
+
+### Common Candidate Mistakes
+
+They demand global ordering by default, use timestamps as truth, and ignore commit order versus delivery order.
+
+## Summary
+
+- Ordering is scoped: global, partition, per-key, causal, or best effort.
+- Route the smallest entity that needs sequence; protect state with versions or compare-and-set.
+- Retries and concurrent side effects can violate broker delivery order.
+- Cross-key order needs a coordinator, transaction, or compensating workflow.
+
+## Quiz Seeds
+
+1. Why is per-account order enough for a ledger but not necessarily for a two-account transfer?
+2. What does a monotonic version check do when an old retry arrives?
+3. How can a partition remain ordered while side effects become out of order?
+4. Why can timestamp order be wrong across machines?
+5. Which workload benefits from commutative updates instead of strict order?
+6. What should happen when sequence 42 is missing and 43 arrives?
+7. How does a global-order guarantee affect maximum throughput?
+
+## Related Topics
+
+- [Partitions and consumer groups](partitions-and-consumer-groups.mdx) describes the ordering lane.
+- [Delivery semantics](delivery-semantics.mdx) covers retries and crash points.
+- [Idempotent consumers](idempotent-consumers.mdx) makes repeated/out-of-order delivery safe.
+- [Consistency models](../01-foundations/consistency-models.mdx) frames visibility and monotonicity.
+
+## References
+
+### Documentation / Articles
+
+- [Apache Kafka introduction](https://kafka.apache.org/42/documentation.html) — states the partition-level ordering guarantee and the single-partition global-order trade-off.
+- [Amazon SQS FIFO queues](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/FIFO-queues.html) — documents message-group ordering and its serialization scope.
+- [Kinesis resharding](https://docs.aws.amazon.com/streams/latest/dev/kinesis-using-sdk-java-after-resharding.html) — explains how parent/child shards and reads can affect per-key order during resharding.
+- [Timely stream processing](https://nightlies.apache.org/flink/flink-docs-stable/docs/concepts/time/) — grounds event time, watermarks, out-of-order events, and bounded lateness.

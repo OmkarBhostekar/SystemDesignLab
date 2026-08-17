@@ -1,0 +1,170 @@
+---
+type: lesson
+id: 07-05-leases-and-fencing-tokens
+slug: leases-and-fencing-tokens
+title: Leases and Fencing Tokens
+description: Prevent expired or paused owners from corrupting a resource after a newer worker has taken over.
+module: distributed-coordination
+order: 5
+difficulty: advanced
+estimatedMinutes: 30
+prerequisites:
+  - 07-04-distributed-locks
+  - 07-02-leader-election
+  - 01-10-consistency-models
+tags:
+  - leases
+  - fencing-tokens
+  - stale-writers
+  - concurrency-control
+  - ownership
+objectives:
+  - Explain why lease expiry changes ownership state but cannot stop a paused process.
+  - Use a monotonically increasing fencing token at the protected resource to reject stale operations.
+  - Distinguish lease renewal, token issuance, and resource-side enforcement.
+  - State timing, persistence, and provider assumptions required for a fencing design.
+relatedLessons:
+  - 07-04-distributed-locks
+  - 07-06-distributed-transactions-and-2pc
+  - 07-01-clocks-and-ordering
+---
+
+# Leases and Fencing Tokens
+
+> Lease expiry answers “who may acquire next?”; a fencing token answers “which operation may the resource accept?”
+
+## Why This Exists
+
+Worker A acquires a lock and then pauses for 30 seconds. Its lease is 10 seconds, so the coordinator correctly lets worker B acquire the resource. When A resumes, it still has an open socket and can issue a write. The naive “lock with TTL” design now has two active writers.
+
+The improvement is to attach an increasing **fencing token** to every ownership grant. The protected resource stores the greatest accepted token and rejects operations with a lower token. This turns stale ownership from a timing problem into a resource-side ordering check. The new trade-off is that every protected operation must carry and enforce the token; a resource that ignores it is not fenced.
+
+## Mental Model
+
+```text
+coordinator:  grant A → token 41 ──lease expires──> grant B → token 42
+resource:     accept token 41; then accept only token >= 42
+stale A:      write(token 41) ────────────────X rejected
+current B:    write(token 42) ─────────────────✓ accepted
+```
+
+The lease is a liveness mechanism: it bounds how long the coordinator waits before reassigning. The token is a safety mechanism: it orders ownership generations at the resource. A wall-clock expiry alone cannot provide safety because local clocks, pauses, and network delay are not under the resource's control.
+
+## How It Works
+
+1. A worker atomically acquires a lease and receives token `t`, greater than every token previously issued for that resource.
+2. The worker includes `t` in every write, delete, or irreversible command in the critical section.
+3. The resource keeps `lastAcceptedToken` (or a per-object version) durably and accepts a request only if `t >= lastAcceptedToken`, updating it atomically with the data write.
+4. The worker renews before the lease expires. If renewal is uncertain, it stops issuing work; it must not mint tokens locally.
+5. A new worker gets a larger token after expiry or explicit release.
+
+The comparison should usually be `t > lastAcceptedToken` for a new ownership generation, but retries of one operation may need idempotency keyed by `(token, operationId)`. The exact comparison and retry behavior belong to the resource contract. If the resource is an external API that has no conditional/versioned write, fencing may be impossible; use idempotency keys, a provider-side reservation, or redesign the side effect.
+
+Token allocation itself must be linearizable/authoritative. A counter replicated with eventual consistency can issue duplicate or decreasing values. Persistence matters across coordinator restarts; an in-memory counter that resets to 1 can let an old token look current.
+
+## Example
+
+An image-processing scheduler writes a “current output manifest” to object storage. Worker A receives token 100, downloads source files, and pauses. B receives token 101 and writes a manifest with an `If-Match`/version condition or a database row condition that records 101. A resumes and tries to overwrite the manifest with 100; the resource rejects it. The scheduler records A's stale-write metric and can retry the work under a new token.
+
+If object storage cannot compare arbitrary fencing numbers, put a small manifest row in a transactional database and store the blob under a content-addressed key. The database accepts only the greater token and points to the accepted blob. This moves fencing to a resource that can enforce it instead of pretending a lock service can control an unaware object store.
+
+## Visualization We Eventually Want
+
+Animate workers A and B, a lease coordinator, and a resource with `lastAcceptedToken`. Controls should pause/resume A, alter lease duration and clock skew, delay renewals, issue a takeover, and toggle resource-side token enforcement. Show the operation timeline, accepted/rejected writes, token history, and duplicate side effects. A **“late A after B”** preset should make the incorrect TTL-only design visibly corrupt state and the fenced design reject the stale write. Include a note that external APIs without conditional writes cannot be fenced by client intent alone.
+
+## Scaling Behavior
+
+Tokens are usually one monotonically increasing value per resource, so metadata is compact. A high-cardinality resource set needs per-key counters or an ownership epoch embedded in a partition's metadata. Cross-region token allocation adds a consensus/latency dependency; region-local tokens need a namespace/epoch that prevents two regions from issuing indistinguishable authority.
+
+Fencing checks add a conditional write or compare-and-swap to the hot path. Batch multiple operations only if the resource can ensure all batch items are protected by the same token and does not allow a stale batch to partially commit.
+
+## Failure Modes
+
+- **Token reset:** coordinator restart reuses old numbers; persist the counter or use an epoch with durable uniqueness.
+- **Resource ignores token:** the design has no safety guarantee even if the coordinator is correct.
+- **Lost renewal response:** worker must stop or revalidate; continuing can create stale writes.
+- **Non-atomic check/write:** another owner can advance the token between the check and data mutation.
+- **Token overflow/reordering:** use a representation and comparison policy that survives long operation lifetimes.
+- **External side effect:** email/payment APIs may not support fencing; use idempotency/reconciliation or a provider reservation.
+- **Read-after-reassignment race:** consumers may read work generated by an old owner; version the output and validate provenance.
+
+## Trade-offs
+
+Fencing converts pause/split-brain risk into a resource-enforced condition, but adds metadata and protocol changes to every protected write. Lease renewal gives bounded recovery instead of permanent orphan locks, but short leases increase traffic and false expiry. A durable per-resource version is simpler than a separate token service when the resource already owns the state; an external coordinator is reusable but has another failure boundary.
+
+## Alternatives
+
+- **Database row version / optimistic concurrency:** prefer when the write target is one transactional database.
+- **Provider idempotency key:** prefer for an external API that deduplicates operation IDs but cannot compare fencing numbers.
+- **Single-writer partition:** prefer when the resource can remain owned by one stable leader and failover is rare.
+- **Human reconciliation:** acceptable for low-value batch work where automatic takeover is not worth the complexity.
+
+## When to Use
+
+Use leases for expiring ownership and fencing tokens when stale work can damage shared state after a pause, partition, or failover. Name the protected resource and show exactly where the token is checked atomically.
+
+## When Not to Use
+
+Do not add a token to work that is naturally idempotent and append-only. Do not call a TTL lock “fenced” unless the downstream resource rejects stale tokens. Do not rely on a client wall clock to decide whether its lease is valid.
+
+## Common Misconceptions
+
+- **“TTL expiry kills the owner.”** It only changes coordinator state.
+- **“A token in logs is fencing.”** The resource must enforce it on the mutation.
+- **“Increasing timestamps are tokens.”** Wall clocks can move and are not authoritative sequences.
+- **“Fencing prevents duplicate external effects automatically.”** Providers need idempotency or conditional operations too.
+- **“Renewal success proves in-flight writes are safe.”** A write can be delayed after renewal; resource-side checks still matter.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> A lease lets ownership expire so another worker can recover, but a paused old owner may still send a late write. I issue a durable, monotonically increasing fencing token with each lease and require the protected resource to reject any token older than the latest accepted one. Lease timing handles liveness; the resource-side comparison handles stale-writer safety.
+
+### When to Introduce It
+
+Introduce fencing after a lock/lease design includes pause, GC, network partition, failover, or long-running work. Ask whether the resource supports conditional writes or idempotency.
+
+### Common Follow-Ups
+
+- Where is the token counter stored and how does it survive restart?
+- Is the token check atomic with the data mutation?
+- What if the external provider cannot enforce the token?
+- What happens to work already emitted by an expired owner?
+
+### Common Candidate Mistakes
+
+- Treating lock expiry as process termination.
+- Minting tokens locally or from wall-clock milliseconds.
+- Checking the token in application code but not in the resource transaction.
+- Omitting idempotency for retries of the current token.
+
+## Summary
+
+Leases allow takeover; fencing tokens prevent stale owners from mutating a protected resource. Persist and monotonically issue tokens, carry them through every irreversible operation, and enforce the comparison atomically at the resource. If the resource cannot enforce fencing, use an explicit idempotency/reconciliation contract instead.
+
+## Quiz Seeds
+
+1. Worker A holds token 41, pauses, and worker B obtains token 42. What must the resource do with A's late write?
+2. Why is a client wall clock unsuitable for a fencing token?
+3. What failure occurs if token validation and the data write are separate transactions?
+4. How would you protect an external payment API that supports idempotency keys but not fencing tokens?
+5. Why must token allocation survive coordinator restart?
+6. What is the difference between lease liveness and fencing safety?
+7. When is a database row version a simpler alternative?
+
+## Related Topics
+
+- [Distributed Locks](./distributed-locks.mdx)
+- [Clocks and Ordering](./clocks-and-ordering.mdx)
+- [Distributed Transactions and 2PC](./distributed-transactions-and-2pc.mdx)
+- [Consistency Models](../01-foundations/consistency-models.mdx)
+
+## References
+
+### Documentation / Articles
+
+- [How to do distributed locking](https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html) — explains why lease expiry is not enough and why fencing must reach the storage resource.
+- [The Chubby Lock Service for Loosely-Coupled Distributed Systems](https://research.google/pubs/the-chubby-lock-service-for-loosely-coupled-distributed-systems/) — grounds sessions, lock ownership, and failure handling in a deployed coordinator.
+- [Distributed locks with Redis](https://redis.io/docs/latest/develop/clients/patterns/distributed-locks/) — provides an implementation pattern whose assumptions should be evaluated against the resource contract.
+- [Conditional requests](https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/Conditional_requests) — shows HTTP entity tags and preconditions as a familiar resource-side version/fencing analogue.

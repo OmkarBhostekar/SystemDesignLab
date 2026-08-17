@@ -1,0 +1,199 @@
+---
+type: lesson
+id: 04-05-transaction-isolation
+slug: transaction-isolation
+title: Transaction Isolation and Anomalies
+description: Predict dirty reads, non-repeatable reads, phantoms, and write skew and choose an isolation response.
+module: databases
+order: 5
+difficulty: advanced
+estimatedMinutes: 45
+prerequisites:
+  - 04-04-acid-and-transactions
+  - 01-10-consistency-models
+tags:
+  - transactions
+  - isolation
+  - mvcc
+  - anomalies
+  - serializable
+objectives:
+  - Reproduce dirty reads, non-repeatable reads, phantom reads, and write skew with two concurrent transactions.
+  - Distinguish statement snapshots, transaction snapshots, locks, and serializability.
+  - Select an isolation level or explicit constraint/lock for a stated invariant, including a retry plan.
+  - Explain why stronger isolation can abort work and why repeatable reads do not automatically prevent write skew.
+relatedLessons:
+  - 04-04-acid-and-transactions
+  - 04-14-concurrency-control
+  - 04-06-database-indexes
+  - 01-10-consistency-models
+---
+
+# Transaction Isolation and Anomalies
+
+> Isolation is the rule for how concurrent transactions share observations and conflicts; it is a correctness choice with a measurable contention cost.
+
+## Why This Exists
+
+Atomic transactions can still produce a wrong result when their reads and writes interleave. Two doctors each check that another doctor is on call, then both go off call: every individual transaction saw a valid snapshot, yet the invariant “at least one doctor remains” is false. A booking check can see an empty seat twice while another transaction inserts a reservation. A report can read a value, another transaction commits, and the first read returns a different value later.
+
+The naive fix is “use a transaction,” but a transaction without an isolation model leaves these interleavings unspecified. The improvement names the anomaly and chooses a database guarantee, constraint, lock, or serializable retry. The new trade-off is waiting, aborts, memory, and lower concurrency.
+
+## Mental Model
+
+Think of each transaction as a sequence of reads/writes against a timeline. Isolation decides whether a read sees an uncommitted value, a new committed version, a stable snapshot, or a serial ordering. Four useful anomalies are:
+
+| Anomaly | Interleaving | Invariant at risk |
+| --- | --- | --- |
+| Dirty read | T1 writes but has not committed; T2 reads it; T1 rolls back | T2 acts on a value that never existed as committed state |
+| Non-repeatable read | T1 reads row X; T2 commits a change; T1 reads X again and differs | A decision assumes one row stayed stable |
+| Phantom read | T1 queries a predicate; T2 inserts/deletes a matching row; T1 repeats the predicate and gets a different set | Counts, ranges, or “no matching row” checks |
+| Write skew | T1 and T2 read overlapping facts, then update different rows; both pass their local check | A multi-row predicate invariant, such as coverage or capacity |
+
+Dirty read is about visibility of uncommitted data. Write skew can happen even when every read is from committed data and each transaction sees a stable snapshot. That distinction is why naming only “read consistency” is insufficient.
+
+## How It Works
+
+Isolation levels are not perfectly portable labels, so verify the selected engine. A common conceptual ladder is:
+
+| Level | Typical protection | Remaining work |
+| --- | --- | --- |
+| Read uncommitted | May allow dirty reads in some engines | Rarely appropriate for correctness decisions |
+| Read committed | No dirty reads; each statement can see a newer committed snapshot | Non-repeatable reads, phantoms, and write skew can remain |
+| Repeatable read/snapshot | Stable transaction snapshot; dirty and non-repeatable reads prevented | Predicate/write-skew anomalies may remain depending on engine; retries may still occur |
+| Serializable | Committed outcome is equivalent to some serial order | More conflict detection/blocking/abort and whole-transaction retries |
+
+Multiversion concurrency control (MVCC) keeps versions and gives a transaction a snapshot; locks can protect rows or predicates and coordinate writers. Snapshot isolation is not automatically serializable: two transactions can read the same old state and update disjoint rows. A unique constraint, exclusion constraint, `SELECT ... FOR UPDATE`, advisory/explicit lock, or serializable mode can encode the missing conflict—but each changes throughput or failure behavior.
+
+## Example
+
+For a clinic, invariant: **at least one doctor is on call for each shift.** Under snapshot/repeatable-read behavior:
+
+```text
+T1: SELECT count(*) WHERE shift = 'night' AND on_call = true  -- sees 2
+T2: SELECT count(*) WHERE shift = 'night' AND on_call = true  -- sees 2
+T1: UPDATE doctors SET on_call = false WHERE id = 'A'
+T2: UPDATE doctors SET on_call = false WHERE id = 'B'
+T1: COMMIT
+T2: COMMIT
+-- no doctor remains, even though each transaction saw one other doctor
+```
+
+The naive design uses read committed and the check/update pair; it permits write skew. One improvement locks all qualifying doctor rows or uses a serializable transaction and retries a serialization failure. Another changes the data model to a single shift row with an assignment count/owner so both transactions conflict on one record. That may create a hot row, but the invariant becomes easier to enforce. A database `CHECK` constraint alone cannot usually express “at least one row in this predicate” because it evaluates a row, not the entire concurrent set.
+
+For a seat, a unique constraint on `(show_id, seat_number)` prevents duplicate inserts even when two requests race. For a “reserve if available” counter, a single conditional update can be safer and cheaper than selecting then updating. Use the narrowest primitive that protects the actual invariant.
+
+In PostgreSQL, read committed starts each statement with a snapshot, repeatable read uses a transaction snapshot, and serializable can abort a transaction when the dependency graph cannot be serialized. A client must retry the complete transaction after a serialization failure; replaying only the last statement is not equivalent.
+
+## Visualization We Eventually Want
+
+Create an **anomaly scheduler** with two transaction lanes and a shared table. Presets should include dirty read, non-repeatable read, phantom range insert, doctor write skew, and seat uniqueness. Let learners step each read/write/commit, choose isolation, add a row/ predicate lock or unique constraint, and replay after abort.
+
+Show snapshots, row/predicate locks, versions, waits, aborts, invariant status, and retry count. Controls should vary transaction duration, conflict probability, retry backoff, and workload skew. A text timeline must state whether a guarantee comes from the engine's isolation level, a constraint, or application coordination. Include pause/reset and keyboard/reduced-motion behavior.
+
+## Scaling Behavior
+
+Stronger isolation can reduce effective throughput through locks, conflict tracking, snapshot memory, and retries. Long-running snapshots delay cleanup of old versions and increase storage. A serializable workload with high contention may spend significant CPU re-running aborted transactions; a weak level may appear fast until it permits an expensive business error.
+
+Partitioning changes the conflict surface. A row-level invariant can remain local, while a predicate across shards requires coordination or a redesigned owner. Read replicas generally do not solve transaction isolation for writes; a stale replica can make a decision based on an older state.
+
+## Failure Modes
+
+- **Wrong level by default:** A framework default is treated as a business guarantee without verifying engine behavior.
+- **Write skew:** Stable snapshots protect individual reads but not a multi-row predicate.
+- **Deadlock:** Explicit locks are acquired in inconsistent order; the engine aborts one transaction.
+- **Serialization storm:** Automatic retries run without bounds or jitter and overload the database.
+- **Phantom through a missing constraint:** A range check sees no row, but a concurrent insert wins.
+- **Stale read decision:** A replica or cache is used for a correctness-critical check.
+- **Long snapshot:** A report holds versions and blocks vacuum/cleanup or increases bloat.
+
+Mitigate with explicit isolation configuration, constraints, stable lock order, bounded retry budgets, metrics for abort/wait age, primary reads for decisions, and invariant-focused tests.
+
+## Trade-offs
+
+Weak isolation increases concurrency and may be adequate for independent point updates, but application checks can race. Strong isolation makes reasoning closer to single-threaded execution, but it costs conflict detection, blocking or retries, and potentially lower availability under contention. Constraints and single-row conditional operations can provide targeted protection more cheaply than raising every transaction to serializable.
+
+## Alternatives
+
+- **Unique/exclusion/check constraint:** Best for an invariant the engine can express declaratively.
+- **Row/predicate/advisory lock:** Best for a short, known critical section; define timeout and lock order.
+- **Optimistic version check:** Best when conflicts are rare and losing work can be retried or rejected.
+- **Pessimistic lock:** Best when conflict is likely and holding ownership briefly is cheaper than retrying.
+- **Serializable snapshot isolation:** Best when the invariant spans reads/writes and a robust retry loop is available.
+- **Single-owner/queue:** Best when all updates to one entity can be serialized asynchronously and latency allows it.
+
+## When to Use
+
+Use stronger isolation or explicit coordination when a concurrent schedule can violate a named invariant. Reproduce the interleaving, choose the smallest protection, and state how the application handles aborts, deadlocks, and timeouts.
+
+## When Not to Use
+
+Do not choose serializable globally to avoid understanding the invariant, and do not lower isolation merely because a benchmark is faster. Do not hold locks while waiting for a user or remote provider.
+
+## Common Misconceptions
+
+- **Repeatable read equals serializable everywhere.** Labels and anomaly behavior vary; verify the engine.
+- **No dirty reads means no anomalies.** Non-repeatable reads, phantoms, and write skew remain possible at stronger-than-dirty-read levels.
+- **A transaction-level snapshot sees the latest value.** It may intentionally be older than a concurrent commit.
+- **A `CHECK` constraint enforces a table-wide count.** Row constraints are not general predicate constraints.
+- **Retrying the failed statement is enough.** Serialization failure requires retrying the transaction's logical work.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I start from the invariant and an interleaving, not from the isolation-level name. Read committed prevents dirty reads but can allow non-repeatable reads, phantoms, and write skew; snapshot/repeatable read gives a stable view but may still allow predicate anomalies; serializable prevents non-serial outcomes by blocking or aborting, so the application must retry the whole transaction. Constraints, row/predicate locks, or a single-owner model can be a more targeted solution.
+
+### When to Introduce It
+
+Introduce isolation when a design has a check-then-write race, range/availability invariant, concurrent booking, balance, quota, or “at least one” rule.
+
+### Common Follow-Ups
+
+- Can you show the exact interleaving?
+- What does the chosen database implement for each level?
+- What is retried after a serialization failure?
+- Could a unique constraint or conditional update be simpler?
+- What happens to a read on a lagging replica?
+
+### Common Candidate Mistakes
+
+- Naming “serializable” without a retry and timeout plan.
+- Treating snapshot isolation as serializable.
+- Locking rows in arbitrary order.
+- Using stale reads for a booking or authorization decision.
+- Explaining anomalies without tying them to an invariant and observable outcome.
+
+## Summary
+
+- Isolation defines concurrent visibility/conflict, not whether a transaction is atomic or durable.
+- Dirty read, non-repeatable read, phantom, and write skew are different schedules with different fixes.
+- Stronger isolation can abort or block; a correct application retries the whole logical transaction.
+- Constraints, conditional writes, and targeted locks often protect one invariant more cheaply than globally stronger isolation.
+
+## Quiz Seeds
+
+1. Construct a dirty-read schedule and explain why a rollback makes T2's observation invalid.
+2. Why can two repeatable-read transactions both take doctors off call?
+3. When does a unique constraint solve a seat-booking race better than serializable isolation?
+4. Why is replaying only the final statement after a serialization failure unsafe?
+5. How can a lagging replica turn an otherwise safe check-then-write flow into an oversell?
+6. What is the cost of long-running snapshots at high write volume?
+7. Compare an optimistic version check with a row lock for a frequently edited document.
+8. What metrics reveal a serialization storm?
+
+## Related Topics
+
+- [ACID and transactions](acid-and-transactions.mdx)
+- [Concurrency control](concurrency-control.mdx)
+- [Database indexes](database-indexes.mdx)
+- [Consistency models](../01-foundations/consistency-models.mdx)
+
+## References
+
+### Documentation / Articles
+
+- [PostgreSQL: Transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html) — defines dirty, non-repeatable, phantom, and serialization anomalies and documents PostgreSQL's snapshot behavior.
+- [PostgreSQL: Explicit locking](https://www.postgresql.org/docs/current/explicit-locking.html) — documents table, row, and advisory lock modes and their blocking behavior.
+- [A critique of ANSI SQL isolation levels](https://www.microsoft.com/en-us/research/wp-content/uploads/2016/02/tr-95-51.pdf) — the foundational paper that clarifies anomaly-based isolation definitions and their limits.
+- [Amazon DynamoDB: Condition expressions](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Expressions.ConditionExpressions.html) — gives a concrete optimistic/conditional-write primitive for rejecting stale or conflicting updates.

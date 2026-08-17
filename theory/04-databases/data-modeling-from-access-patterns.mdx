@@ -1,0 +1,200 @@
+---
+type: lesson
+id: 04-01-data-modeling-from-access-patterns
+slug: data-modeling-from-access-patterns
+title: Data Modeling from Access Patterns
+description: Derive entities, keys, indexes, and ownership from the reads and writes the system must serve.
+module: databases
+order: 1
+difficulty: core
+estimatedMinutes: 35
+prerequisites:
+  - 00-04-interview-framework
+  - 01-10-consistency-models
+  - 02-07-api-design-interviews
+  - 03-08-service-boundaries
+tags:
+  - data-modeling
+  - access-patterns
+  - keys
+  - cardinality
+  - consistency
+objectives:
+  - Turn user journeys into explicit read, write, lookup, sort, and retention access patterns.
+  - Choose identifiers, ownership, constraints, and indexes that make the important paths bounded.
+  - Explain when normalization, embedding, or a projection follows from a requirement rather than a preference.
+  - Identify a likely hot key, large partition, or cross-owner transaction before choosing a database product.
+relatedLessons:
+  - 04-02-sql-vs-nosql
+  - 03-08-service-boundaries
+  - 01-10-consistency-models
+---
+
+# Data Modeling from Access Patterns
+
+> Model the questions the system must answer, then select a representation that keeps those questions correct and affordable.
+
+## Why This Exists
+
+A common first attempt is to list nouns from a prompt—`User`, `Post`, `Comment`, `Like`—and create one table for each. That can be a useful vocabulary exercise, but it does not say whether the product needs a user's newest posts, one post's comment page, a uniqueness check, or a count that can be slightly stale. A schema that looks tidy can still make the critical request scan millions of rows or coordinate unrelated owners.
+
+Start with the access patterns. A user journey such as “open a post” becomes several concrete operations: fetch the post by ID, fetch the first 50 comments in creation order, check whether the viewer liked it, and record a view event. Each operation has a key, expected result size, freshness requirement, and write behavior. The model is good when those properties are visible in the schema and the query plan, not when the table names sound domain-oriented.
+
+The improvement introduces a new trade-off: a read-optimized representation may duplicate fields, constrain future queries, or require a rebuild when a new access path matters. Modeling is choosing where to pay—at read time, write time, storage time, or operational time.
+
+## Mental Model
+
+Treat each access pattern as a contract between the application and storage:
+
+| Access-pattern field | Question to answer | Design consequence |
+| --- | --- | --- |
+| Actor and owner | Who may read or change the data? | Partition key, authorization boundary, and service ownership |
+| Operation | Point lookup, range, prefix, aggregate, or graph traversal? | Key shape and index/data structure |
+| Cardinality | One result, a page, or an unbounded set? | Pagination, partition size, and fan-out limit |
+| Ordering | Which order is meaningful and stable? | Sort key, index order, cursor, or precomputed rank |
+| Freshness | Must it reflect the latest committed write? | Transaction, replica choice, cache/projection policy |
+| Atomicity | Which fields must change together? | Transaction boundary or explicit workflow |
+| Growth | How do rows, bytes, and traffic grow? | Shard/partition strategy, retention, and archive path |
+
+An entity is a durable fact with an owner; an access pattern is a question about those facts. The same fact can have several representations—an authoritative normalized record and a denormalized feed row—provided the owner and update path are explicit.
+
+## How It Works
+
+Use this sequence in an interview or design review:
+
+1. List the critical user journeys and their success/failure semantics.
+2. Convert each journey into reads, writes, scans, sorts, counts, and background work. Name the expected result bound, such as “one page of 50,” rather than “get comments.”
+3. Mark the owner and invariant for every field. Ask whether two writes must commit together or can converge later.
+4. Choose stable identifiers. Separate a public identifier from a partition key when a sequential ID would create a hotspot or leak volume.
+5. Make the primary query cheap. In a relational system this may be a primary or composite index; in a key-value or wide-column system it is usually the partition and sort-key shape.
+6. Add constraints and indexes only for real access patterns. Define how uniqueness, nullability, foreign keys, and lifecycle state are enforced.
+7. Bound every collection. Use a cursor, time bucket, page limit, or archive instead of allowing one logical key to grow forever.
+8. Test the model against skew and the failure path: a celebrity tenant, a retry, a deleted owner, a stale replica, and a partial background projection.
+
+For a relational design, normalization is a useful default for authoritative facts: store a customer's address once, enforce a foreign key, and join when the access path and latency budget permit it. For a key-value design, co-locate records that are read together and accept that a new query may need another item shape. Neither rule is universal; the workload decides.
+
+## Example
+
+Suppose an online classroom supports “show a student's dashboard,” “submit an assignment,” and “list the latest submissions for a course.” A naive model has `students`, `courses`, `enrollments`, `assignments`, and `submissions`, then lets each dashboard request join and sort everything at request time.
+
+Write the access-pattern table before choosing indexes:
+
+| Pattern | Result bound | Freshness/atomicity | Candidate shape |
+| --- | --- | --- | --- |
+| Dashboard by student | one summary plus recent 20 items | enrollment and permission must be current | `enrollments(student_id, course_id)` plus bounded recent-submission query |
+| Submit assignment | one submission | idempotent per `(student, assignment, attempt)` | unique constraint and transaction for status + submission |
+| Course's latest submissions | page of 100, ordered by time | a few seconds of lag is acceptable for teaching staff | index `(course_id, submitted_at, submission_id)` or a projection keyed by course |
+| Regrade all submissions | asynchronous, unbounded | durable command and resumable progress | job table/event stream, not a request-time scan |
+
+The naive dashboard fails when a popular course creates a large join and every page sorts a growing submissions table. The first improvement is a composite index and cursor pagination. If the dashboard becomes read-heavy, maintain a student summary projection updated after the authoritative transaction. That removes repeated joins, but now a submission can be committed while the summary is briefly stale; the UI must label or tolerate that state, and a repair job must rebuild projections.
+
+The key is not “always denormalize.” It is being able to point to the access pattern that paid for each index or copy and name the invariant that remains authoritative.
+
+## Visualization We Eventually Want
+
+Build an **access-pattern workbench** with a small classroom dataset. Let the learner add a request pattern, choose a key, set result bounds and freshness, and drag records into normalized tables, embedded documents, or projections. Controls should include student/course skew, page size, write rate, index selectivity, replica lag, and projection failure.
+
+Show query work, rows examined, partition size, p50/p99 latency, write amplification, storage bytes, stale-result age, and repair backlog. Presets should compare “normalized joins,” “student dashboard projection,” and “unbounded course partition.” Play, pause, step, reset, keyboard controls, reduced motion, and a text event log are required. The simulator should let a learner change one access pattern and watch which indexes or projections become unnecessary or inadequate.
+
+## Scaling Behavior
+
+At small scale, a normalized relational schema and a few measured indexes are usually easier to operate. As rows and traffic grow, the result bound and partition distribution matter more than the table count. Time-based queries may need time buckets; tenant keys may need a tenant-plus-bucket key; high-cardinality entities may need independent partitions.
+
+Estimate both the average and the skewed case. A course with 10,000 students may be fine until one global course has 10 million submissions or a single user becomes a celebrity. Include index bytes, replicas, write amplification, retention, and backfill time. An index that makes reads fast can make every write more expensive and can delay a migration that needs to build it.
+
+## Failure Modes
+
+- **Unbounded collection:** One key accumulates millions of children, making reads, repairs, and deletes increasingly expensive. Bucket or archive it.
+- **Hot partition:** A popular tenant or current time bucket receives most writes. Salt, bucket, or route the hot entity deliberately; do not hide skew behind average QPS.
+- **Missing uniqueness:** A retry creates duplicate orders or submissions. Enforce an idempotency/unique key in the authoritative store.
+- **Cross-owner update:** One request mutates data owned by two services without a clear transaction or workflow. Keep a local invariant or introduce an explicit process.
+- **Projection drift:** A read model misses an update. Track version/offset, make rebuilds safe, and expose freshness rather than claiming immediate consistency.
+- **Wrong pagination:** Offset pagination becomes slower and unstable under inserts. Use a deterministic cursor such as `(created_at, id)`.
+
+## Trade-offs
+
+Access-pattern-first modeling makes critical reads predictable and exposes consistency decisions early. It can duplicate data, tie a table to a workload, constrain ad hoc queries, and require migrations or backfills when the product changes. Normalization saves update work and protects invariants but can make read paths join-heavy. Denormalization reduces read work but adds stale copies, write fan-out, and repair logic.
+
+## Alternatives
+
+- **Normalized relational model:** Prefer when many relationships, constraints, and evolving queries matter more than one fixed read shape.
+- **Query-shaped key-value/wide-column model:** Prefer when access patterns are known, scale-out and predictable partition reads dominate, and joins are avoidable.
+- **Search index:** Prefer for text relevance or faceting, but keep an authoritative source and accept indexing lag.
+- **Materialized/read projection:** Prefer for repeated read joins or aggregates whose freshness budget is explicit.
+- **Graph model:** Prefer for variable-depth relationship traversal, not merely because records have foreign keys.
+
+## When to Use
+
+Use this method whenever a prompt includes more than one read or write path, a non-functional target, or a choice among storage models. State the top three patterns, their result bounds, ownership, freshness, and expected skew before naming a product.
+
+## When Not to Use
+
+Do not prematurely encode every hypothetical query or create a copy for an unmeasured optimization. If the workload is small and exploratory, start with a simple authoritative model, instrument it, and let real access patterns justify specialized indexes or projections.
+
+## Common Misconceptions
+
+- **A schema is good because it is fully normalized.** Normalization is a correctness/default tool, not a latency guarantee.
+- **NoSQL means no modeling.** Key-value and wide-column stores are often stricter about query-shaped modeling.
+- **An index fixes any slow query.** It helps only when its ordering/selectivity and maintenance cost fit the predicate and result set.
+- **A projection is a second source of truth.** It should be rebuildable from the authoritative owner and carry a freshness contract.
+- **Average traffic is enough.** Skew, bursts, unbounded keys, and tenant concentration commonly determine failure first.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I start from the user journeys and write the bounded reads, writes, ordering, freshness, and atomicity each one needs. Then I assign ownership and invariants, choose keys and indexes that make the critical paths bounded, and test the model against skew, retries, and growth. If a read projection or denormalized copy is worthwhile, I name its source of truth, update path, lag, and repair strategy.
+
+### When to Introduce It
+
+Introduce access-pattern modeling immediately after requirements and rough estimates, before choosing SQL, NoSQL, cache, or shard count. Revisit it when a new scale or latency requirement appears.
+
+### Common Follow-Ups
+
+- What is the hottest key or largest logical partition?
+- Which fields must be changed atomically?
+- How does a retry avoid a duplicate?
+- How do you paginate and delete an unbounded collection?
+- Which copy is authoritative and how is a projection rebuilt?
+
+### Common Candidate Mistakes
+
+- Listing entities without writing the queries that use them.
+- Choosing a database brand before identifying ownership and guarantees.
+- Using offsets over a changing, large result set.
+- Treating every relationship as a synchronous cross-service join.
+- Ignoring index write cost, retention, skew, and migration/backfill time.
+
+## Summary
+
+- Access patterns turn vague features into bounded storage contracts.
+- Keys, ordering, constraints, and ownership should make important reads and writes predictable.
+- Normalize authoritative facts by default; add projections or duplication only with an explicit freshness and repair plan.
+- Model skew, retries, growth, and the largest logical key—not only average QPS.
+
+## Quiz Seeds
+
+1. Why is “get a user's posts” incomplete until the result bound, ordering, and freshness are specified?
+2. Design a cursor for records ordered by `(created_at, id)` and explain why `created_at` alone is unsafe.
+3. A single tenant owns 40% of writes. Which key changes or bucketing strategies would you consider, and what new read cost do they add?
+4. Which fields in an order submission need one transaction, and which analytics update can be asynchronous?
+5. Why can a composite index help one query while adding latency to every write?
+6. A projection is 30 seconds behind. Which user journeys can tolerate it, and how should the UI/metrics make the lag visible?
+7. Compare a normalized join, an embedded document, and a read projection for the classroom dashboard.
+8. Why is a query that scans an unbounded collection a modeling problem rather than only a hardware problem?
+
+## Related Topics
+
+- [SQL versus NoSQL](sql-vs-nosql.mdx)
+- [Storage models](storage-models.mdx)
+- [Service boundaries and data ownership](../03-traffic-and-services/service-boundaries.mdx)
+- [Consistency models](../01-foundations/consistency-models.mdx)
+
+## References
+
+### Documentation / Articles
+
+- [PostgreSQL: Data Definition](https://www.postgresql.org/docs/current/ddl.html) — grounds tables, constraints, schemas, and indexes as mechanisms that serve concrete access paths.
+- [Amazon DynamoDB: Core components](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/HowItWorks.CoreComponents.html) — explains partition keys, sort keys, and item collections in a query-shaped key-value model.
+- [Apache Cassandra data modeling introduction](https://cassandra.apache.org/doc/3.11/cassandra/data_modeling/intro.html) — explicitly frames wide-column modeling around application queries, storage, capacity, and consistency.
+- [MongoDB: Data modeling](https://www.mongodb.com/docs/manual/data-modeling/) — describes modeling decisions around workload, relationships, and read/write patterns for document data.

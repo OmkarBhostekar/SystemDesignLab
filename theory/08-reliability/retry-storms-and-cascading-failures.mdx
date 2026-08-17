@@ -1,0 +1,197 @@
+---
+type: lesson
+id: 08-04-retry-storms-and-cascading-failures
+slug: retry-storms-and-cascading-failures
+title: Retry Storms and Cascading Failures
+description: Trace how retries, saturation, and failover feedback can turn a local dependency fault into a system-wide outage.
+module: reliability
+order: 4
+difficulty: core
+estimatedMinutes: 30
+prerequisites:
+  - 08-02-retries
+  - 08-03-exponential-backoff-and-jitter
+  - 01-04-percentiles-tail-latency
+  - 03-04-health-checks-and-failover
+tags:
+  - retry-storms
+  - cascading-failures
+  - overload
+  - feedback-loops
+  - capacity
+objectives:
+  - Model retries as additional demand and identify positive feedback in a failure cascade.
+  - Explain how queueing, timeouts, health checks, and failover can amplify one another.
+  - Design retry budgets, load shedding, capacity reserves, and dependency isolation to break the loop.
+  - Distinguish root cause, amplifiers, and recovery actions during an incident.
+relatedLessons:
+  - 08-05-circuit-breaker
+  - 08-06-bulkhead
+  - 08-07-load-shedding-and-graceful-degradation
+---
+
+# Retry Storms and Cascading Failures
+
+> A cascade is a positive feedback loop: failure reduces capacity, retries add demand, latency triggers more timeouts, and the remaining capacity fails in turn.
+
+## Why This Exists
+
+Suppose a backend can sustain 10,000 QPS and starts returning errors at 10,100 QPS. A frontend retries 100 failed calls immediately. The backend now sees 10,200 QPS, rejects more work, and receives still more retries. If a load balancer ejects slow instances, traffic concentrates on fewer survivors; their queues grow, health checks fail, and the failure spreads.
+
+The naive fix is “add retries and autoscaling.” Autoscaling may arrive after queues and retries have already consumed resources; retries can multiply at every layer. Reliability engineering starts by breaking feedback: fail early, reduce offered load, isolate pools, and preserve capacity for recovery.
+
+## Mental Model
+
+```text
+dependency slows
+      ↓
+requests wait → timeouts/errors
+      ↓             ↑
+clients retry ──────┘
+      ↓
+more queue/CPU/connections → fewer healthy instances
+      ↓
+failover concentrates traffic → cascade
+```
+
+Useful quantities:
+
+```text
+offered load = original demand + retry demand + recovery/probe demand
+retry amplification ≈ attempts per request (often multiplied across layers)
+surviving capacity = healthy instances × sustainable capacity each
+```
+
+The system may be unstable even after traffic falls below the original breaking point because it is running with reduced capacity and a backlog of retries. Recovery often needs a deliberate load reduction, not only a restart.
+
+## How It Works
+
+1. A dependency slows or fails; callers hold resources until deadlines.
+2. Queues and in-flight requests grow; latency crosses timeout thresholds.
+3. Callers retry, adding work while original attempts may still be running.
+4. Health checks or outlier ejection remove slow instances, reducing capacity and concentrating load.
+5. Resource exhaustion causes more errors, process deaths, and retries—a positive feedback loop.
+
+Break the loop at several boundaries:
+
+- limit attempts with a per-request and process-wide retry budget;
+- use exponential backoff/jitter and honor overload signals;
+- shed low-value work and reject cheaply at the edge/worker;
+- isolate pools with bulkheads and circuit breakers;
+- reserve capacity for failover and recover with slow start;
+- propagate deadlines/cancellation so expired work stops consuming resources.
+
+During recovery, disable or reduce retries, drain queues deliberately, and restore traffic gradually. A restart that immediately receives the full retry wave can crash again.
+
+## Example
+
+A recommendation service normally handles 8,000 QPS and is called by every homepage request. Its database latency doubles during compaction. Homepages wait 800 ms, time out, and retry once. The frontend gateway also retries, so one user request can become four database attempts. Load balancer health checks share the same thread pool and start failing; half the recommendation instances are ejected. Remaining instances now receive 16,000 attempts and fail faster.
+
+Mitigation: mark recommendations optional, open a per-dependency circuit after measured failures, stop retries for the optional branch, return cached/default recommendations, and shed requests above a concurrency limit. The homepage core path remains healthy. After the database recovers, slowly close the circuit and warm instances rather than replaying every stale attempt at once.
+
+## Visualization We Eventually Want
+
+Show request rate, useful work, retries, queue depth, healthy capacity, and error rate on aligned charts. Controls should inject dependency latency/failure, set retry layers/attempts, health-check thresholds, capacity, queue limit, circuit breaker, bulkhead, and load shedding. Animate the feedback arrows and provide a **“recover”** phase where operators reduce load. Compare a naive restart with controlled recovery; include text explaining which action breaks the loop.
+
+## Scaling Behavior
+
+At large fan-out, small per-branch retry rates can become huge aggregate traffic. If each of four layers retries twice after the initial attempt, a single user action can create up to `3^4 = 81` downstream attempts in the worst case. A small overload at one shard can cascade through shared pools, DNS/service discovery, and regional failover.
+
+Capacity planning must include failure domains: if one zone/region is lost, the surviving pool should operate below its saturation point or have a shedding policy. Recovery capacity also needs warmup and queue-drain headroom.
+
+## Failure Modes
+
+- **Retry multiplication:** multiple libraries/services each add attempts.
+- **Queue saturation:** waiting requests consume memory and concurrency slots.
+- **Health-check cascade:** probes fail because the service is overloaded, causing more ejection.
+- **Failover overload:** traffic shifts to a pool without reserve capacity.
+- **Cache miss amplification:** a cache outage sends optional reads to the same stressed database.
+- **Autoscaling lag:** new capacity arrives too late or is immediately overwhelmed.
+- **Recovery storm:** queued/retried work floods a recovering dependency.
+
+## Trade-offs
+
+Shedding and fail-fast errors reduce total success during a peak but preserve a useful subset and enable recovery. Circuit breakers improve isolation but can hide partial recovery or create a thundering half-open probe. Bulkheads preserve critical tenants/workloads but may leave capacity idle in one pool. Spare capacity and slow start cost money while healthy; they buy failure and recovery margin.
+
+## Alternatives
+
+- **Queue backpressure:** let producers slow or reject based on bounded capacity.
+- **Load-aware admission:** accept requests only when concurrency/CPU/queue thresholds allow.
+- **Cell-based architecture:** isolate failure domains so one cell cannot exhaust all capacity.
+- **Static capacity reduction:** operator disables expensive features or traffic classes during an incident.
+- **Graceful degradation:** serve a lower-cost result instead of failing the entire request.
+
+## When to Use
+
+Treat cascade prevention as part of every multi-hop design. Model total offered load under one dependency failure, one zone loss, and retry behavior. Add budgets, isolation, degradation, shedding, and recovery runbooks before production.
+
+## When Not to Use
+
+Do not respond to a cascade by adding unlimited retries or blindly increasing timeouts. Do not assume autoscaling alone can break a positive feedback loop. Avoid globally ejecting a shared dependency's entire fleet based on one noisy signal.
+
+## Common Misconceptions
+
+- **“The root cause is the only fix.”** Amplifiers must be stopped before the root cause recovers.
+- **“Retry rate is just a symptom.”** It can be the dominant source of overload.
+- **“Health checks always protect availability.”** Under overload they can eject healthy capacity and worsen the cascade.
+- **“Dropping requests is failure.”** Controlled shedding can preserve the core service and recover faster.
+- **“Once demand is below normal capacity, recovery is automatic.”** Reduced capacity/backlog can keep the system unstable.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I model retries as new demand. A slow dependency causes timeouts, retries increase offered load, queues exhaust resources, health checks eject instances, and failover overloads the remainder. I break the loop with deadlines/cancellation, one bounded retry owner, jitter and budgets, circuit/bulkhead isolation, load shedding/degradation, spare capacity, and controlled recovery.
+
+### When to Introduce It
+
+Introduce cascade reasoning whenever the design has synchronous fan-out, retries, health checks, or failover. Ask what happens if one dependency is slow rather than simply dead.
+
+### Common Follow-Ups
+
+- How many downstream attempts can one user request produce?
+- Which traffic do you shed first?
+- How do health checks avoid making the outage worse?
+- How do you recover a system with a large retry backlog?
+
+### Common Candidate Mistakes
+
+- Drawing retries without calculating amplification.
+- Ignoring retry/health-check resource pools.
+- Moving all traffic to a surviving region without capacity reserve.
+- Restarting everything without reducing offered load.
+
+## Summary
+
+Cascades are feedback loops between demand, latency, retries, queues, health, and failover. Reliability comes from controlling offered load and isolating failure—not from making every request wait and retry. Design both the incident break and the recovery ramp.
+
+## Quiz Seeds
+
+1. Why can a service remain unstable after traffic drops below its original capacity?
+2. How many attempts can four layers with two retries each produce in the worst case?
+3. Why might health-check ejection worsen an overloaded service?
+4. Which traffic would you shed first on a recommendation dependency failure?
+5. What is the difference between root cause and amplifier in a retry storm?
+6. Why does a recovering dependency need slow start?
+7. How can a cache outage trigger a database cascade?
+
+## Related Topics
+
+- [Retries](./retries.mdx)
+- [Exponential Backoff and Jitter](./exponential-backoff-and-jitter.mdx)
+- [Circuit Breaker](./circuit-breaker.mdx)
+- [Bulkhead](./bulkhead.mdx)
+- [Load Shedding and Graceful Degradation](./load-shedding-and-graceful-degradation.mdx)
+
+## References
+
+### Documentation / Articles
+
+- [Addressing Cascading Failures](https://sre.google/sre-book/addressing-cascading-failures/) — Google SRE gives a detailed overload/retry cascade model and recovery guidance.
+- [Handling Overload](https://sre.google/sre-book/handling-overload/) — explains load shedding, graceful degradation, deadlines, and retry amplification.
+- [Production Services Best Practices](https://sre.google/sre-book/service-best-practices/) — connects capacity testing, overload behavior, and resilient service design.
+- [Using load shedding to avoid overload](https://aws.amazon.com/builders-library/using-load-shedding-to-avoid-overload/) — AWS Builders’ Library discusses protecting a service by rejecting work before collapse.
+
+### Papers
+
+- [The Tail at Scale](https://research.google/pubs/the-tail-at-scale/) — explains how tail behavior and fan-out amplify latency and failure probability.

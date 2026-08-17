@@ -1,0 +1,161 @@
+---
+type: lesson
+id: 05-07-cache-stampede
+slug: cache-stampede
+title: Cache Stampede
+description: Prevent synchronized misses from multiplying source load with jitter, coalescing, locks, and stale-while-revalidate.
+module: caching
+order: 7
+difficulty: core
+estimatedMinutes: 35
+prerequisites:
+  - 05-03-cache-aside
+  - 05-05-eviction-and-ttl
+  - 05-06-cache-invalidation
+tags:
+  - cache-stampede
+  - thundering-herd
+  - request-coalescing
+  - jitter
+  - stale-while-revalidate
+objectives:
+  - Explain how synchronized expiry or a cold cache amplifies a source request burst.
+  - Compare per-key single-flight, distributed locks, TTL jitter, early refresh, and stale-while-revalidate.
+  - Identify lock expiry, owner crash, and stale-serving trade-offs.
+  - Select layered mitigations that preserve source safety under a hot-key miss.
+relatedLessons:
+  - 05-05-eviction-and-ttl
+  - 05-08-hot-keys
+  - 05-09-multi-layer-caching
+  - 06-09-backpressure
+---
+
+# Cache Stampede
+
+> A stampede happens when many callers discover the same key is absent together and all perform the expensive fill; the cache has turned one miss into a coordinated overload.
+
+## Why This Exists
+
+Suppose a product entry expires at 12:00:00 and receives 1,000 reads/s. The naive cache-aside path lets every reader query the database and then overwrite the same key. The source sees the exact burst that the cache was meant to absorb. A cold restart or broad invalidation creates the same shape without a TTL boundary.
+
+The improvement is to coordinate fills or soften expiry. The new trade-off is waiting, lock management, stale responses, or speculative refresh work. A mitigation that protects one cache node but lets every process hit the source is incomplete.
+
+## Mental Model
+
+```text
+many readers ── miss key K ──┬─ loader ── source ── cache K
+                            └─ waiters ─────────────┘
+```
+
+**Request coalescing** (single-flight) lets one loader own a key while callers share its result. **A lock** coordinates across processes, but it needs a bounded lease and owner token. **Jitter** spreads expiry times. **Early refresh** reloads before the deadline. **Stale-while-revalidate (SWR)** serves an expired-but-allowed value while one worker refreshes it.
+
+## How It Works
+
+For a local process, keep an in-flight promise per key. On a distributed path, use an atomic “set if absent with expiry” lock such as `lock:K`, carrying a random owner token. The winner loads and writes the value, then releases only if the token still matches. Waiters poll or subscribe briefly; if the lock expires, they must not assume the old owner succeeded.
+
+Jitter changes `TTL = base ± random(delta)` within the freshness budget. Probabilistic early refresh chooses a fraction of requests to refresh as TTL approaches zero, avoiding a hard boundary. SWR needs two windows: a fresh window and a stale grace window. Outside the grace window, callers wait for a load or receive an error according to the product contract.
+
+## Example
+
+A flash-sale product page is cached for 30 seconds and receives 2,000 reads/s. Without coordination, a 150 ms database load can create hundreds of concurrent queries. With single-flight per product, one request loads while others wait up to 200 ms. If the database is unavailable, serving the previous value for a 10-second stale grace window protects the source but must label price data as unsafe for checkout.
+
+The naive global lock makes unrelated products wait behind one slow item. The improvement keys the lock by product and limits waiters. The new trade-off is one lock key per active miss, lock-expiry edge cases, and a possible wave of fallback requests when the loader fails.
+
+## Visualization We Eventually Want
+
+Build a **Stampede Control Room** with a timeline of readers, TTL expiry, source calls, locks, and refreshes. Controls should include arrival rate, key popularity, TTL distribution, loader latency, jitter, lock lease, waiter timeout, stale grace window, and source failure. Compare no mitigation, jitter only, local single-flight, distributed lock, and SWR. Show peak source concurrency, source QPS, wait latency, stale age, lock contention, and failed loads.
+
+## Scaling Behavior
+
+Coalescing reduces duplicate work per key, not total work across many keys. Distributed lock traffic and waiter polling grow with active misses. Jitter spreads load but does not reduce the number of misses. SWR moves work to background refreshes and can keep a hot key stable, while a cold-key population may waste refresh capacity. Apply bounded concurrency at both cache and source layers.
+
+## Failure Modes
+
+- Loader crashes while holding a lock; lease must expire without unsafe unlock by another owner.
+- Lock lease is shorter than the slowest load; a second loader starts and duplicates work.
+- Waiters time out together and stampede the source as fallback.
+- Stale grace is longer than the business freshness rule.
+- Refresh worker succeeds but writes an older version after a concurrent source update.
+- Broad invalidation creates one stampede per key at once.
+
+Use owner tokens, version checks, randomized waiter deadlines, bounded source concurrency, and metrics for coalesced requests, loader failures, lock expirations, and stale age.
+
+## Trade-offs
+
+Locks can protect a distributed source but add contention and operational complexity. Local single-flight is cheap but cannot coordinate across processes. Jitter is simple but does not help a cold cache. SWR improves tail latency and availability by serving stale data, but it changes freshness semantics and requires an error budget. Early refresh spends source capacity before a miss. Often the safest design combines jitter with per-key coalescing and a bounded stale fallback.
+
+## Alternatives
+
+- **Prewarming:** load a known hot set before traffic shifts; useful for predictable deployments, but can waste capacity.
+- **Rate limiting or load shedding:** protect the source when no stale value is safe.
+- **Publish-on-change:** keep hot keys updated from a durable event stream; adds event consistency work.
+- **Replica reads:** distribute miss load when slightly stale source reads are acceptable.
+
+## When to Use
+
+Use per-key coalescing whenever many callers can miss the same key. Add TTL jitter for large cohorts, distributed leases when processes share a source, and SWR only when stale responses are explicitly acceptable.
+
+## When Not to Use
+
+Do not serve stale values for correctness-critical authorization, payment, or inventory decisions. Do not use an unbounded global lock, and do not let lock failure trigger unlimited direct source retries.
+
+## Common Misconceptions
+
+- **A lock makes the load exactly once.** Crashes, lease expiry, and retries can still duplicate it.
+- **Jitter eliminates stampedes.** It spreads expiry; a hot key can still overload its shard.
+- **SWR is free availability.** It spends freshness budget and needs observability.
+- **Only TTL causes stampedes.** Deploys, invalidation, cache outages, and hot-key evictions do too.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> A stampede is correlated cache misses that multiply source work. I collapse misses per key with single-flight, use a short distributed lease with an owner token when coordination crosses processes, spread expiries with jitter, and optionally serve stale-while-revalidate within an explicit grace window. I bound waiters and fallback load because a lock or stale policy can otherwise move the overload rather than remove it.
+
+### When to Introduce It
+
+Introduce stampede controls when a popular key, synchronized TTL, cold start, or broad invalidation can produce more source concurrency than the source can serve.
+
+### Common Follow-Ups
+
+- What if the lock holder crashes?
+- How long can stale data be served?
+- Why is the lock per key?
+- What happens when all waiters time out?
+
+### Common Candidate Mistakes
+
+They use one global mutex, omit lock expiry ownership, and call stale-while-revalidate safe for all data.
+
+## Summary
+
+- A correlated miss is a workload multiplier, not merely a cache miss.
+- Per-key coalescing, leases, jitter, early refresh, and SWR solve different parts of the problem.
+- Lock ownership, bounded waiters, version checks, and stale budgets are required for safe mitigation.
+- Protect the source even when the cache is cold or unavailable.
+
+## Quiz Seeds
+
+1. At 1,000 reads/s and 200 ms source latency, what concurrency can a synchronized miss create before any retries?
+2. Why must a distributed lock carry an owner token on release?
+3. When does TTL jitter help, and when does it not?
+4. What is the difference between single-flight and stale-while-revalidate?
+5. How can a short lock lease create duplicate loaders?
+6. Which values should never be served stale during source failure?
+7. What metrics prove coalescing is protecting the source rather than merely increasing waiter latency?
+
+## Related Topics
+
+- [Eviction and TTL](eviction-and-ttl.mdx) explains expiry cohorts and jitter.
+- [Hot keys](hot-keys.mdx) covers one-key overload even with a warm cache.
+- [Multi-layer caching](multi-layer-caching.mdx) places coalescing at several boundaries.
+- [Backpressure](../06-messaging/backpressure.mdx) supplies bounded-concurrency and overload controls.
+
+## References
+
+### Documentation / Articles
+
+- [Redis cache-aside with Node.js](https://redis.io/docs/latest/develop/use-cases/cache-aside/nodejs/) — demonstrates atomic per-key locking, owner-token release, waiter polling, and stampede suppression.
+- [Redis cache-aside](https://redis.io/docs/latest/develop/use-cases/cache-aside/) — discusses popular-key expiration and probabilistic early refresh.
+- [Cache-Control header](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Cache-Control) — defines stale-while-revalidate and stale-if-error semantics for HTTP caches.
+- [HTTP caching (RFC 9111)](https://www.rfc-editor.org/rfc/rfc9111.html) — grounds freshness and revalidation behavior at intermediaries.

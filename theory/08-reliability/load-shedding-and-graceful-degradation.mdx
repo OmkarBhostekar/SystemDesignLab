@@ -1,0 +1,176 @@
+---
+type: lesson
+id: 08-07-load-shedding-and-graceful-degradation
+slug: load-shedding-and-graceful-degradation
+title: Load Shedding and Graceful Degradation
+description: Preserve core user value by rejecting excess work and reducing optional features before overload becomes total failure.
+module: reliability
+order: 7
+difficulty: core
+estimatedMinutes: 30
+prerequisites:
+  - 08-04-retry-storms-and-cascading-failures
+  - 08-06-bulkhead
+  - 03-04-health-checks-and-failover
+tags:
+  - load-shedding
+  - graceful-degradation
+  - admission-control
+  - overload
+  - priorities
+objectives:
+  - Distinguish load shedding (rejecting work) from graceful degradation (doing cheaper/less work).
+  - Choose admission signals, priorities, and user-visible fallbacks for an overloaded service.
+  - Design bounded queues and overload responses that do not hide latency or create retry loops.
+  - Explain how to protect critical traffic while preserving fairness and recovery capacity.
+relatedLessons:
+  - 08-06-bulkhead
+  - 08-05-circuit-breaker
+  - 08-08-disaster-recovery
+---
+
+# Load Shedding and Graceful Degradation
+
+> When demand exceeds safe capacity, deliberately doing less or rejecting selected work can preserve more useful service than accepting everything until all requests fail.
+
+## Why This Exists
+
+A homepage loads identity, feed, recommendations, ads, and analytics. If recommendations slow the database, the naive design waits for every feature before responding. Queueing grows, p99 explodes, and eventually the whole page fails. A service that returns `200` after 20 seconds is not healthy for a 500 ms user budget.
+
+**Load shedding** rejects work before it consumes expensive resources. **Graceful degradation** returns a lower-cost or partial result: cached recommendations, a smaller feed, or no optional module. Both require a product decision about priority and a truthful response contract. The trade-off is reduced functionality or explicit errors for some traffic.
+
+## Mental Model
+
+```text
+incoming work
+      ↓ admission: deadline, concurrency, queue, priority
+critical ───────────────> full path
+best effort ────────────> cheaper path / bounded reject
+excess / expired ───────> fast 429/503/drop
+```
+
+Admission signals can include queue depth/age, active concurrency, CPU/memory pressure, dependency health, request deadline, tenant quota, or an explicit overload token. Prefer cheap signals available before expensive work. A load-shed response must not trigger an uncontrolled client retry wave; include clear status/backoff semantics.
+
+## How It Works
+
+1. Classify requests by business value and deadline: checkout, login, read feed, recommendations, telemetry.
+2. Check an admission budget before acquiring a scarce pool/connection.
+3. If safe, perform full work; if pressure is high, degrade optional branches or lower result quality.
+4. If no safe path remains, reject quickly with a retryable/non-retryable response and a request ID.
+5. Reserve capacity for critical traffic and recovery/control-plane operations.
+6. Measure shed/degraded volume, user impact, queue age, and recovery; rehearse thresholds under load.
+
+Graceful degradation must be explicit in API/UI semantics. A cached recommendation can include freshness metadata; a partial feed can state that ranking is unavailable. Silent stale data may violate a business invariant.
+
+## Example
+
+At peak, a news feed service receives 20,000 QPS. It keeps 30% concurrency reserve for posting and login. When ranking latency exceeds its budget, it returns the chronological cached feed and skips expensive personalization. If queue age exceeds 200 ms, it rejects low-priority prefetch and analytics with `429`/`202` semantics while preserving interactive reads. It does not retry shed requests immediately; clients use backoff or wait for a pollable job.
+
+If the database itself is near saturation, a fallback that queries another table may worsen the incident. The cheaper path must be tested under failure load and should have independent cache/pool capacity.
+
+## Visualization We Eventually Want
+
+Show incoming priority classes, admission gates, queues, full/degraded paths, and rejection. Controls should set traffic mix, capacity, queue limits, reserve percentage, dependency latency, degradation toggles, and client retry behavior. Display useful responses, degraded responses, shed count, queue age, p99, and recovery time. Presets should compare “accept all,” “shed low priority,” “serve cached,” and “disable optional feature” under the same overload.
+
+## Scaling Behavior
+
+Admission thresholds must account for peak bursts, per-instance versus fleet metrics, and failover capacity. A global queue may provide fairness but becomes a bottleneck; local queues react faster but can make one instance shed while another is idle. Use consistent routing/cells or work stealing where appropriate.
+
+As traffic grows, static priority lists can starve lower classes. Add quotas, aging, or a reserved minimum. Shedding at the edge saves downstream work; shedding late may already have consumed connections and CPU.
+
+## Failure Modes
+
+- **Wrong priority:** essential payment or auth is shed while optional analytics succeeds.
+- **Retry loop:** clients immediately retry `429/503`, converting shedding into a storm.
+- **Fallback coupling:** degraded path uses the same failing database or pool.
+- **Hidden latency:** a bounded but too-large queue returns slow responses instead of shedding.
+- **Starvation:** low-priority tenants never receive capacity.
+- **Threshold flapping:** rapid toggling between full and degraded modes causes cache churn.
+- **Inconsistent behavior:** one instance sheds based on local pressure while another overloads.
+- **Data correctness:** stale/partial result is presented as fresh/complete.
+
+## Trade-offs
+
+Shedding protects availability and recovery at the cost of rejected work; degradation preserves more requests but may reduce quality or freshness. Edge shedding saves the most resources but has less domain context. Application-level degradation understands business value but adds feature coupling. Reservations improve critical reliability but reduce peak utilization.
+
+## Alternatives
+
+- **Autoscaling:** add capacity for sustained demand, not immediate overload.
+- **Queue/backpressure:** slow producers or make work durable when completion can be delayed.
+- **Bulkhead/priority pools:** isolate before admission decisions.
+- **Circuit breaker:** skip a failing dependency and use a fallback.
+- **Rate limiting/quotas:** prevent one tenant/client from consuming capacity before system overload.
+
+## When to Use
+
+Use shedding/degradation whenever overload is possible and some work is optional or prioritizable. Define the user-visible contract, thresholds, reserve, retry response, and recovery policy before launch.
+
+## When Not to Use
+
+Do not degrade an operation whose correctness invariant requires the full result (for example, silently accepting an uncertain ledger write). Do not shed without communicating retryability and fairness. If every request is equally critical, focus on admission/queueing and capacity rather than arbitrary priority.
+
+## Common Misconceptions
+
+- **“Dropping requests is always worse.”** Controlled shedding can prevent a complete outage.
+- **“Graceful degradation means stale data is fine.”** Freshness and business limits must be explicit.
+- **“HTTP 503 automatically slows clients.”** Clients need a bounded retry policy/backoff.
+- **“Fallback is free.”** It has its own resource and correctness cost.
+- **“Autoscaling solves overload.”** Scaling latency and shared dependencies can leave the cascade intact.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I classify traffic by business value, reserve capacity for critical paths, and admit work only while queues/concurrency fit the deadline. Under pressure I degrade optional features or serve a cheaper cached result; when no safe path remains I shed low-priority work quickly with clear retry semantics. I capacity-test the fallback and protect recovery from a retry wave.
+
+### When to Introduce It
+
+Introduce shedding/degradation after showing a dependency outage, traffic spike, or queue saturation that cannot be fixed instantly by scaling. Tie each shed/degraded class to a requirement.
+
+### Common Follow-Ups
+
+- What work is critical versus optional?
+- How do clients learn whether a response is degraded or retryable?
+- Where is admission enforced, and what metrics drive it?
+- What prevents starvation or fallback overload?
+
+### Common Candidate Mistakes
+
+- Saying “return cached data” without freshness/independence analysis.
+- Shedding randomly with no priority or tenant fairness.
+- Returning `503` while clients immediately retry all requests.
+- Ignoring control-plane/recovery reserve capacity.
+
+## Summary
+
+Load shedding controls offered work; graceful degradation preserves core value with less expensive/complete behavior. Both require explicit priorities, bounded queues, clear client semantics, independent fallback capacity, and measured recovery.
+
+## Quiz Seeds
+
+1. Which should be shed first on a homepage dependency failure: checkout or recommendations, and why?
+2. How does a bounded queue differ from load shedding?
+3. Why can immediate retries defeat a correct shedding policy?
+4. What should a degraded response communicate to the client?
+5. How can a fallback cause the same cascade as the primary path?
+6. Where should shedding happen to save the most downstream resources?
+7. What reserve capacity is needed for control-plane/recovery traffic?
+
+## Related Topics
+
+- [Bulkhead](./bulkhead.mdx)
+- [Circuit Breaker](./circuit-breaker.mdx)
+- [Retry Storms and Cascading Failures](./retry-storms-and-cascading-failures.mdx)
+- [Disaster Recovery](./disaster-recovery.mdx)
+
+## References
+
+### Documentation / Articles
+
+- [Using load shedding to avoid overload](https://aws.amazon.com/builders-library/using-load-shedding-to-avoid-overload/) — AWS explains admission/load-shedding choices and preserving useful work.
+- [Handling Overload](https://sre.google/sre-book/handling-overload/) — Google SRE covers graceful degradation, dynamic timeouts, and rejecting excess traffic.
+- [Production Services Best Practices](https://sre.google/sre-book/service-best-practices/) — connects overload behavior to service SLOs and capacity testing.
+- [Bulkhead pattern](https://learn.microsoft.com/en-us/azure/architecture/patterns/bulkhead) — resource isolation complements admission and degradation.
+
+### Papers
+
+- [The Tail at Scale](https://research.google/pubs/the-tail-at-scale/) — grounds partial/degraded responses in tail-latency behavior.

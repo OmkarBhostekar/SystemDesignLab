@@ -1,0 +1,179 @@
+---
+type: lesson
+id: 07-06-distributed-transactions-and-2pc
+slug: distributed-transactions-and-2pc
+title: Distributed Transactions and Two-Phase Commit
+description: Coordinate atomic commit across independent resource managers and understand why the coordinator can block.
+module: distributed-coordination
+order: 6
+difficulty: advanced
+estimatedMinutes: 35
+prerequisites:
+  - 07-03-consensus-and-raft-intuition
+  - 01-10-consistency-models
+  - 03-08-service-boundaries
+tags:
+  - distributed-transactions
+  - two-phase-commit
+  - 2pc
+  - atomic-commit
+  - blocking
+objectives:
+  - Explain why independent service transactions cannot be made atomic by simply calling each service in sequence.
+  - Describe prepare and commit phases, participant durable state, and coordinator recovery at intuition level.
+  - Identify blocking, latency, lock retention, and heuristic-outcome risks in two-phase commit.
+  - Decide when a local transaction, 2PC, or a saga better matches the business invariant.
+relatedLessons:
+  - 07-07-saga-pattern
+  - 07-08-transactional-outbox
+  - 07-05-leases-and-fencing-tokens
+---
+
+# Distributed Transactions and Two-Phase Commit
+
+> Two-phase commit coordinates an all-or-nothing decision across participants, but it can hold resources while the coordinator is unreachable and does not make slow networks disappear.
+
+## Why This Exists
+
+An order service writes `Order=CONFIRMED` while an inventory service decrements stock. If the order commit succeeds and the inventory call fails, the system may promise an item it cannot ship. The naive sequential workflow—call service A, then service B, and undo A on failure—has no automatic atomicity: the process can crash between calls, and a “compensating” update may itself fail or have different business meaning.
+
+Two-phase commit (2PC) introduces a coordinator and a durable decision. Participants first promise that they can commit, then all apply the same final decision. The cost is a longer critical section, coordinator/participant recovery protocols, and a blocking window when a participant cannot learn the decision.
+
+## Mental Model
+
+```text
+coordinator                    participants
+     |                         inventory   order
+     |── PREPARE ────────────────>|          |
+     |<── YES + durable promise ──|          |
+     |── COMMIT (decision) ──────>|─────────|
+     |<── ACK ────────────────────|─────────|
+```
+
+The prepare response means “I have validated and durably recorded enough state to commit later,” not “the business effect is already visible.” Once a participant says yes, it may hold locks or provisional resources. The coordinator's commit decision must be durable before it can safely recover from a crash.
+
+## How It Works
+
+### Phase 1: prepare
+
+The coordinator assigns a transaction ID and asks every participant to prepare. Each participant validates constraints, obtains needed locks/reservations, writes a prepared record to durable storage, and replies `YES` or `NO`. A single `NO` causes a global abort. A timeout is not a safe `NO` unless the protocol explicitly chooses that policy; a participant may already have prepared.
+
+### Phase 2: commit or abort
+
+If all participants voted yes, the coordinator durably records `COMMIT` and sends it to every participant. Participants apply/retain the commit, release locks, and acknowledge. If any participant voted no, the coordinator records `ABORT` and informs all participants. A participant that crashes after prepare recovers its prepared transaction and asks the coordinator or a durable recovery service for the decision.
+
+The protocol assumes participants can keep their prepared state and that the coordinator's decision is recoverable. It does not guarantee a bounded completion time when a participant or coordinator is unavailable. An in-doubt transaction may remain prepared, holding resources, until an operator or recovery mechanism resolves it.
+
+## Example
+
+A ticket purchase reserves a seat in the inventory database and charges an internal wallet database. Both are under one organization and support a transaction manager. The coordinator prepares both: inventory holds seat `A12`, wallet verifies funds and records a prepared debit. After durable `COMMIT`, both make the result visible.
+
+Now the coordinator crashes after participants prepare but before the decision is available to them. Inventory cannot safely release the seat just because a timeout elapsed: the wallet may later receive `COMMIT`. Holding the seat protects atomicity but hurts availability and user experience. A recovery coordinator can read the durable decision log; if the log is lost, manual/heuristic resolution may break atomicity.
+
+If inventory and payment are independent providers with no shared transaction manager, 2PC is not available. A saga with pending order state, a payment authorization, and compensation is usually more realistic. A single relational database for the invariant may be simpler than either distributed protocol.
+
+## Visualization We Eventually Want
+
+Show a coordinator and two participants with transaction states (`working`, `prepared`, `committed`, `aborted`, `in-doubt`). Controls should fail a participant before/after prepare, crash the coordinator at each point, delay commit messages, change lock duration, and trigger recovery. Display time spent holding resources, visible versus provisional inventory, and the point at which 2PC blocks. Compare a local transaction and saga in a side-by-side scenario, while labeling that the simulator omits vendor-specific recovery details.
+
+## Scaling Behavior
+
+Commit latency includes the slowest participant and coordinator round trips. More participants increase prepare/commit messages and the probability that one is slow or unavailable. A coordinator can become a throughput bottleneck; shard transaction coordinators by workload, but cross-shard atomicity still needs a protocol.
+
+Prepared state consumes locks, connection slots, log space, and operational attention. Long-running business workflows are a poor fit: the system may retain resources for minutes while a user waits. Monitoring in-doubt transaction count and age is part of capacity planning.
+
+## Failure Modes
+
+- **Coordinator crash before decision:** participants may block in prepared state.
+- **Participant crash after prepare:** recovery must locate the durable decision before releasing or committing.
+- **Network partition:** messages and acknowledgements can be delayed; guessing can violate atomicity.
+- **Lost commit acknowledgement:** the participant may have committed even though the coordinator retries.
+- **Heuristic commit/abort:** a participant unilaterally resolves an in-doubt record and can diverge from others.
+- **Long locks:** unrelated requests queue behind a prepared transaction.
+- **Non-transactional side effect:** email, payment network, or object storage cannot be rolled back by 2PC unless it supports a compatible protocol.
+
+## Trade-offs
+
+2PC offers a simple atomic outcome for compatible resource managers, but adds coordinator dependency, synchronous latency, prepared-state locks, and blocking under uncertainty. It can be a good fit inside one organization and tightly bounded transactions; it is a poor fit for internet-scale services and human-paced workflows. A saga improves availability and duration by accepting intermediate states, but compensation is application-specific and not the same as rollback.
+
+## Alternatives
+
+- **Single local transaction:** prefer when one database can own the invariant.
+- **Saga:** prefer for long-running business workflows across service boundaries, with compensating actions and explicit pending states.
+- **Transactional outbox:** prefer when the real problem is atomic database change plus event publication, not atomic updates across databases.
+- **Reservation/authorization protocol:** prefer when an external provider exposes hold/capture/refund semantics instead of 2PC.
+- **Consensus-backed state machine:** prefer for one replicated authority, not arbitrary cross-resource atomic commit.
+
+## When to Use
+
+Consider 2PC when all participants implement a compatible transaction contract, the transaction is short, the atomic invariant is stronger than availability, and the team can operate recovery for in-doubt records. State the participant count, timeout, lock budget, and recovery owner.
+
+## When Not to Use
+
+Do not call a REST API and label the sequence 2PC. Do not use 2PC for long user workflows, uncooperative external providers, or a problem solved by one local transaction. Do not hide an in-doubt transaction behind an infinite timeout.
+
+## Common Misconceptions
+
+- **“Prepare means committed.”** It is a durable promise plus usually held resources.
+- **“A timeout means abort.”** The coordinator may be unreachable after commit; participants need the decision.
+- **“2PC gives high availability.”** It can block when a coordinator/participant is unavailable.
+- **“Compensation is equivalent to rollback.”** A refund or release may be delayed, partial, or subject to new business rules.
+- **“Exactly once external action comes for free.”** External APIs still need idempotency/reconciliation.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> Two-phase commit coordinates compatible participants in prepare and commit phases. Each participant durably promises it can commit, the coordinator records a decision, and all participants apply that decision. It provides atomic outcome but can block with prepared locks when the coordinator or a participant is unavailable, so I prefer a local transaction or saga when workflows are long or cross-provider.
+
+### When to Introduce It
+
+Introduce 2PC only after confirming a strict cross-resource atomic invariant and compatible transaction managers. Contrast it with the simpler local transaction, outbox, and saga choices.
+
+### Common Follow-Ups
+
+- What if the coordinator crashes between prepare and commit?
+- How are in-doubt transactions recovered?
+- Why does a saga improve availability but lose isolation?
+- Which external side effects can participate in 2PC?
+
+### Common Candidate Mistakes
+
+- Treating a sequence of HTTP calls as a distributed transaction.
+- Ignoring locks and prepared-state growth.
+- Claiming 2PC is non-blocking under partition.
+- Forgetting that payment/network side effects may be irreversible.
+
+## Summary
+
+2PC can provide atomic commit only across participants that implement its contract. Prepare holds a durable promise and often resources; commit is a separate decision. The protocol's safety comes with blocking, latency, recovery, and operational complexity, so a local transaction or saga is often the better interview answer.
+
+## Quiz Seeds
+
+1. Why can a participant not safely abort a prepared transaction just because the coordinator is silent?
+2. What resources may remain held while a transaction is in-doubt?
+3. When is an outbox a better answer than 2PC?
+4. What does a participant need to persist before replying `YES`?
+5. Why is a human-paced payment workflow usually a poor 2PC candidate?
+6. Compare a refund compensation with an ACID rollback.
+7. What failure can occur if a participant heuristically commits while another aborts?
+
+## Related Topics
+
+- [Consensus and Raft Intuition](./consensus-and-raft-intuition.mdx)
+- [Saga Pattern](./saga-pattern.mdx)
+- [Transactional Outbox](./transactional-outbox.mdx)
+- [Health Checks and Failover](../03-traffic-and-services/health-checks-and-failover.mdx)
+
+## References
+
+### Documentation / Articles
+
+- [PREPARE TRANSACTION](https://www.postgresql.org/docs/current/sql-prepare-transaction.html) — PostgreSQL documents the prepared-transaction state and operational warning about lingering prepared transactions.
+- [Two-Phase Commit](https://zookeeper.apache.org/doc/current/recipes.html#sc_twoPhasedCommit) — ZooKeeper's recipe illustrates the coordination sequence and its client-side nature.
+- [Managing Distributed Transactions](https://docs.oracle.com/en/database/oracle/oracle-database/19/admin/managing-distributed-transactions.html) — Oracle documentation covers distributed transaction participants, recovery, and in-doubt outcomes.
+- [Distributed Transactions](https://www.cockroachlabs.com/docs/stable/transactions) — a modern database perspective on transaction retries, contention, and distributed commit costs.
+
+### Papers
+
+- [Transaction Processing: Concepts and Techniques](https://www.microsoft.com/en-us/research/publication/transaction-processing-concepts-and-techniques/) — Gray and Reuter's foundational transaction-processing reference, including distributed commit context.

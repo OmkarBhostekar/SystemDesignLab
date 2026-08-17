@@ -1,6 +1,6 @@
 # Module 04 — Data and Databases
 
-**Status:** Scaffold only. This is planned as the deepest theory module; its lessons, references, visualizations, and quizzes remain to be authored.
+**Status:** Theory complete — all 14 intended lessons are authored and indexed. Interactive visualizations and structured quizzes remain future application work; every lesson includes a behavior-oriented visualization specification and reasoning quiz seeds.
 
 ## Purpose
 
@@ -47,5 +47,21 @@ This module spans the full curriculum depth range:
 
 ## Authoring boundary
 
-The module ordering is a dependency scaffold, not a completed database course. Future lessons should make anomalies and scaling behavior observable, state assumptions, and link to authoritative references. No database technology should be presented as universally correct.
+The module ordering is a dependency-aware learning path. The authored lessons make anomalies, index/compaction behavior, replica lag, rebalancing, quorum overlap, pool saturation, and concurrency races observable in prose and future visualization specifications. They state assumptions, distinguish local from distributed guarantees, and link to direct authoritative documentation or original research. No database technology is presented as universally correct.
 
+## Authored contents
+
+1. [Data modeling from access patterns](data-modeling-from-access-patterns.mdx) — turns journeys into bounded reads, writes, keys, ownership, and invariants.
+2. [SQL versus NoSQL](sql-vs-nosql.mdx) — compares relational and non-relational choices by workload, guarantees, and operations.
+3. [Storage models](storage-models.mdx) — contrasts relational, key-value, document, wide-column, and graph locality.
+4. [ACID and transactions](acid-and-transactions.mdx) — scopes atomicity, consistency, isolation, durability, WAL, and external workflows.
+5. [Transaction isolation](transaction-isolation.mdx) — reproduces dirty reads, non-repeatable reads, phantoms, and write skew.
+6. [Database indexes](database-indexes.mdx) — covers B-trees, composite/covering indexes, selectivity, plans, and write cost.
+7. [B-tree versus LSM trees](b-tree-vs-lsm.mdx) — compares read/write/space amplification, SSTables, and compaction.
+8. [Replication](replication.mdx) — explains leader/follower copies, sync/async lag, read routing, and failover.
+9. [Partitioning and sharding](partitioning-and-sharding.mdx) — covers range/hash/directory ownership, hotspots, and live movement.
+10. [Consistent hashing](consistent-hashing.mdx) — explains ring ownership, virtual nodes, remapping, and hot-key limits.
+11. [Read and write quorums](read-write-quorums.mdx) — derives N/R/W overlap while separating it from linearizability.
+12. [Denormalization](denormalization.mdx) — designs versioned read models with freshness, fan-out, and rebuild plans.
+13. [Connection pools](connection-pools.mdx) — treats pooling as reuse plus a bounded concurrency queue.
+14. [Concurrency control](concurrency-control.mdx) — compares optimistic versions, pessimistic locks, constraints, and holds.

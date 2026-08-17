@@ -1,0 +1,189 @@
+---
+type: lesson
+id: 04-11-read-write-quorums
+slug: read-write-quorums
+title: Read and Write Quorums
+description: Reason about N, R, and W acknowledgments, overlap, latency, availability, and the assumptions behind quorum reads.
+module: databases
+order: 11
+difficulty: advanced
+estimatedMinutes: 45
+prerequisites:
+  - 04-08-replication
+  - 04-10-consistent-hashing
+  - 01-09-cap
+  - 01-10-consistency-models
+tags:
+  - quorums
+  - replication
+  - consistency
+  - availability
+  - read-repair
+objectives:
+  - Define N, R, and W and calculate quorum overlap for a replicated key.
+  - Explain why R plus W greater than N is a useful overlap condition under explicit assumptions.
+  - Compare latency, availability, stale reads, conflict resolution, hinted/sloppy quorum, and repair behavior.
+  - Avoid claiming linearizability, exactly-once, or consensus-like guarantees from quorum arithmetic alone.
+relatedLessons:
+  - 04-08-replication
+  - 04-10-consistent-hashing
+  - 04-09-partitioning-and-sharding
+  - 01-09-cap
+---
+
+# Read and Write Quorums
+
+> A quorum is an acknowledgment policy over replicas; overlap can improve visibility, but only the whole protocol defines consistency.
+
+## Why This Exists
+
+With three replicas, waiting for all three on every read and write gives a simple freshness story but fails whenever one replica is slow or unavailable. Waiting for one is available and fast, but a read can miss a recent write. A quorum lets the system continue with a subset while seeking intersection between the replicas that acknowledged a write and those consulted for a read.
+
+The naive slogan is `R + W > N, therefore strong consistency`. The improvement is to state the assumptions: the same replica set, a version/order rule, no stale replica returning an older version as newest, and repair/timeout behavior that respects the chosen contract. Sloppy quorums, hinted handoff, concurrent writes, clock conflict resolution, and failover can change the guarantee.
+
+## Mental Model
+
+For one key:
+
+- `N` is the number of replicas that should hold the key.
+- `W` is the number of replica acknowledgments required before a write response.
+- `R` is the number of replica responses consulted for a read.
+
+If `R + W > N`, any R-sized read set and W-sized write set must share at least one replica **when both sets are subsets of the same N replicas**. That intersection can reveal the write if versions are compared and the read returns the newest valid version. For `N=3`, `W=2`, `R=2`, the sets must overlap by at least one.
+
+The arithmetic does not say which version wins, whether a concurrent write is ordered, whether an acknowledged write is durable across a region, or whether a partition can satisfy both sides. It also does not guarantee every read contacts exactly R nodes; speculative reads, local quorums, caches, and repair may alter the path.
+
+## How It Works
+
+A coordinator hashes a key to its replica set, sends a write to all/eligible replicas, waits for W responses, and returns success. It may record a hint for an unavailable replica. A read asks R replicas (or enough local replicas), compares versions/timestamps/vector metadata, returns a chosen value, and may repair stale replicas.
+
+Common configurations:
+
+| N | W | R | Typical direction | Cost |
+| --- | --- | --- | --- | --- |
+| 3 | 1 | 1 | Fast/available, weak visibility | Stale reads and repair/conflict risk |
+| 3 | 2 | 2 | Quorum overlap | More latency and failure sensitivity |
+| 3 | 3 | 1 | Fresh writes before success | Writes fail if any required replica is unavailable; read may trust one |
+| 3 | 1 | 3 | Read freshness by sampling all | Read latency and availability depend on all |
+
+“Majority” means more than half of a particular set; `QUORUM` may be local-datacenter, global, or an engine-specific consistency level. Read and write quorums should be aligned with failure domains: three replicas in one rack do not survive a rack failure, even if arithmetic is perfect.
+
+## Example
+
+An availability store has `N=3`. A write at `W=2` reaches A and B; C is partitioned. A read at `R=2` contacts A and C. The overlap A exposes the new version, assuming A responds and the protocol compares versions. A read to B and C may also see it through B. If the read instead uses `R=1`, it can contact stale C and return old data.
+
+The improvement from `W=1,R=1` to `W=2,R=2` reduces stale-read probability/possibility under the overlap assumptions but increases latency and causes writes/reads to fail when fewer than two suitable replicas are reachable. Under a network partition, an engine may choose a sloppy quorum on non-owner nodes to preserve availability; that relaxes the simple same-replica-set intersection and requires hinted handoff/repair.
+
+Now consider two concurrent writes to the same key. Both can receive W acknowledgments. Quorum overlap does not define a total order or business merge. Last-write-wins can discard one update based on timestamps; vector clocks or application conflict resolution may preserve alternatives. A quorum also does not make an increment safe if replicas apply non-commutative operations independently.
+
+## Visualization We Eventually Want
+
+Build a **quorum matrix simulator** with N replicas and adjustable R/W. Let learners partition links, delay replicas, choose version/conflict rules, enable sloppy quorum, and inject concurrent writes.
+
+Show contacted sets, overlap size, acknowledgment latency, success/failure, stale-version returns, conflict count, hinted bytes, repair backlog, and failure-domain placement. Presets should compare `(3,1,1)`, `(3,2,2)`, `(3,3,1)`, local quorum across two zones, and a partition with sloppy quorum. The event log must label assumptions and explicitly distinguish “newest response observed” from “linearizable read.” Include pause/step/reset, keyboard controls, and reduced-motion mode.
+
+## Scaling Behavior
+
+Increasing N increases copies, network traffic, repair, and storage. Raising R or W increases per-operation fan-out/latency and reduces the number of failures tolerated before an operation fails. Cross-region quorums add distance and may make a partition unavailable; local quorums trade global freshness for regional latency/availability.
+
+At high skew, the coordinator or replica set for one key is hot even if aggregate load is balanced. Quorum read/write work also competes with hinted handoff, anti-entropy, compaction, and repair. Track p99 quorum latency, unavailable responses, conflict/repair rate, stale age, and replica-set hotness.
+
+## Failure Modes
+
+- **Arithmetic overclaim:** `R+W>N` is treated as linearizability or consensus.
+- **Different sets:** Sloppy quorum, topology changes, or ring disagreement mean read/write sets are not the same N replicas.
+- **Concurrent writes:** Overlap sees versions but does not decide business merge/order.
+- **Stale cache/read path:** A cache or local replica bypasses the quorum contract.
+- **Clock conflict:** Last-write-wins loses a concurrent update under clock skew or timestamp choice.
+- **Repair backlog:** Hints/read repair/anti-entropy lag, extending divergence beyond the intended window.
+- **Failure-domain illusion:** Majority replicas share one rack/zone and fail together.
+
+Mitigate with an explicit consistency level per operation, failure-domain placement, version/conflict semantics, bounded hints/repair, cache policy, and tests under partitions and concurrent writes.
+
+## Trade-offs
+
+Higher R/W improves the chance that reads observe acknowledged writes but costs latency, network, and availability. Lower thresholds keep operations available but expose stale/divergent values and put more weight on repair. N controls redundancy and cost. Quorum choices are per workload; a session token or leader read may be simpler for read-your-writes than globally raising R.
+
+## Alternatives
+
+- **Leader read/write:** One ordered authority can simplify freshness and conflict handling; it is a write/failover bottleneck.
+- **Synchronous replication:** Commit waits for selected copies; explicit durability/failure policy may be easier to reason about.
+- **Eventual consistency plus repair:** Fast/available for counters or feeds when stale results are acceptable.
+- **Consensus/linearizable register:** Needed for a strict single order/leader decision; costs coordination and is not implied by quorum arithmetic.
+- **Per-session monotonic token:** Routes reads until a replica has applied a known version without making every read global.
+
+## When to Use
+
+Use tunable quorums when a replicated/partition-tolerant store needs explicit per-operation latency, availability, and visibility choices and its conflict/repair protocol is understood.
+
+## When Not to Use
+
+Do not use quorum numbers as a substitute for a transaction, uniqueness constraint, consensus, or conflict-resolution design. Avoid cross-region `R`/`W` choices that cannot meet the stated latency or partition-availability objective.
+
+## Common Misconceptions
+
+- **Quorum means majority always.** `R` and `W` can be any thresholds; engine terms may be local or global.
+- **R plus W greater than N guarantees linearizability.** It usually provides an overlap condition under assumptions, not a total order.
+- **A write is on only W replicas.** Many systems send to all eligible replicas but wait for W; verify the engine.
+- **Repair is immediate.** Hints/read repair/anti-entropy can lag or be best effort.
+- **More replicas remove hotspots.** A hot key can burden every replica/coordinator for that key.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> For a key replicated to N nodes, W controls write acknowledgments and R controls read responses. If the read and write sets are the same N replicas and versions are compared, `R+W>N` forces overlap, improving visibility of acknowledged writes. I still specify failure domains, concurrent-write conflict resolution, sloppy/quorum behavior, repair, and latency/availability. Quorum arithmetic alone is not linearizability, consensus, or exactly-once.
+
+### When to Introduce It
+
+Introduce quorums when the design uses multi-primary/leaderless replication or needs a tunable read/write availability-versus-freshness policy. Start with the required operation guarantee, then select N/R/W.
+
+### Common Follow-Ups
+
+- What are the actual replica sets under a partition?
+- How are concurrent versions merged?
+- What happens when a replica is slow or missing?
+- Does the operation need linearizability or only bounded staleness?
+- Where do hints and repair run, and how are they monitored?
+
+### Common Candidate Mistakes
+
+- Writing `R+W>N` without stating assumptions.
+- Confusing quorum overlap with a transaction/lock.
+- Ignoring sloppy quorum and failure domains.
+- Forgetting that concurrent increments need commutative/conditional handling.
+- Claiming “exactly once” from an acknowledgment threshold.
+
+## Summary
+
+- N is replica count, R read acknowledgments, and W write acknowledgments for one operation/key.
+- `R+W>N` can force set overlap under same-set/version assumptions, not a universal consistency guarantee.
+- Higher thresholds cost latency/availability; lower thresholds require explicit stale/conflict/repair handling.
+- Failure domains, caches, sloppy quorum, concurrent writes, and repair determine the real behavior.
+
+## Quiz Seeds
+
+1. For N=3, W=2, R=2, what is the minimum overlap and what assumption makes it useful?
+2. Why can N=3, W=1, R=1 return a stale value after a successful write?
+3. How does sloppy quorum weaken the simple set-intersection argument?
+4. Why do concurrent writes require a conflict-resolution rule even when R+W>N?
+5. What does raising W do to latency and availability during a replica failure?
+6. Why is a rack-local majority not equivalent to a zone-failure-tolerant quorum?
+7. Which workload might prefer a leader read over a high R?
+8. What metrics show repair backlog or hot-key pressure?
+
+## Related Topics
+
+- [Replication](replication.mdx)
+- [Consistent hashing](consistent-hashing.mdx)
+- [Partitioning and sharding](partitioning-and-sharding.mdx)
+- [CAP](../01-foundations/cap.mdx)
+
+## References
+
+### Papers / Documentation
+
+- [Dynamo: Amazon's highly available key-value store](https://www.amazon.science/publications/dynamo-amazons-highly-available-key-value-store) — the original system paper grounding quorum-style replication, sloppy quorums, hinted handoff, and eventual reconciliation.
+- [Apache Cassandra: Dynamo architecture](https://cassandra.apache.org/doc/latest/cassandra/architecture/dynamo.html) — documents replication factor, consistency levels, quorum overlap, local quorums, and conflict/repair behavior.
+- [Apache Cassandra: Guarantees](https://cassandra.apache.org/doc/stable/cassandra/architecture/guarantees.html) — clearly separates availability, eventual consistency, and lightweight transactions/linearizability.
+- [DynamoDB read consistency](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/HowItWorks.ReadConsistency.html) — contrasts eventually consistent and strongly consistent read choices in a managed replicated store.

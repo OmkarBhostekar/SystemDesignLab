@@ -1,0 +1,185 @@
+---
+type: lesson
+id: 07-03-consensus-and-raft-intuition
+slug: consensus-and-raft-intuition
+title: Consensus and Raft Intuition
+description: Understand how a quorum agrees on one replicated command history while leaders fail and messages are delayed.
+module: distributed-coordination
+order: 3
+difficulty: advanced
+estimatedMinutes: 40
+prerequisites:
+  - 07-02-leader-election
+  - 01-09-cap
+  - 01-10-consistency-models
+tags:
+  - consensus
+  - raft
+  - replicated-log
+  - quorum
+  - leader-failover
+objectives:
+  - State the problem consensus solves and the assumptions under which a quorum protocol can make progress.
+  - Explain Raft terms, leader replication, commit index, and majority acknowledgement at intuition level.
+  - Distinguish an appended, replicated, and committed log entry from an applied state-machine operation.
+  - Identify what a simplified educational model omits from production consensus implementations.
+relatedLessons:
+  - 07-02-leader-election
+  - 07-04-distributed-locks
+  - 07-08-transactional-outbox
+---
+
+# Consensus and Raft Intuition
+
+> Consensus is agreement on one safe sequence of decisions despite crashes and delayed messages; Raft makes that sequence understandable by combining a leader, terms, a replicated log, and quorum commitment.
+
+## Why This Exists
+
+Leader election alone does not tell replicas which commands are authoritative. A scheduler may elect leader A, append `reserve room 42`, and crash before followers see it. A replacement leader must know whether the command was merely proposed, replicated to a majority, or applied to the state machine. If replicas independently accept commands, they can expose contradictory state.
+
+The naive design is “write to the leader and copy asynchronously.” It is fast, but a leader crash can lose acknowledged data or let a stale follower become authoritative. A consensus protocol adds a durable, quorum-backed decision boundary. The price is coordination latency and unavailability when a majority cannot communicate.
+
+## Mental Model
+
+Imagine a replicated notebook. One writer proposes numbered entries; followers copy the entries. An entry becomes **committed** when the protocol knows a quorum has it under the relevant safety rules. Each replica then applies committed entries in order to a deterministic state machine.
+
+```text
+client command
+      ↓
+leader term 8: [reserve A] [charge B] [ship C]
+       ↙         ↓          ↘
+ follower 1   follower 2   follower 3
+       └──── majority stores entry ────┘
+                    ↓
+             commit → apply
+```
+
+A log index is an order position; a term identifies an election era. “Stored on three nodes” is not the same as “committed,” and “committed” is not the same as “client response returned” unless the API defines that contract.
+
+## How It Works
+
+Raft's high-level flow:
+
+1. Followers start an election if their election timer expires.
+2. A candidate increments its term, votes for itself, and requests votes. A candidate with a majority becomes leader.
+3. The leader receives a command, appends it locally, and sends `AppendEntries` to followers.
+4. Followers reject conflicting previous-term/index prefixes; the leader backs up until the logs align, then repairs the suffix.
+5. Once a safe majority stores the entry, the leader advances its commit index and informs followers.
+6. Every replica applies committed entries in index order and returns state-machine results.
+
+The actual Raft paper specifies rules for election restriction, log matching, commitment, persistence, snapshots, membership changes, and client behavior. This lesson uses the intuition only: a production implementation must follow the protocol and test crash/restart/interleaving cases rather than copying the six-step sketch.
+
+The quorum matters. In a five-voter group, three replicas form a majority. Two disjoint majorities cannot exist, so two leaders cannot both commit different entries at the same log position under the protocol's assumptions. If only two voters remain reachable, the cluster may serve stale reads or reject writes depending on its policy, but it must not claim a new committed history.
+
+## Example
+
+An inventory metadata service stores the state machine `available[sku]`. A client sends `reserve(sku=book, id=R1)`. The leader appends it at index 51 in term 8 and replicates it to itself, node B, and node C. It can acknowledge a committed reservation after the quorum rule is satisfied.
+
+If the leader crashes after B and C store the entry but before the response reaches the client, a retry with idempotency key `R1` should return the existing result, not reserve twice. If the leader crashes before a majority stores the entry, a future term may omit the uncommitted suffix. The client must not infer success from a socket write; it should query by operation ID.
+
+If a network partition isolates the old leader with two voters, it cannot commit new entries. The three-node side can elect a new leader and continue. When connectivity returns, log repair reconciles uncommitted suffixes. The old leader's term and uncommitted commands are not allowed to overwrite committed history.
+
+## Visualization We Eventually Want
+
+Render five nodes, each with a term, role, log entries, commit index, and applied state. Controls should add a command, delay/drop append messages, crash/restart a node, partition links, change the quorum, and step through elections. Show three distinct badges: **proposed**, **replicated**, **committed**. A **“crash before response”** preset should require an idempotent client query. A **“minority partition”** preset should show reads/writes policy and prevent a minority from committing. The panel must warn that this is an intuition simulator, not a complete Raft implementation.
+
+## Scaling Behavior
+
+Consensus groups are intentionally small. Every committed write requires quorum communication and durable append, so throughput is bounded by the leader, disk, network, and follower slowest-path behavior. Sharding the keyspace across independent consensus groups increases aggregate throughput but introduces routing, reconfiguration, and cross-shard transaction complexity.
+
+Snapshots compact logs after state is safely materialized. Membership changes require a protocol-safe transition; manually changing the voter list can create two incompatible majorities. Read scaling can use followers only if the application tolerates staleness or the protocol provides a linearizable-read mechanism.
+
+## Failure Modes
+
+- **Minority availability:** no quorum means no new committed writes; forcing them risks divergence.
+- **Slow follower:** replication lag increases commit latency or causes the leader to retain a large log suffix.
+- **Leader crash:** clients may see timeout after commit; operation IDs and read-back resolve ambiguity.
+- **Stale candidate:** election restriction prevents a candidate with an outdated log from winning under Raft's safety rules.
+- **Disk loss/corruption:** consensus assumes a durable, correctly persisted log; backups and integrity checks remain necessary.
+- **Membership mistake:** unsafe voter changes can defeat quorum intersection.
+- **Application nondeterminism:** applying the same committed log to nondeterministic code can produce divergent state even when the protocol is correct.
+
+## Trade-offs
+
+Consensus gives a strong, single history and controlled leader failover, but each committed operation pays replication cost and loses write availability without a quorum. More replicas improve failure tolerance but increase network and storage work. Strong reads may require quorum communication; local follower reads are cheaper but potentially stale. A managed consensus service reduces implementation risk but introduces cost, limits, and a dependency.
+
+## Alternatives
+
+- **Single database primary with asynchronous replicas:** simpler and often enough when bounded data loss is acceptable.
+- **Leaderless quorum store:** can keep writes available across more failures, but conflict resolution and read repair become application concerns.
+- **CRDT or append-only event merge:** prefer for commutative operations where one total history is unnecessary.
+- **Partition-local consensus:** prefer when keys can be isolated; do not use one global group for an unbounded workload.
+
+## When to Use
+
+Use consensus when multiple nodes must agree on one authoritative command history: metadata/configuration, ownership, a replicated state machine, or a strongly consistent coordination service. State the failure model (usually crash faults, not arbitrary malicious nodes), quorum placement, durability, and read semantics.
+
+## When Not to Use
+
+Do not add Raft because a service has replicas. If a relational database transaction already supplies the required atomicity for one boundary, a second consensus group may add complexity without value. Do not use a toy election simulator or hand-rolled protocol as a production consensus implementation.
+
+## Common Misconceptions
+
+- **“Any two replicas agreeing is a commit.”** The quorum and term/log rules define commitment.
+- **“Replicated means durable.”** Acknowledgement semantics, fsync policy, and durable media matter.
+- **“Raft makes every read instantly current.”** Read semantics require a protocol path; a follower may be behind.
+- **“Consensus tolerates any partition.”** It can preserve safety while sacrificing progress without a majority.
+- **“A Raft diagram is a full implementation.”** Membership changes, snapshots, persistence, client retries, and edge cases are substantial.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> Consensus lets a quorum agree on one ordered history despite crashes and message delays. In Raft, a term elects one leader, the leader appends commands to a replicated log, and a safe majority acknowledgement advances the commit index before replicas apply entries. Losing the majority stops authoritative writes; retries use operation IDs because a client timeout does not reveal whether a command committed.
+
+### When to Introduce It
+
+Introduce consensus when the design needs a strongly consistent replicated coordinator, metadata store, or leader-backed state machine—not merely read replicas. Clarify whether an existing database/service already provides this guarantee.
+
+### Common Follow-Ups
+
+- What is the difference between append, replicate, commit, and apply?
+- What can a minority partition do?
+- How does a client retry safely after a timeout?
+- Why does sharding consensus groups improve throughput but complicate transactions?
+
+### Common Candidate Mistakes
+
+- Claiming acknowledged means committed without specifying the write concern.
+- Ignoring follower lag and read semantics.
+- Describing leader election but not log safety.
+- Saying “partition tolerance” means writes continue everywhere.
+
+## Summary
+
+Consensus is a safe commitment protocol, not just an election. Raft's useful mental model is term + leader + replicated log + quorum commit + ordered state-machine apply. It preserves safety through partitions but may sacrifice availability, and production use requires the full protocol and operational testing.
+
+## Quiz Seeds
+
+1. Why is an entry stored on the leader and one follower not necessarily committed in a five-node group?
+2. What should a client do when a reservation request times out after the leader may have committed it?
+3. Why can a minority partition remain safe by rejecting writes?
+4. How does a term help a restarted old leader recognize that it is stale?
+5. What new complexity appears when a keyspace is split across many consensus groups?
+6. Why are follower reads cheaper but potentially stale?
+7. Name two production concerns omitted by an election-only Raft sketch.
+
+## Related Topics
+
+- [Leader Election](./leader-election.mdx)
+- [Distributed Transactions and 2PC](./distributed-transactions-and-2pc.mdx)
+- [Transactional Outbox](./transactional-outbox.mdx)
+- [Consistency Models](../01-foundations/consistency-models.mdx)
+
+## References
+
+### Documentation / Articles
+
+- [In Search of an Understandable Consensus Algorithm](https://raft.github.io/raft.pdf) — the original Raft paper defines election, log replication, safety, and membership details.
+- [Raft Visualization](https://raft.github.io/) — the Raft project offers an interactive visual intuition aid; the lesson intentionally does not copy its implementation.
+- [etcd: Why etcd](https://etcd.io/docs/v3.5/learning/why/) — a production consensus-backed key-value store's rationale and operational context.
+- [Managing Critical State: Distributed Consensus for Reliability](https://sre.google/sre-book/managing-critical-state/) — Google SRE connects consensus to real reliability-critical coordination.
+
+### Papers
+
+- [The Chubby Lock Service for Loosely-Coupled Distributed Systems](https://research.google/pubs/the-chubby-lock-service-for-loosely-coupled-distributed-systems/) — a production coordination system illustrates the boundary between a lock service and replicated state.

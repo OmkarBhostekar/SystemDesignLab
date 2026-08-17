@@ -1,0 +1,174 @@
+---
+type: lesson
+id: 08-03-exponential-backoff-and-jitter
+slug: exponential-backoff-and-jitter
+title: Exponential Backoff and Jitter
+description: Spread retry work across time so simultaneous failures do not create synchronized recovery spikes.
+module: reliability
+order: 3
+difficulty: core
+estimatedMinutes: 25
+prerequisites:
+  - 08-02-retries
+  - 01-04-percentiles-tail-latency
+  - 03-04-health-checks-and-failover
+tags:
+  - exponential-backoff
+  - jitter
+  - retries
+  - synchronization
+  - recovery
+objectives:
+  - Compare immediate retry, fixed delay, exponential backoff, and jittered schedules.
+  - Explain why deterministic backoff can still synchronize clients.
+  - Choose a capped backoff and jitter distribution consistent with deadline and recovery targets.
+  - Estimate the load and recovery trade-offs introduced by a retry schedule.
+relatedLessons:
+  - 08-02-retries
+  - 08-04-retry-storms-and-cascading-failures
+  - 08-05-circuit-breaker
+---
+
+# Exponential Backoff and Jitter
+
+> Backoff reduces pressure over time; jitter breaks phase alignment so thousands of clients do not retry on the same clock tick.
+
+## Why This Exists
+
+When a database leader fails, 10,000 clients may receive connection errors together. Immediate retry sends another 10,000 requests while the leader is still recovering. A fixed 1-second retry delays the wave but keeps all clients synchronized: at t=1s, they arrive together again. Exponential backoff increases the spacing; random jitter spreads each attempt across a window.
+
+Backoff is not a substitute for bounded attempts, error classification, or overload protection. It trades faster recovery for lower synchronized load and needs a cap so a client does not wait forever.
+
+## Mental Model
+
+For attempt number `k`, a capped exponential delay can be:
+
+```text
+base = 100 ms
+raw(k) = min(cap, base × 2^k)
+```
+
+Jitter chooses when within a window to retry:
+
+- **Full jitter:** random delay uniformly between `0` and `raw`.
+- **Equal jitter:** wait `raw/2` plus a random value in `[0, raw/2]`.
+- **Decorrelated jitter:** next delay depends on the previous random delay and cap, avoiding long synchronized sequences.
+
+The exact distribution is less important than stating its bound, randomness source, maximum attempts, and deadline. Use a per-operation stable random seed if deterministic tests are required; production clients need independent randomness.
+
+## How It Works
+
+1. Classify the failure as retryable and check the remaining deadline/budget.
+2. Compute the next capped delay from attempt count.
+3. Add jitter and honor server-provided `Retry-After` when it is compatible with the deadline.
+4. Sleep without holding scarce request threads/connections where possible.
+5. Retry, record attempt delay, and stop at cap/deadline/budget.
+
+Full jitter minimizes expected synchronized load but some clients retry immediately. Equal jitter bounds the minimum recovery pause but may maintain more clustering. A server may return an overload window; clients should not add a shorter schedule that ignores it.
+
+## Example
+
+500 workers poll an index service. With immediate retries, all 500 requests repeat each failure. With base 100 ms and cap 2 s, deterministic exponential delays cluster at 100/200/400/800 ms. With full jitter, attempts distribute inside those windows; the service sees a lower peak but some workers wait longer.
+
+If the user request has 900 ms remaining, a computed 1.6-second backoff should not be slept; fail or enqueue. For a background worker with a 10-minute budget, a 30-second cap may be reasonable. The policy is workload-specific.
+
+## Visualization We Eventually Want
+
+Render 500 clients on a time chart. Controls should switch immediate/fixed/exponential/full-jitter/equal-jitter, set base/cap/attempts, inject a dependency recovery time, and enable `Retry-After`. Show requests per time bucket, peak retry QPS, useful completions, average completion time, and abandoned work. Presets should make the synchronized waves visible and allow a fixed random seed for repeatable explanation.
+
+## Scaling Behavior
+
+With `N` simultaneous clients, deterministic schedules can create O(N) spikes at each retry boundary. Jitter spreads the same total attempts over more buckets, lowering peak QPS but not eliminating total work. At very large scale, use server-side admission/retry budgets and queueing; randomness alone cannot make a permanently unavailable dependency healthy.
+
+Backoff interacts with autoscaling and recovery: a slow ramp may reduce load while capacity returns, but a cap that is too low can maintain a high retry rate. Use histograms of retry delay and attempts, not just average latency.
+
+## Failure Modes
+
+- **No jitter:** clients synchronize on the same base schedule.
+- **Uncapped delay:** work remains pending beyond user or business deadlines.
+- **Cap too low:** clients keep returning high retry pressure during prolonged outage.
+- **Cap too high:** recovery takes too long for a short transient fault.
+- **Randomness bug:** shared seed or time source re-synchronizes clients.
+- **Sleep holds resources:** blocked threads/connections create a second overload.
+- **Retry-After conflict:** client ignores a server's safer recovery hint.
+
+## Trade-offs
+
+Jitter reduces peak synchronization but makes individual completion times less predictable. Full jitter lowers expected delay in some attempts; equal/decorrelated variants may reduce very short retries. Larger caps protect the dependency but delay user-visible recovery. Backoff can be implemented in clients, SDKs, queues, or a service mesh; centralized policy is easier to change but can hide per-operation semantics.
+
+## Alternatives
+
+- **Queue with scheduled visibility:** durable delayed retries for background work.
+- **Circuit breaker/load shedding:** stop attempts entirely when failure is sustained.
+- **Server push / lease notification:** avoid polling when the server can notify readiness.
+- **Fixed retry-after:** suitable for a small, controlled client population with a service-provided window.
+
+## When to Use
+
+Use capped exponential backoff with jitter for retryable transient operations from many independent clients or workers. Choose base/cap from measured recovery and caller deadlines; add retry budgets and idempotency.
+
+## When Not to Use
+
+Do not back off a permanent error, a strict interactive deadline with no remaining budget, or a workflow that needs durable scheduling semantics better served by a queue. Do not rely on jitter to fix unbounded retries or a dependency with no capacity plan.
+
+## Common Misconceptions
+
+- **“Exponential backoff alone prevents storms.”** Deterministic exponential schedules still align.
+- **“Jitter reduces total requests.”** It spreads attempts; classification/budgets reduce total work.
+- **“More delay is always safer.”** It can violate user deadlines and hold workflow state.
+- **“Random means untestable.”** Fixed seeds make simulation deterministic while production uses independent randomness.
+- **“Backoff replaces circuit breaking.”** A long-lived outage may need immediate rejection, not delayed retries.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> Immediate or fixed retries synchronize clients. I use a capped exponential schedule plus jitter, honor `Retry-After`, and stop when the operation deadline or retry budget is exhausted. Jitter lowers peak retry QPS but does not reduce total work by itself, so I pair it with classification, idempotency, circuit breaking, and load shedding.
+
+### When to Introduce It
+
+Introduce backoff/jitter when a retryable operation can fail for many clients at once. Quantify base delay, cap, attempts, deadline, and expected dependency recovery time.
+
+### Common Follow-Ups
+
+- Which jitter strategy would you choose and why?
+- What happens to 500 workers at each schedule?
+- How does `Retry-After` interact with client backoff?
+- Where do delayed retries live if the worker process restarts?
+
+### Common Candidate Mistakes
+
+- Showing exponential backoff without jitter.
+- Omitting a cap/deadline and retry budget.
+- Sleeping while holding a database connection/thread.
+- Treating backoff as a fix for permanent errors.
+
+## Summary
+
+Exponential backoff spaces attempts; jitter breaks synchronized phases. Cap both delay and total attempts by the caller/workflow deadline, honor server signals, avoid holding scarce resources while waiting, and pair the schedule with idempotency and overload controls.
+
+## Quiz Seeds
+
+1. Why do 500 clients still synchronize with deterministic exponential backoff?
+2. What does full jitter randomize?
+3. Why should a 1.6-second computed delay be skipped when only 900 ms remains?
+4. How does jitter affect peak versus total retry load?
+5. When is a durable delayed queue better than sleeping in a worker?
+6. What problem does a retry budget solve that jitter does not?
+7. Why should a client honor a longer `Retry-After` than its local delay?
+
+## Related Topics
+
+- [Retries](./retries.mdx)
+- [Retry Storms and Cascading Failures](./retry-storms-and-cascading-failures.mdx)
+- [Circuit Breaker](./circuit-breaker.mdx)
+- [Timeouts](./timeouts.mdx)
+
+## References
+
+### Documentation / Articles
+
+- [Exponential Backoff And Jitter](https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/) — AWS visualizes synchronized contention and compares jitter strategies.
+- [Timeouts, retries, and backoff with jitter](https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/) — AWS Builders’ Library connects scheduling choices to deadlines and retry budgets.
+- [Addressing Cascading Failures](https://sre.google/sre-book/addressing-cascading-failures/) — Google SRE recommends randomized exponential backoff and bounded retry behavior.
+- [Retry pattern](https://learn.microsoft.com/en-us/azure/architecture/patterns/retry) — Microsoft documents retry delay, transient faults, and when retrying is inappropriate.

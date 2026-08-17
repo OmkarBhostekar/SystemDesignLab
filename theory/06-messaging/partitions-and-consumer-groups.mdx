@@ -1,0 +1,161 @@
+---
+type: lesson
+id: 06-04-partitions-and-consumer-groups
+slug: partitions-and-consumer-groups
+title: Partitions and Consumer Groups
+description: Scale a topic with partitions and consumer groups while preserving the ordering and rebalancing limits the partition count creates.
+module: messaging
+order: 4
+difficulty: advanced
+estimatedMinutes: 40
+prerequisites:
+  - 06-03-pub-sub-and-topics
+  - 01-02-horizontal-vs-vertical-scaling
+  - 01-04-percentiles-tail-latency
+tags:
+  - partitions
+  - consumer-groups
+  - rebalancing
+  - parallelism
+  - lag
+objectives:
+  - Explain how partition count bounds parallel consumers in a group.
+  - Choose a partition key that balances load while preserving required per-key order.
+  - Describe group membership, assignment, heartbeat, and rebalance effects on processing.
+  - Diagnose lag from hot partitions, insufficient consumers, or downstream bottlenecks.
+relatedLessons:
+  - 06-03-pub-sub-and-topics
+  - 06-05-ordering
+  - 06-09-backpressure
+  - 01-02-horizontal-vs-vertical-scaling
+---
+
+# Partitions and Consumer Groups
+
+> Partitions are the unit of durable order and parallelism; a consumer group assigns each partition to at most one active member at a time for a subscription.
+
+## Why This Exists
+
+A single ordered queue gives simple sequencing but one consumer (or one serialized lane) becomes the throughput limit. The naive answer is to add consumers, yet two consumers reading the same order stream can apply updates out of order. Partitioning splits the stream into independent lanes. The new trade-off is that partition count, key skew, rebalancing, and cross-partition ordering now shape the design.
+
+## Mental Model
+
+```text
+topic:  P0 ──→ consumer A
+        P1 ──→ consumer B       group G
+        P2 ──→ consumer C
+        P3 ──→ (unassigned while group has three members)
+```
+
+A producer chooses a partition, often by hashing a key. A group member processes its assigned partitions and commits offsets. A second group receives its own assignment and sees all partitions independently. If consumers outnumber partitions, some wait idle; if partitions outnumber consumers, each member handles multiple lanes.
+
+## How It Works
+
+The partition key should align with the smallest unit that needs order, such as `account_id` or `order_id`. All events for that key go to one partition until repartitioning changes the mapping. The group coordinator tracks membership through heartbeats. A join, leave, missed heartbeat, or assignment change triggers a rebalance, during which ownership can pause or move.
+
+Parallelism is bounded by `min(partitions, healthy consumers)` for one group, but actual throughput is also bounded by per-partition work and downstream capacity. A hot key can make one partition lag while others are idle. Increasing partitions later may change key placement or require a migration plan; it is not a free, instant scale knob.
+
+## Example
+
+A telemetry topic has 12 partitions keyed by device ID and a consumer group with 6 workers. Each worker owns two partitions. Devices with one key stay ordered, while independent devices process in parallel. One celebrity device sends 10 times the traffic and lands in P7, so P7 lag grows. Adding six workers does nothing if P7 remains the serial bottleneck; repartitioning or splitting that device's workload changes the ordering contract.
+
+The naive “key by customer and add consumers” design leaves one enterprise customer hot. The improvement uses a stable per-entity order requirement, then splits only work that can be safely parallelized or assigns a larger partition count with a better key. The new trade-off is more state coordination and possible cross-partition aggregation.
+
+## Visualization We Eventually Want
+
+Build a **Partition Assignment Lab** with a topic, keys, partitions, consumers, and a rebalance timeline. Controls should include partition count, consumer count, key skew, processing rate, heartbeat timeout, join/leave/crash events, assignment strategy, and resharding. Show ownership, per-partition lag, idle consumers, pause duration, key-to-partition mapping, and throughput. A hot-key preset should reveal why adding consumers alone fails.
+
+## Scaling Behavior
+
+More partitions permit more parallel consumers and spread broker/storage load, but increase metadata, file/network overhead, and potential imbalance. More consumers reduce lag until the partition limit or downstream dependency binds. Rebalancing cost grows with group size and assignment movement. Autoscaling from lag must account for startup and rebalance time; otherwise oscillating membership can worsen lag.
+
+## Failure Modes
+
+- Hot partition dominates lag while aggregate throughput looks healthy.
+- Consumer pauses too long and is removed, causing repeated rebalances.
+- Rebalance moves a partition after work but before offset commit, causing redelivery.
+- Too many consumers waste resources because partitions are the ceiling.
+- Changing partition count breaks assumptions about key placement or joins.
+- One slow downstream call blocks all keys sharing a partition.
+
+Use cooperative assignment where supported, bounded processing per poll, partition-level metrics, stable keys, idempotent consumers, and autoscaling from age plus capacity rather than lag alone.
+
+## Trade-offs
+
+Partitions buy horizontal processing and per-partition order at the cost of more operational metadata, key-skew risk, and only partial order. Consumer groups simplify work sharing but make membership and rebalance behavior visible. More partitions provide future parallelism but can increase cost and should be sized with expected key/cardinality and replay needs.
+
+## Alternatives
+
+- **Single ordered queue:** simplest global order, lowest parallelism.
+- **Work queue with competing consumers:** good when order is unneeded; may process independent jobs faster.
+- **Sharded queues by tenant:** explicit isolation and order, but routing and capacity management are manual.
+- **Actor/entity model:** routes one entity to one owner, useful for stateful per-key sequencing.
+
+## When to Use
+
+Use partitions when independent keys can be processed concurrently and the group needs replayable durable order per key. Pick enough partitions for expected parallelism and isolate skewed tenants or entities deliberately.
+
+## When Not to Use
+
+Do not partition a workflow that truly requires global order unless you can state the merge/coordination mechanism. Do not add consumers beyond partitions and call it scaling.
+
+## Common Misconceptions
+
+- **Partitions are replicas.** They are parallel lanes; replication is a separate durability mechanism.
+- **More consumers always increase throughput.** Partitions and downstream capacity bound it.
+- **Per-partition order is global order.** Cross-partition records have no total order by default.
+- **Rebalance is invisible.** Ownership changes can pause work and cause redeliveries.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I partition a topic by the key that needs ordering, then use a consumer group to assign each partition to one active worker. Parallelism is bounded by partition count and downstream capacity, and a hot key can make one partition lag while others idle. Joins, crashes, and heartbeats trigger rebalancing, so I commit offsets after idempotent processing and monitor per-partition lag and rebalance pauses.
+
+### When to Introduce It
+
+Introduce partitions when one serialized queue cannot meet throughput or recovery goals and the workload has independent ordering keys.
+
+### Common Follow-Ups
+
+- What is the partition key?
+- What if one key is hot?
+- How many consumers can be active?
+- What happens during a rebalance?
+
+### Common Candidate Mistakes
+
+They equate partitions with replicas, ignore key skew, and claim global order from per-partition sequencing.
+
+## Summary
+
+- Partitions are both the order and parallelism unit.
+- Consumer groups share partition work; separate groups get independent subscriptions.
+- `min(partitions, consumers)` is only a ceiling; hot keys and downstream limits still bind.
+- Rebalances, offset timing, and partition changes are part of the failure model.
+
+## Quiz Seeds
+
+1. With 12 partitions and 20 consumers, how many can actively own a partition in one group?
+2. Why can a hot key keep lag high after adding consumers?
+3. What events trigger a rebalance?
+4. Which key would preserve per-account order in a ledger topic?
+5. Why can increasing partition count later affect joins or routing assumptions?
+6. When is a single-partition topic the correct trade-off?
+7. What metrics distinguish rebalance pauses from slow downstream processing?
+
+## Related Topics
+
+- [Pub/sub and topics](pub-sub-and-topics.mdx) defines independent subscriptions.
+- [Ordering](ordering.mdx) compares per-key, partition, and global order.
+- [Backpressure](backpressure.mdx) handles partition lag and producer pressure.
+- [Horizontal versus vertical scaling](../01-foundations/horizontal-vs-vertical-scaling.mdx) supplies the parallelism vocabulary.
+
+## References
+
+### Documentation / Articles
+
+- [Apache Kafka introduction](https://kafka.apache.org/42/documentation.html) — explains partition order, consumer-group assignment, and the consumer-count ceiling.
+- [Kafka consumer configurations](https://kafka.apache.org/28/configuration/consumer-configs/) — documents heartbeats, poll timeouts, and rebalance triggers.
+- [Kafka consumer rebalance protocol](https://kafka.apache.org/42/operations/consumer-rebalance-protocol/) — describes current group membership and assignment behavior.
+- [Kinesis resharding and parallel processing](https://docs.aws.amazon.com/streams/latest/dev/kinesis-record-processor-scaling.html) — provides a concrete shard/worker scaling and ordering example.

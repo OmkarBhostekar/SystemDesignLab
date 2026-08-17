@@ -1,0 +1,182 @@
+---
+type: lesson
+id: 04-10-consistent-hashing
+slug: consistent-hashing
+title: Consistent Hashing
+description: Minimize key remapping as cache or shard nodes change while measuring virtual-node balance and hotspot limits.
+module: databases
+order: 10
+difficulty: advanced
+estimatedMinutes: 40
+prerequisites:
+  - 04-09-partitioning-and-sharding
+  - 01-02-horizontal-vs-vertical-scaling
+  - 03-02-load-balancing-algorithms
+tags:
+  - consistent-hashing
+  - hash-ring
+  - virtual-nodes
+  - rebalancing
+  - caching
+objectives:
+  - Explain why modulo-N hashing remaps most keys when the node count changes.
+  - Map keys and virtual nodes onto a ring and identify the owner and replicas.
+  - Evaluate balance, remapping, virtual-node count, movement cost, and hot-key behavior.
+  - Choose consistent hashing, rendezvous hashing, or another placement strategy for a stated change pattern.
+relatedLessons:
+  - 04-09-partitioning-and-sharding
+  - 04-11-read-write-quorums
+  - 03-02-load-balancing-algorithms
+---
+
+# Consistent Hashing
+
+> Consistent hashing makes membership changes local to a ring interval; it reduces remapping, not skew, hot keys, or migration cost to zero.
+
+## Why This Exists
+
+For a cache with `N` nodes, the naive owner is `hash(key) mod N`. Add one node and the modulus changes for nearly every key; a cache miss storm sends the whole working set to the origin. The same problem appears when shard count changes: data and ownership move broadly at once.
+
+The improvement hashes both keys and node positions onto a circular keyspace. A key belongs to the next node clockwise (or according to the chosen orientation). Adding a node claims only the intervals it lands in; removing one hands those intervals to its successor. Virtual nodes place many positions per physical node to smooth random gaps. The new trade-off is ring metadata, lookup/migration complexity, uneven ownership when the ring is small, and no answer for a single extremely hot key.
+
+## Mental Model
+
+Imagine a number line whose ends wrap together:
+
+```text
+        key K ● → clockwise successor → node B
+  node A ●──────────────● node B──────────────● node C
+```
+
+The ring has two mappings: hash(key) → position, and position → physical owner. Virtual nodes (vnodes) are many positions labeled with one physical node. More vnodes usually reduce ownership variance and make a new node take many small intervals, but they increase metadata, movement planning, and peer coordination. The exact balance depends on token placement, weights, failure domains, and workload—not a magic vnode count.
+
+Consistent hashing is a placement function. Replication is a separate choice: the next `N` distinct physical owners may store copies, with failure-domain rules. A cache ring may simply repopulate entries; a durable shard ring must migrate and verify data.
+
+## How It Works
+
+1. Choose a stable hash/keyspace and hash each physical node into one or more tokens.
+2. Sort tokens around the ring and assign each interval to its successor/owner.
+3. Hash a key and binary-search the first token at or after it, wrapping at the end.
+4. On node addition, assign tokens/intervals, stream or lazily refill affected data, and update clients with a versioned ring.
+5. On removal/failure, route to successor/replica and decide whether to serve a miss, stale copy, or durable migration.
+
+With `N` physical nodes and one token each, a new node may claim one large interval by chance. Vnodes lower this variance. Weighted nodes can receive more tokens, but weight should reflect sustainable capacity and be revisited when hardware or workload changes.
+
+## Example
+
+An image-thumbnail cache has four nodes and 100 million keys. Modulo hashing maps keys evenly today. Adding a fifth node remaps about four-fifths of keys, so origin traffic spikes and popular thumbnails all miss at once.
+
+A ring with 128 virtual tokens per node maps each key to a local interval. Adding a fifth node takes many small intervals; only keys in those intervals need migration/refill. The cache can lazily refill while using request coalescing and origin rate limits. For a durable key-value store, lazy refill is not enough: each moved interval needs a copy/verification/cutover and enough replica capacity.
+
+Now introduce a celebrity key requested 100,000 times/s. Consistent hashing still maps that key to one owner. Replicate that key, use edge caching, split it into read replicas, or coalesce requests. These fixes change consistency and invalidation behavior; claiming the ring “solves hotspots” is incorrect.
+
+## Visualization We Eventually Want
+
+Build a **hash-ring explorer** with adjustable node count, vnode count, token seed, weights, key distribution, replication factor, and hot-key rate. Show key ownership before/after add/remove, remapped fraction, ownership variance, interval sizes, migration bytes, and hot-node QPS.
+
+Presets should compare modulo-N, one-token ring, vnode ring, weighted capacity, and a celebrity key. Let learners pause ring-version rollout, kill an owner, and choose lazy refill versus durable migration. Include a table/event log for color-independent ownership, keyboard controls, step/reset, and reduced motion.
+
+## Scaling Behavior
+
+Ring lookup is typically `O(log tokens)` with a sorted token map; each client/coordinator needs a current ring. More vnodes improve balance but increase token metadata and movement coordination. More replicas increase read/write fan-out and repair cost.
+
+As nodes churn, repeated add/remove events can cause continuous movement and cache churn even when each event remaps a small fraction. Durable data needs bandwidth and disk headroom for migration; cache data needs origin capacity for refill. Hot-key distribution can dominate aggregate ownership balance.
+
+## Failure Modes
+
+- **Ring disagreement:** Clients use different membership versions, causing misses or writes to old owners.
+- **Large interval:** Too few/random tokens leave one physical node overloaded.
+- **Hot key:** One popular key overwhelms its owner despite even token ownership.
+- **Thundering refill:** A node joins and many cache entries miss simultaneously at the origin.
+- **Unsafe removal:** Data is discarded before replicas/migration are verified.
+- **Weight mismatch:** A slow node owns a capacity-sized share or a fast node is underused.
+- **Failure-domain collision:** Replicas land on the same rack/zone and fail together.
+
+Mitigate with versioned membership, health/fencing, vnodes/weights, hot-key replication/coalescing, throttled migration, origin budgets, and failure-domain-aware replica placement.
+
+## Trade-offs
+
+Consistent hashing reduces remapping and enables incremental membership changes. It adds ring metadata, join/leave protocols, uneven token issues, movement/refill work, and more complex debugging. Vnodes improve statistical balance but increase coordination and may spread a node's responsibility across many peers. Modulo hashing is simpler and can be fine when node count is fixed or a full rebuild is acceptable.
+
+## Alternatives
+
+- **Modulo hashing:** Simplest and fast when bucket count is stable and remapping is affordable.
+- **Rendezvous/HRW hashing:** Scores each node per key and can offer simple weighted membership decisions without a ring; lookup cost and implementation details differ.
+- **Directory mapping:** Explicit placement and migrations for tenants/objects; metadata becomes a dependency.
+- **Range partitioning:** Natural for ordered scans and explicit splits; hotspots require careful range management.
+- **Replication/edge cache:** Better for hot keys than changing the placement function alone.
+
+## When to Use
+
+Use consistent or rendezvous hashing when a changing node set should move a bounded fraction of keys, especially cache/shard placement. State the movement/refill protocol, vnode balance, failure domains, and hot-key plan.
+
+## When Not to Use
+
+Do not use it to hide a bad partition key, solve multi-key transactions, or guarantee even request cost. Avoid it when membership is fixed and modulo/range is simpler or when the workload requires global query ordering.
+
+## Common Misconceptions
+
+- **Consistent means strongly consistent.** It describes placement stability, not replica/read consistency.
+- **Only `1/N` keys move on every add.** Expected movement depends on token distribution and vnode/weight placement; it is not a universal exact fraction.
+- **Vnodes eliminate hotspots.** They reduce ownership variance, not popular-key or skewed-work cost.
+- **The ring is the migration.** A new mapping still needs data copy/refill, verification, and cutover.
+- **Replication factor is vnode count.** Vnodes are positions; replicas are distinct physical owners/copies.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> Modulo-N hashing remaps most keys when N changes. Consistent hashing maps keys and many virtual node tokens onto a ring, so adding/removing a node changes ownership for local intervals. Vnodes reduce random ownership variance, while replica placement handles availability. I still need a versioned ring, migration/refill and rollback plan, capacity weights, and a separate hot-key strategy; placement stability is not data consistency.
+
+### When to Introduce It
+
+Introduce it for cache/shard membership churn, autoscaling, or incremental movement where a full remap is too expensive.
+
+### Common Follow-Ups
+
+- How many virtual nodes and why?
+- What happens to a hot key?
+- How do clients learn ring updates safely?
+- How do you migrate durable data?
+- How are replicas placed across zones?
+
+### Common Candidate Mistakes
+
+- Drawing a ring without defining successor direction or replication.
+- Claiming perfect balance or zero movement.
+- Treating vnodes as a hot-key solution.
+- Ignoring ring version disagreement and migration bandwidth.
+- Forgetting weighted capacity and failure domains.
+
+## Summary
+
+- Consistent hashing limits membership-change remapping by localizing ownership intervals.
+- Virtual nodes smooth ownership but add metadata and movement coordination.
+- Hot keys, ring disagreement, refill storms, and durable migration remain explicit problems.
+- Placement stability says nothing by itself about read/write consistency or transaction scope.
+
+## Quiz Seeds
+
+1. Why does modulo-N hashing invalidate most cache mappings after adding one node?
+2. How do virtual nodes change ownership variance?
+3. Why can a celebrity key still overload one node?
+4. What is the difference between a vnode and a replica?
+5. Which steps are needed to migrate durable data after a ring change?
+6. When would rendezvous hashing be a reasonable alternative?
+7. How can ring-version disagreement produce a write split?
+8. Which metrics distinguish uneven ownership from a hot key?
+
+## Related Topics
+
+- [Partitioning and sharding](partitioning-and-sharding.mdx)
+- [Read/write quorums](read-write-quorums.mdx)
+- [Load-balancing algorithms](../03-traffic-and-services/load-balancing-algorithms.mdx)
+
+## References
+
+### Documentation / Articles
+
+- [Consistent Hashing and Random Trees](https://people.csail.mit.edu/karger/Papers/web.pdf) — the original Karger et al. paper grounding consistent hashing and virtual-node-style load balancing for distributed caches.
+- [Apache Cassandra: Dynamo architecture](https://cassandra.apache.org/doc/latest/cassandra/architecture/dynamo.html) — explains token rings, virtual nodes, replica ownership, and what consistent hashing does not solve.
+- [Envoy: Load balancing](https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/upstream/load_balancing/load_balancers.html) — documents ring-hash behavior and operational load-balancing alternatives.
+- [Apache Cassandra: Production recommendations](https://cassandra.apache.org/doc/stable/cassandra/getting-started/production.html) — discusses vnode count, expansion movement, balance, and availability trade-offs.

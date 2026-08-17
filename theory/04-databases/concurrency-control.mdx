@@ -1,0 +1,196 @@
+---
+type: lesson
+id: 04-14-concurrency-control
+slug: concurrency-control
+title: Optimistic and Pessimistic Concurrency Control
+description: Prevent lost updates and oversells with version checks, conditional writes, locks, and explicit retry behavior.
+module: databases
+order: 14
+difficulty: core
+estimatedMinutes: 40
+prerequisites:
+  - 04-04-acid-and-transactions
+  - 04-05-transaction-isolation
+  - 04-08-replication
+  - 04-13-connection-pools
+tags:
+  - concurrency-control
+  - optimistic-locking
+  - pessimistic-locking
+  - compare-and-set
+  - idempotency
+objectives:
+  - Compare optimistic version checks and pessimistic locks for conflict rate, latency, and failure behavior.
+  - Protect a last-room/last-seat booking invariant under concurrent requests.
+  - Combine conditional writes, unique constraints, transaction isolation, and idempotency correctly.
+  - Describe lock wait, deadlock, stale-version, retry, and user-visible conflict outcomes.
+relatedLessons:
+  - 04-05-transaction-isolation
+  - 04-04-acid-and-transactions
+  - 04-13-connection-pools
+  - 03-08-service-boundaries
+---
+
+# Optimistic and Pessimistic Concurrency Control
+
+> Concurrency control turns “two requests saw the same state” into either one accepted transition and one explicit conflict, or a safely serialized outcome.
+
+## Why This Exists
+
+An inventory service says one hotel room remains. Two clients read availability, both receive “available,” and both create a reservation. A naive last-write-wins update hides the race; one booking overwrites the other or the count becomes negative. A transaction alone is not enough if the check and write can both pass under the chosen isolation.
+
+Concurrency control makes the conflict explicit. **Optimistic** control lets readers proceed and rejects a write when the version changed. **Pessimistic** control acquires a lock before checking/updating, making other writers wait or fail. Both are valid; the workload, conflict rate, critical-section duration, and user retry cost decide.
+
+## Mental Model
+
+| Strategy | Mechanism | Good fit | Failure outcome |
+| --- | --- | --- | --- |
+| Optimistic | `UPDATE ... WHERE version = expected` or compare-and-set | Conflicts are rare; work can be retried/merged | Zero rows/conditional failure; reread and retry or show conflict |
+| Pessimistic | Row/key/advisory lock held through check and write | Conflicts are common; critical section is short | Wait, lock timeout, or deadlock abort |
+| Declarative | Unique/check/exclusion constraint | Invariant fits an engine constraint | Constraint violation; caller handles duplicate/conflict |
+| Single owner | Queue/actor/partition serializes one key | One hot entity needs an ordered stream | Queue delay/retry; owner failure/recovery matters |
+
+“Optimistic” does not mean no transaction: the version read and conditional write should be atomic. “Pessimistic” does not mean no retries: deadlocks, timeouts, failover, and transient errors still exist.
+
+## How It Works
+
+### Optimistic version check
+
+Store a monotonically increasing version or compare token. Read `(value, version=7)`, compute a candidate, then atomically update only if version is still 7 and increment to 8. If zero rows update, another writer won; reread, merge if safe, or return a conflict. A unique key can serve as a one-time compare-and-set for inserts.
+
+```sql
+UPDATE inventory
+SET available = available - 1, version = version + 1
+WHERE room_id = 'R42' AND available > 0 AND version = 7;
+```
+
+The caller must check the affected-row count. A successful network response after the database commit can still be lost, so idempotency keys map retries to the original result.
+
+### Pessimistic lock
+
+Start a short transaction, lock the row/key, recheck the condition, update, and commit. Other writers wait or use `NOWAIT`/`SKIP LOCKED` where supported. Acquire multiple locks in a stable order; set a lock timeout; never hold a lock while calling a remote service or waiting for user input.
+
+Neither strategy fixes a multi-row predicate automatically. Use serializable isolation, predicate/explicit locks, a constraint, or a data model with one counter/owner when the invariant spans rows.
+
+## Example
+
+For a last-room booking, store `room_inventory(show_id, room_id, available, version)` and an idempotency record. Two clients read `available=1, version=7`.
+
+The optimistic path lets both compute a reservation. One conditional update changes available to 0/version 8; the other updates zero rows and receives `409 Conflict` or retries against the new state. A unique constraint on `(show_id, room_id, booking_id)` prevents duplicate insertion after a retry. The client may be asked to choose another room, not told “success” twice.
+
+The pessimistic path locks the inventory row. Client A checks and reserves; client B waits, then observes `available=0` and fails. This is simpler when contention is high, but lock wait adds tail latency and a stuck transaction can block many customers. If the database transaction also calls a payment provider, the lock may be held during an external timeout; instead create a short-lived hold/lease state, commit it, and run payment/release idempotently in a workflow.
+
+The new trade-off for optimistic control is wasted work and user conflicts under high contention. The new trade-off for pessimistic control is blocking and deadlocks. The design should choose based on measured conflict/hold-time distribution rather than a blanket “optimistic scales better.”
+
+## Visualization We Eventually Want
+
+Build a **booking race simulator** with two to many clients, one inventory row, optional seats, version tokens, locks, transaction isolation, and idempotency keys. Let learners step read/check/write/commit, vary conflict probability and lock hold time, inject client timeouts, and choose retry/backoff.
+
+Show accepted bookings, conflicts, oversells, lock wait/age, deadlocks, retries, version increments, hold expiry, and user-visible responses. Presets should compare naive read-then-write, optimistic conditional update, pessimistic lock, unique constraint, and short hold plus asynchronous payment. Include a text timeline, step/pause/reset, keyboard controls, and reduced motion.
+
+## Scaling Behavior
+
+Optimistic control scales well when conflicts are rare and retries are cheap; under a hot key, repeated retries multiply database work and p99. Pessimistic control serializes a hot key intentionally, but lock queues and connection occupancy become the limit. Sharding an entity can distribute different keys but cannot make one hot room parallel without changing the business invariant.
+
+Measure conflict rate, retries per successful operation, lock wait/hold time, deadlocks, conditional failures, pool occupancy, and abandoned holds. Backoff must be bounded/jittered and stop when the business operation's deadline expires; retries are not free capacity.
+
+## Failure Modes
+
+- **Lost update:** Last writer overwrites a newer value without version/lock protection.
+- **Unchecked conditional failure:** The application ignores zero affected rows and reports success.
+- **Deadlock:** Transactions lock rooms/accounts in different orders.
+- **Lock convoy:** A slow holder makes a queue of otherwise short requests.
+- **Retry storm:** Every conflict retries immediately and increases contention.
+- **Duplicate side effect:** Client timeout causes a second booking/payment without idempotency.
+- **Stale authority:** The check reads a lagging replica while the conditional write uses another owner.
+- **Hold leak:** A reservation/lock expires incorrectly or is not reconciled after a worker crash.
+
+Mitigate with atomic conditional writes/constraints, stable lock order, lock/query/operation deadlines, bounded jittered retries, primary/owner reads, idempotency records, and reconciliation for abandoned holds.
+
+## Trade-offs
+
+Optimistic control avoids blocking and is efficient at low conflict, but retries/rejected work make hot keys and user experience worse. Pessimistic control gives immediate serialization and often clearer conflict behavior, but consumes connections, creates waits/deadlocks, and reduces parallelism. Declarative constraints are compact and reliable for expressible invariants, while workflows/leases handle longer business processes at the cost of intermediate states and recovery logic.
+
+## Alternatives
+
+- **Unique constraint:** Best for “only one row per key” races.
+- **Atomic counter/conditional update:** Best for a single-row inventory/quota invariant.
+- **Serializable transaction:** Best for complex predicates with a reliable whole-transaction retry.
+- **Queue/actor per entity:** Best for extremely hot keys when asynchronous latency is acceptable.
+- **Lease/hold state machine:** Best when work spans payment/user time; requires expiration, fencing, and reconciliation.
+
+## When to Use
+
+Use optimistic version/conditional writes when conflicts are uncommon and a caller can safely retry or surface a conflict. Use a short pessimistic lock when conflicts are common, the critical section is local, and waiting is better than wasted work. Encode uniqueness/checks in the database whenever possible.
+
+## When Not to Use
+
+Do not hold a row lock across a remote call, user interaction, or unbounded queue. Do not retry every conditional failure indefinitely, and do not use an optimistic check against a stale read source for a correctness decision.
+
+## Common Misconceptions
+
+- **Optimistic means no coordination.** The conditional write/version check is coordination at commit.
+- **Pessimistic locking guarantees no failures.** Deadlocks, timeouts, crashes, and failover remain.
+- **A transaction prevents oversell automatically.** Isolation and predicate/constraint choice determine the race.
+- **A zero-row conditional update is an infrastructure error.** It can be a valid business conflict.
+- **Retries make a request exactly once.** Idempotency protects duplicate commands; external effects still need reconciliation.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> For a last-room booking, I make the check and decrement one atomic conditional update or hold a short lock while rechecking. Optimistic version checks are efficient when conflicts are rare but return an explicit conflict and need bounded retries; pessimistic locks are useful for hot, short critical sections but add waits and deadlocks. I add unique constraints/idempotency for retries and keep payment or other remote calls outside the database lock, using a hold/reconciliation workflow.
+
+### When to Introduce It
+
+Introduce concurrency control when two requests can read the same capacity/version and both attempt a state transition, especially booking, inventory, quotas, balances, and editable resources.
+
+### Common Follow-Ups
+
+- What happens if the version check fails?
+- How do you avoid a deadlock?
+- What if the client times out after commit?
+- Can this invariant be a unique/conditional constraint?
+- How does a hold expire and recover after a worker crash?
+
+### Common Candidate Mistakes
+
+- Using read-then-write with no atomic condition.
+- Ignoring affected-row count or lock timeout.
+- Holding locks during payment/network calls.
+- Retrying conflicts without a deadline/backoff.
+- Reading from a replica and writing to a different stale authority.
+
+## Summary
+
+- Optimistic control detects a changed version; pessimistic control blocks competitors; constraints can be even more targeted.
+- Choose from conflict rate, critical-section duration, user retry cost, and invariant scope.
+- Atomic conditions, unique keys, stable lock order, timeouts, idempotency, and reconciliation are all part of correctness.
+- A hot key may need a single owner/queue or a business hold model rather than endless retries.
+
+## Quiz Seeds
+
+1. Why must the version predicate and update be one atomic operation?
+2. What response should an API return when an optimistic update affects zero rows?
+3. Why can two locks acquired in different order deadlock?
+4. When is a unique constraint simpler than an application lock?
+5. What happens if a client retries after a booking commit but before receiving the response?
+6. Why should payment occur outside the inventory row lock?
+7. Compare optimistic and pessimistic behavior for a celebrity room with 10,000 concurrent buyers.
+8. Which metrics distinguish conflict waste from lock queueing?
+
+## Related Topics
+
+- [Transaction isolation](transaction-isolation.mdx)
+- [ACID and transactions](acid-and-transactions.mdx)
+- [Connection pools](connection-pools.mdx)
+- [Service boundaries and data ownership](../03-traffic-and-services/service-boundaries.mdx)
+
+## References
+
+### Documentation / Articles
+
+- [PostgreSQL: Explicit locking](https://www.postgresql.org/docs/current/explicit-locking.html) — documents row/table/advisory locks, lock modes, waiting, and transaction-scoped behavior.
+- [PostgreSQL: Transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html) — explains conditional update visibility, serialization failures, snapshots, and whole-transaction retries.
+- [Amazon DynamoDB: Condition expressions](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Expressions.ConditionExpressions.html) — demonstrates compare-and-set style conditional writes for rejecting stale state.
+- [MongoDB: Transactions](https://www.mongodb.com/docs/manual/core/transactions/) — provides a concrete multi-document transaction boundary and retry/error-handling considerations.

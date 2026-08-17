@@ -1,0 +1,185 @@
+---
+type: lesson
+id: 08-08-disaster-recovery
+slug: disaster-recovery
+title: Disaster Recovery
+description: Recover service and data after a major failure by defining scenarios, recovery objectives, dependencies, and rehearsed runbooks.
+module: reliability
+order: 8
+difficulty: core
+estimatedMinutes: 35
+prerequisites:
+  - 08-07-load-shedding-and-graceful-degradation
+  - 01-07-durability
+  - 03-04-health-checks-and-failover
+  - 07-03-consensus-and-raft-intuition
+tags:
+  - disaster-recovery
+  - recovery-plan
+  - failover
+  - backup-restore
+  - resilience
+objectives:
+  - Define a disaster scenario and the user-visible recovery contract before selecting a topology.
+  - Distinguish high availability, backup/restore, failover, and disaster recovery.
+  - Trace application, data, identity, networking, secrets, and operational dependencies through a recovery runbook.
+  - Validate recovery time, recovered data, integrity, and safe traffic return through drills.
+relatedLessons:
+  - 08-09-backups-rpo-rto
+  - 08-10-multi-region-and-region-failover
+  - 01-07-durability
+---
+
+# Disaster Recovery
+
+> Disaster recovery is a tested way to restore an acceptable service and data state after a failure exceeds normal redundancy—not a region diagram labeled “backup.”
+
+## Why This Exists
+
+Multi-zone replicas may survive an instance or zone failure, but a bad deployment, credential compromise, operator deletion, corrupted data, or regional outage can affect every replica. The naive plan is “take snapshots and fail over when needed.” It often omits how to recreate compute, network routes, secrets, schema, queues, DNS, permissions, and the exact data point to restore.
+
+Disaster recovery (DR) starts with a scenario and business target: what can be unavailable, how much data can be lost, and how quickly useful service must return. The design includes people/runbooks and validation, not only storage products.
+
+## Mental Model
+
+```text
+scenario → detect/declare → contain → recover data → recover compute/dependencies
+                                      ↓
+                              validate integrity + objectives
+                                      ↓
+                             shift traffic gradually → reconcile
+```
+
+Separate layers:
+
+- **High availability:** absorb expected component failures automatically.
+- **Backup/restore:** recover data from a known copy or point in time.
+- **Failover:** move service traffic/ownership to a surviving system.
+- **DR:** the complete scenario, decision, recovery, validation, and return process.
+
+DR targets are workload-specific. A public catalog may tolerate stale data and a long rebuild; a ledger may require a precise point-in-time and manual write freeze. Define degraded read/write behavior while recovery is in progress.
+
+## How It Works
+
+1. Enumerate scenarios: zone loss, region loss, accidental deletion, corruption/ransomware, provider outage, bad migration, or dependency loss.
+2. Set RPO/RTO and data-integrity requirements per component; identify dependencies and owners.
+3. Choose recovery strategy: restore from backup, warm standby, pilot light, active/passive, or active/active.
+4. Automate infrastructure/configuration recreation and secure access; store runbooks out of the failed plane.
+5. Detect/declare, freeze or fence unsafe writes, recover data and schema, start compute/dependencies, and validate.
+6. Shift traffic gradually with health/capacity gates, reconcile duplicates/lost work, and document residual data loss.
+7. Run drills; measure actual RPO/RTO, gaps, integrity, operator actions, and rollback.
+
+The recovery order matters: restoring the database without application schema/credentials can produce a reachable but unusable service. A failover that accepts writes before data ownership is unambiguous can create split brain.
+
+## Example
+
+An order platform loses its primary region after a control-plane incident. The warm standby has application images and infrastructure templates but asynchronously replicated orders. The runbook fences the old region's write path, verifies the standby's replication position against the RPO, promotes the standby, starts workers, updates routing, and admits read traffic before writes. A reconciliation job replays durable outbox events and identifies orders whose payment result is unknown.
+
+Operators validate sample orders, inventory totals, payment idempotency records, queue offsets, auth/secret access, and p95 latency before opening all traffic. If the old region returns, it remains fenced until replication is reconciled and a planned failback is performed. “DNS changed” is not the end of recovery.
+
+## Visualization We Eventually Want
+
+Show primary/standby regions and a dependency graph (data, compute, DNS, secrets, queues, external providers). Controls should inject region loss, replication lag, corrupted backup, missing secret, routing TTL, and capacity limits. Walk through declare → fence → restore/promote → validate → shift → reconcile. Display elapsed RTO, data-loss window/RPO, recovered records, validation failures, traffic/error rate, and operator steps. Include a runbook checklist and a “failback” scenario.
+
+## Scaling Behavior
+
+More regions/dependencies increase recovery graph size and test surface. Replicating every workload synchronously may raise latency and reduce write availability; asynchronous copies reduce cost but widen RPO. Warm capacity costs money but shortens RTO; cold restore saves cost but makes restore bandwidth and provisioning time critical.
+
+Automate inventory and dependency ordering. Large data stores need parallel restore, snapshots/PITR, incremental logs, and integrity checks. Recovery traffic can overload the standby; capacity and rate limits must be tested at the target scale.
+
+## Failure Modes
+
+- **Backup exists but cannot restore:** corrupt/incompatible/inaccessible copy.
+- **RPO breach:** replication/backup lag exceeds the data-loss target.
+- **RTO breach:** restore, DNS, warmup, or human approval takes longer than planned.
+- **Split brain:** old and new regions both accept writes.
+- **Hidden dependency:** identity, secrets, schema registry, queue, or third party is unavailable in the recovery plane.
+- **Recovery overload:** warm standby cannot carry production traffic or replay backlog.
+- **Unsafe failback:** returning to the old region loses newer writes or reintroduces corruption.
+- **Drill gap:** runbook assumes access/people/actions that were never tested.
+
+## Trade-offs
+
+Stronger RPO/RTO require replication, warm capacity, automation, multi-region complexity, and cost. Synchronous cross-region replication reduces data loss but adds latency and partition behavior. Asynchronous replication improves availability/latency but permits loss. Manual recovery is cheaper initially but slower and error-prone; automation requires investment and maintenance.
+
+## Alternatives
+
+- **Single-region multi-zone HA:** enough for component/AZ failure, not a region or data-corruption event.
+- **Backup/restore:** economical for relaxed RTO/RPO and rebuildable systems.
+- **Pilot light:** keep data/critical control plane ready, create compute on demand.
+- **Warm standby:** scaled-down but running recovery region for shorter RTO.
+- **Active/active:** serve traffic in multiple regions; highest complexity and conflict/failover demands.
+
+## When to Use
+
+Design DR for every durable, user-critical system and every stated region/corruption threat. Start with RPO/RTO and scenario scope, then show data ownership, runbook, validation, and failback—not just a second region.
+
+## When Not to Use
+
+Do not pay for active/active when backup/restore meets the business target. Do not call replicas/backups a DR plan until restore and traffic-shift procedures are exercised. Do not fail over a stateless tier while leaving the authoritative data/identity plane behind.
+
+## Common Misconceptions
+
+- **“HA equals DR.”** HA absorbs expected failures; DR handles larger loss and recovery process.
+- **“A backup is a recovery plan.”** Restore, validation, dependencies, and traffic ownership are still needed.
+- **“DNS failover is instant.”** TTL/cache behavior and client connections delay traffic movement.
+- **“Warm standby is active/active.”** It may not serve normal traffic or have full capacity.
+- **“Failover ends the incident.”** Reconciliation, failback, and data-integrity verification remain.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I start DR with a failure scenario and RPO/RTO, then map data, compute, routing, identity, secrets, queues, and operators. The runbook fences the old writer, restores/promotes data, brings dependencies up, validates integrity and capacity, shifts traffic gradually, and reconciles ambiguous work. I choose backup/restore, warm standby, or active/active based on targets and cost, and I prove the plan with drills.
+
+### When to Introduce It
+
+Introduce DR after normal HA/failover limits are clear or when the prompt names region loss, corruption, or data recovery. Ask which data may be lost and which user actions remain available.
+
+### Common Follow-Ups
+
+- What is the RPO/RTO for orders versus recommendations?
+- How do you fence the old region?
+- What dependencies must be recreated before traffic shifts?
+- How do you validate a restored backup and plan failback?
+
+### Common Candidate Mistakes
+
+- Drawing a second region without data replication/restore semantics.
+- Ignoring RPO/RTO and recovery capacity.
+- Failing over without split-brain fencing.
+- Not testing restore, secrets, queues, or operational access.
+
+## Summary
+
+DR is a scenario-specific, tested recovery system. Define RPO/RTO, choose a recovery topology, fence unsafe writers, restore and validate every dependency/data layer, shift traffic deliberately, and rehearse failback. A second region or snapshot is only one component of that process.
+
+## Quiz Seeds
+
+1. Why does a multi-zone replica not protect against corrupted writes?
+2. What must be fenced before a new region accepts writes?
+3. Which recovery strategy fits a relaxed RTO/RPO workload?
+4. What hidden dependencies can make a restored database unusable?
+5. Why does DNS failover not imply immediate traffic movement?
+6. What metrics prove a DR drill met its objectives?
+7. Why can recovery replay overload a warm standby?
+
+## Related Topics
+
+- [Backups, RPO, RTO, and Restore Validation](./backups-rpo-rto.mdx)
+- [Multi-Region and Region Failover](./multi-region-and-region-failover.mdx)
+- [Health Checks and Failover](../03-traffic-and-services/health-checks-and-failover.mdx)
+- [Durability](../01-foundations/durability.mdx)
+
+## References
+
+### Documentation / Articles
+
+- [Disaster recovery planning guide](https://cloud.google.com/architecture/dr-scenarios-planning-guide) — Google Cloud frames DR around scenarios, recovery strategies, dependencies, and testing.
+- [Disaster recovery architecture on AWS: Strategies for recovery](https://aws.amazon.com/blogs/architecture/disaster-recovery-dr-architecture-on-aws-part-i-strategies-for-recovery-in-the-cloud/) — compares backup/restore, pilot light, warm standby, and multi-site approaches with RPO/RTO.
+- [REL13: How do you plan for disaster recovery?](https://docs.aws.amazon.com/wellarchitected/latest/framework/rel_planning_for_recovery.html) — AWS Well-Architected guidance for recovery objectives and tested plans.
+- [Perform periodic recovery of the data to verify backup integrity and processes](https://docs.aws.amazon.com/wellarchitected/latest/framework/rel_backing_up_data_periodic_recovery_testing_data.html) — AWS requires restore tests to validate data and objectives, not just backup existence.
+
+### Papers
+
+- [Site Reliability Engineering: Testing for Reliability](https://sre.google/sre-book/testing-reliability/) — Google SRE discusses testing failure/recovery behavior as an engineering practice.

@@ -1,0 +1,191 @@
+---
+type: lesson
+id: 04-02-sql-vs-nosql
+slug: sql-vs-nosql
+title: SQL versus NoSQL
+description: Choose relational or non-relational storage by workload, relationships, guarantees, and operating constraints.
+module: databases
+order: 2
+difficulty: core
+estimatedMinutes: 35
+prerequisites:
+  - 04-01-data-modeling-from-access-patterns
+  - 01-09-cap
+  - 03-08-service-boundaries
+tags:
+  - relational
+  - nosql
+  - schema
+  - consistency
+  - workload-shape
+objectives:
+  - Compare relational and non-relational storage using access patterns, invariants, scaling, and operations rather than slogans.
+  - Explain what transactions, joins, schema constraints, and partition-oriented models buy and cost.
+  - Choose a primary store and identify when a second specialized store is justified.
+  - State the consistency and failure behavior that a database choice does not automatically provide.
+relatedLessons:
+  - 04-01-data-modeling-from-access-patterns
+  - 04-03-storage-models
+  - 04-04-acid-and-transactions
+  - 01-09-cap
+---
+
+# SQL versus NoSQL
+
+> “SQL or NoSQL?” is a workload and guarantee question, not a universal ranking of database families.
+
+## Why This Exists
+
+The naive interview answer is “SQL for consistency, NoSQL for scale.” It fails because relational databases can scale vertically, through replicas, partitioning, and distributed implementations, while non-relational systems can offer transactions or strong conditional writes. “NoSQL” also bundles very different key-value, document, wide-column, and graph models.
+
+Start with the real pressure. A payment ledger needs constraints, multi-row atomicity, and auditability. A global session store may need a simple key lookup, elastic partitioning, and low latency across regions. A product catalog may want flexible attributes but still need uniqueness and inventory transactions. The choice follows the access patterns and failure semantics; the query language is only one part of the decision.
+
+## Mental Model
+
+Compare storage along independent axes:
+
+| Axis | Relational tendency | Non-relational tendency |
+| --- | --- | --- |
+| Shape | Tables, typed columns, explicit relationships | Key-value, documents, wide rows, or graph edges |
+| Query freedom | Rich joins, predicates, aggregation, ad hoc analysis | Often optimized for known key/partition access paths |
+| Invariants | Foreign keys, uniqueness, check constraints, transactions | Conditional writes, item/partition transactions, application workflows vary by system |
+| Scale-out | Replicas and partitioning are available but may constrain cross-partition work | Partition-first throughput and locality are usually central to the model |
+| Schema evolution | Explicit migrations and compatibility planning | Flexible fields do not remove versioning and validation work |
+| Operational shape | Mature tooling and strong transactional defaults | Product-specific consistency, repair, hot-key, and partition behavior |
+
+These are tendencies, not guarantees. Ask what the selected system actually promises for a single item, a partition, a transaction, a replica, and a failover.
+
+## How It Works
+
+Use a decision sequence:
+
+1. Identify the authoritative invariants. Do two records need a single commit, or can a process reconcile them later?
+2. List the read/write patterns, result bounds, relationship depth, and ordering from [access-pattern modeling](data-modeling-from-access-patterns.mdx).
+3. Estimate volume, peak load, growth, skew, regions, latency, and availability during partitions.
+4. Choose the simplest model that serves those patterns without an unsafe correctness workaround.
+5. Verify operational capabilities: backups, restore time, replication, failover, observability, migration tooling, quotas, and team expertise.
+6. Decide whether a second store is a derived index or an additional authority. Make ownership and replay explicit.
+
+SQL does not mean every query is cheap: a join or unindexed predicate can still scan. NoSQL does not mean schema-free: key shape, item size, partition limits, version fields, and compatibility rules are schema. Distributed SQL does not mean cross-region writes have zero latency. The right comparison is “which guarantees and bottlenecks are easiest to make explicit for this workload?”
+
+## Example
+
+Consider a marketplace with a catalog, checkout, and seller activity feed. The naive design uses one relational database for every request. At first this is excellent: foreign keys and a transaction can create an order, reserve inventory, and record a payment intent. Under growth, the feed's append-heavy reads and catalog search scans compete with checkout writes; read replicas help reads but do not remove write/index contention.
+
+The improvement is not automatically “replace SQL.” Keep the order and inventory authority in a relational store because the invariants and transaction boundaries are clear. Model the feed in a wide-column or key-value store keyed by `(viewer_id, time_bucket)` if its access pattern is a bounded chronological page and eventual projection is acceptable. Index catalog text in a search system, but rebuild it from catalog authority. This hybrid design introduces extra pipelines, lag, duplicate records, and repair work. It is justified only if the feed/search workload has a different shape and operational owner.
+
+If the marketplace instead needs globally distributed per-user carts with mostly single-key reads and conditional item updates, a document or key-value store may be the primary cart authority. The answer should still name item size, hot carts, concurrent updates, durability, and how checkout obtains a consistent snapshot.
+
+## Visualization We Eventually Want
+
+Build a **storage choice experiment** around the marketplace. Let the learner set transaction scope, relationship depth, read/write ratio, key skew, schema-change frequency, regions, and partition count. Offer relational, document, wide-column, key-value, and hybrid candidates.
+
+Show critical-path latency, rows/partitions touched, transaction conflicts, storage/replica cost, projection lag, hot-key rate, and recovery time. A preset should begin with “one SQL database,” overload the feed workload, then let the learner add read replicas, a projection, or a purpose-built store and observe the new consistency/operations cost. Provide text explanations and accessible step/reset controls instead of relying on an animated architecture.
+
+## Scaling Behavior
+
+Relational systems can often scale a long way with query/index tuning, vertical capacity, read replicas, partitioning, and workload isolation. The hard boundary is usually a write owner or a transaction that spans partitions. Non-relational systems often scale by adding partitions, but a bad partition key or unbounded item can make one logical key the bottleneck. Both families need capacity headroom, backups, repair, and migration plans.
+
+As regions increase, synchronous cross-region commits add latency and may reduce availability during partitions; asynchronous copies add lag and conflict/reconciliation work. As teams increase, a second store multiplies schema, alerting, backup, and incident responsibilities. Count operational units, not only database nodes.
+
+## Failure Modes
+
+- **Category shortcut:** Choosing a family because it is fashionable while the access path is unbounded or cross-partition.
+- **False transaction assumption:** Assuming a distributed product has the same transaction scope as a local relational database.
+- **Hot key/partition:** A single tenant or popular product defeats nominal horizontal capacity.
+- **Schema drift:** “Flexible schema” allows incompatible readers and silently missing fields.
+- **Dual authority:** SQL and NoSQL copies both accept writes, producing reconciliation ambiguity.
+- **Replica surprise:** A read replica or eventually consistent store returns stale data on a correctness-critical path.
+- **Operational blind spot:** The team cannot restore, repair, rebalance, or test failover for the chosen store.
+
+Mitigate with an explicit source of truth, contract/version checks, per-access-pattern capacity tests, conditional writes/transactions where required, freshness metrics, and restore/failover drills.
+
+## Trade-offs
+
+Relational storage often buys expressive queries, constraints, mature transactions, and a clear authority. It may cost cross-partition complexity, schema migration coordination, and a central write bottleneck. Non-relational models often buy predictable partition-local access and elastic scale for known workloads. They may cost query flexibility, duplicated data, application-level invariants, or product-specific repair and consistency behavior. A hybrid adds independent scaling but also data pipelines, observability, and recovery surfaces.
+
+## Alternatives
+
+- **Distributed SQL:** Use when relational semantics and SQL matter while the workload justifies scale-out; verify transaction and cross-region behavior.
+- **Document store:** Use when an aggregate is read/written together and fields evolve, while bounding document size and update contention.
+- **Key-value store:** Use for simple key/condition operations at high scale and low latency.
+- **Wide-column store:** Use for large partitioned datasets with known query shapes and sequential/range access within a partition.
+- **Graph database:** Use for variable-depth relationship traversal where graph locality is part of the workload.
+- **Polyglot persistence:** Use when distinct workloads truly need distinct stores and the team can own the replication/rebuild path.
+
+## When to Use
+
+Use a relational primary when constraints, joins, and multi-row transactions dominate. Choose a non-relational primary when a stable, partition-local access pattern, scale profile, or locality requirement dominates and its guarantees fit. Introduce a second store for a derived workload after naming freshness, source of truth, and rebuild behavior.
+
+## When Not to Use
+
+Do not migrate from SQL solely because one query is slow; measure the plan and fix modeling/indexing first. Do not choose a NoSQL product to avoid thinking about schema, transactions, or migrations. Do not add a second database for a hypothetical future workload without a capacity or ownership case.
+
+## Common Misconceptions
+
+- **SQL cannot scale horizontally.** Read replicas, partitioning, sharding, and distributed SQL exist; the trade-offs are workload-specific.
+- **NoSQL means no schema or no transactions.** Every store has a data shape and a guarantee boundary.
+- **CAP says a database is simply “CP” or “AP.”** Behavior can differ by operation, consistency mode, and failure state; state the actual contract.
+- **A cache/search index is another source of truth.** It is usually a rebuildable derived view.
+- **More database types equals a better architecture.** Each added store creates a backup, deploy, repair, and on-call surface.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I choose the storage model from access patterns, invariants, scale, and operational constraints. SQL is a strong default when joins, constraints, and multi-row transactions matter; key-value, document, wide-column, or graph models fit different bounded access shapes. I would keep one authority per fact, use derived stores only with an explicit lag/rebuild plan, and verify partition, transaction, replication, and failover semantics instead of using “SQL versus NoSQL” as a slogan.
+
+### When to Introduce It
+
+Introduce this comparison after writing access patterns and rough scale. Revisit it when a bottleneck is a write owner, cross-partition query, unbounded key, or operational requirement that the initial model cannot satisfy.
+
+### Common Follow-Ups
+
+- What is the transaction boundary?
+- What happens during a partition or replica lag?
+- Which key distributes load and which query does it support?
+- How does the team rebuild a derived store?
+- Why is a relational database not sufficient here?
+
+### Common Candidate Mistakes
+
+- Calling every non-relational database “NoSQL” and stopping there.
+- Replacing the primary authority to solve a read/index problem.
+- Claiming eventual consistency is harmless on checkout or authorization paths.
+- Ignoring backups, repairs, migration tooling, and restore time.
+- Adding polyglot persistence without naming ownership and failure behavior.
+
+## Summary
+
+- Compare database families by workload and guarantees, not brand or fashion.
+- SQL and NoSQL both have schemas, limits, failure modes, and scaling techniques.
+- Keep correctness-critical authority clear; use derived stores for distinct measured workloads.
+- State transaction scope, partition behavior, consistency, replication, and recovery explicitly.
+
+## Quiz Seeds
+
+1. Why can “SQL for consistency, NoSQL for scale” mislead an interview answer?
+2. Which marketplace data belongs in a relational transaction, and which can be an eventually consistent projection?
+3. A key-value table has one customer receiving 35% of requests. What does that say about its partition key?
+4. How does a flexible document schema still need versioning and validation?
+5. When is distributed SQL a better answer than introducing a second store?
+6. What operational capabilities must be checked before selecting an unfamiliar database?
+7. Explain why a search index should usually be rebuildable from an authority.
+8. If a region partition occurs, which requirement determines whether writes pause or diverge?
+
+## Related Topics
+
+- [Data modeling from access patterns](data-modeling-from-access-patterns.mdx)
+- [Storage models](storage-models.mdx)
+- [ACID and transactions](acid-and-transactions.mdx)
+- [CAP](../01-foundations/cap.mdx)
+
+## References
+
+### Documentation / Articles
+
+- [PostgreSQL: Concepts](https://www.postgresql.org/docs/current/tutorial-concepts.html) — introduces the relational model, tables, constraints, and the role of SQL without treating it as a complete scaling answer.
+- [AWS database decision guide](https://docs.aws.amazon.com/databases-on-aws-how-to-choose/) — compares managed relational and purpose-built database categories by workload requirements.
+- [Amazon DynamoDB: Core components](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/HowItWorks.CoreComponents.html) — provides the concrete partition-key and sort-key model behind a common key-value system.
+- [MongoDB: Data modeling](https://www.mongodb.com/docs/manual/data-modeling/) — explains document modeling, relationships, workload considerations, and schema evolution.
+- [Apache Cassandra: Guarantees](https://cassandra.apache.org/doc/stable/cassandra/architecture/guarantees.html) — makes the availability, eventual-consistency, and lightweight-transaction trade-offs of a wide-column system explicit.

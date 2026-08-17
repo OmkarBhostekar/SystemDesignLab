@@ -1,0 +1,160 @@
+---
+type: lesson
+id: 05-09-multi-layer-caching
+slug: multi-layer-caching
+title: Multi-Layer Caching
+description: Compose browser, CDN, local, distributed, and database caches while making freshness and failure behavior visible at each hop.
+module: caching
+order: 9
+difficulty: core
+estimatedMinutes: 35
+prerequisites:
+  - 05-01-why-cache
+  - 05-02-local-and-distributed-cache
+  - 05-06-cache-invalidation
+  - 02-01-request-lifecycle
+tags:
+  - multi-layer-cache
+  - cdn
+  - http-cache
+  - revalidation
+  - freshness
+objectives:
+  - Trace a response through browser, CDN, reverse-proxy, local, distributed, and source layers.
+  - Explain why each layer needs compatible keys, TTLs, validators, and privacy rules.
+  - Diagnose which layer is responsible for stale data or a cache-miss burst.
+  - Choose a layer from object size, audience, personalization, freshness, and failure requirements.
+relatedLessons:
+  - 05-06-cache-invalidation
+  - 05-07-cache-stampede
+  - 05-08-hot-keys
+  - 02-01-request-lifecycle
+---
+
+# Multi-Layer Caching
+
+> Multiple caches can make a request fast and resilient, but every layer is another copy, policy, and freshness boundary that must agree on what a key means.
+
+## Why This Exists
+
+A photo feed may be cached by the browser, a CDN, a reverse proxy, an application process, a distributed cache, and a database read model. The naive design sends every request to the origin, wasting bandwidth and repeatedly computing the same public response. Adding layers reduces distance and source work. The new trade-off is that one layer may be fresh while another is stale, private data may leak through a shared cache, and a purge can fan out slowly.
+
+## Mental Model
+
+```text
+browser → CDN/edge → reverse proxy → local cache → distributed cache → source/read model
+   L1         L2            L3             L4              L5                L6
+```
+
+For each layer specify key, audience, freshness, revalidation, capacity, and failure behavior. `Cache-Control: public` and a long `max-age` are appropriate for immutable versioned assets, not for a user-specific response. An `ETag` or `Last-Modified` can make a revalidation cheaper without sending the full body.
+
+## How It Works
+
+An outer layer may answer without contacting inner layers. If it misses or revalidates, the request moves inward. On a source change, a purge/invalidation may need to reach the CDN and application caches, while browser caches may retain a response until its max-age or a versioned URL changes. `stale-while-revalidate` lets an intermediary serve a stale response while it contacts the origin; `stale-if-error` can preserve availability during an origin failure, if the data contract allows it.
+
+Never assume outer-cache freshness implies inner-cache freshness. A CDN can cache a response for 60 seconds while an application cache serves a 5-minute-old projection; the user may see the older of the two depending on which layer was populated first. Include tenant, locale, authorization, compression, and content version in the cache key or vary policy explicitly.
+
+## Example
+
+Product images use immutable URLs such as `/images/p-123.v42.webp`: browser and CDN layers can cache them for a year. A public product description uses a CDN `max-age=30` and `stale-while-revalidate=30`, while the API process uses a 10-second local cache backed by a distributed cache. A price update changes the versioned product response and sends an origin purge; checkout bypasses all layers for authoritative inventory.
+
+The naive “cache the whole API response at the CDN” design accidentally shares a personalized `currency=INR` response with another user. The improvement varies by user/locale or separates public and private endpoints. The new trade-off is lower hit ratio, larger key cardinality, or more careful edge authorization.
+
+## Visualization We Eventually Want
+
+Build a **Cache Layer Trace** that animates one request through each layer. Controls should include audience (public/private), key variation, TTL/max-age, validators, stale windows, invalidation/purge delay, layer outage, and source latency. Show which layer answered, age of the body, bytes transferred, origin QPS, hit ratio by layer, and stale/privacy warnings. Presets should cover immutable media, public catalog, personalized feed, and origin outage.
+
+## Scaling Behavior
+
+Outer layers reduce origin bandwidth and can absorb global hot keys. CDN cache cardinality grows with URL/query/cookie variation; application layers grow with instances and tenants. Purges and invalidations fan out across regions and vendors. Lower layers may never see requests that would have warmed them, so a CDN purge can cause an origin surge. Monitor age, hit ratio, origin shield traffic, purge latency, cache-key cardinality, privacy misses, and layer-specific p99.
+
+## Failure Modes
+
+- A private response is served through a public cache key.
+- CDN and origin use different validators or content versions.
+- Purge is delayed, so users in different regions see different versions.
+- A cold edge after deploy sends a global miss burst to origin.
+- An inner cache is stale even though the outer cache was recently purged.
+- Stale-if-error hides an incident beyond the business freshness budget.
+
+Use explicit `Vary`/cache-key rules, immutable asset naming, purge observability, origin shielding, request coalescing, and a bypass path for correctness-critical reads.
+
+## Trade-offs
+
+More layers reduce distance and load but add memory, cost, configuration, invalidation fan-out, debugging time, and privacy risk. HTTP caches can leverage standard validators and shared edge capacity; application caches understand domain keys and permissions. A CDN is excellent for public bytes, not automatically for personalized mutable records. Fewer layers can be easier to reason about when the source already meets the SLO.
+
+## Alternatives
+
+- **Single application cache:** easier coherence, less edge bandwidth savings.
+- **Immutable versioned assets:** avoids purge for static bytes at the cost of storage and URL management.
+- **Read replicas or materialized views:** move read work into an authoritative data path.
+- **Client fetch with no-store:** appropriate for secrets or highly volatile personalized data.
+
+## When to Use
+
+Use outer layers for public, reusable, bandwidth-heavy, or geographically distributed content. Use inner caches for domain projections that need application-aware keys and fallback. Document a per-layer freshness and privacy contract.
+
+## When Not to Use
+
+Do not stack caches by default. Avoid shared edge caching for responses with authorization or tenant-sensitive data unless the cache key and policy are proven. Do not use stale serving for a decision that must reflect a current authority.
+
+## Common Misconceptions
+
+- **The nearest cache is always newest.** Copies can have independent ages and fill times.
+- **A CDN purge is instantaneous everywhere.** Propagation and stale-serving policies vary.
+- **`no-cache` means no storage.** It normally requires revalidation; `no-store` is the stronger no-storage directive.
+- **More cache layers always improve hit ratio.** Key variation and invalidation can make them churn.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I place public, reusable bytes at the edge and domain-aware projections near the service, but I define keys, privacy, TTL, validators, purge, and bypass behavior for every layer. Immutable versioned assets avoid broad invalidation; mutable responses need revalidation or targeted purge. I trace cold starts and origin outages because outer-cache misses can create a much larger inner stampede.
+
+### When to Introduce It
+
+Introduce multiple layers when geographic distance, bandwidth, hot public content, or repeated domain reads creates distinct bottlenecks. Keep the authority and freshness contract visible.
+
+### Common Follow-Ups
+
+- Which requests are safe to cache publicly?
+- How does a purge reach browsers and application caches?
+- What happens when the CDN is cold?
+- Which layer owns authorization and privacy checks?
+
+### Common Candidate Mistakes
+
+They cache private responses at a shared edge, assume purge is immediate, and omit the origin surge when an outer cache expires.
+
+## Summary
+
+- Each layer buys proximity or reuse and adds a copy, policy, and failure edge.
+- Keys must encode audience, tenant, locale, version, and representation as needed.
+- HTTP freshness, validators, immutable names, purge, and bypass paths are complementary.
+- Trace cold and outage behavior from the outer layer to the source.
+
+## Quiz Seeds
+
+1. Why can a CDN purge still leave a stale browser response?
+2. Which directives support stale-while-revalidate and stale-if-error, and why are they not universal correctness guarantees?
+3. How can a personalized response leak through an edge cache?
+4. Why might origin QPS spike after an outer-cache deploy even when inner caches are warm?
+5. Which layer fits immutable images versus checkout inventory?
+6. What fields belong in a cache key for a localized, authenticated response?
+7. When is one application cache easier to operate than five layers?
+
+## Related Topics
+
+- [Cache invalidation](cache-invalidation.mdx) covers purge and version ordering.
+- [Cache stampede](cache-stampede.mdx) handles cold layers and synchronized expiry.
+- [Hot keys](hot-keys.mdx) explains edge and shard skew.
+- [Request lifecycle](../02-networking/request-lifecycle.mdx) provides the end-to-end hop model.
+
+## References
+
+### Documentation / Articles
+
+- [Cache-Control header](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Cache-Control) — documents max-age, no-cache, no-store, stale-while-revalidate, and stale-if-error directives.
+- [HTTP caching](https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/Caching) — explains browser/intermediary caches, validators, and cache keys.
+- [HTTP caching (RFC 9111)](https://www.rfc-editor.org/rfc/rfc9111.html) — defines shared-cache freshness and validation semantics.
+- [CloudFront cache behavior](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/Expiration.html) — gives a concrete CDN TTL and revalidation implementation reference.

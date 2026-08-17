@@ -1,0 +1,172 @@
+---
+type: lesson
+id: 06-03-pub-sub-and-topics
+slug: pub-sub-and-topics
+title: Pub/Sub and Topics
+description: Broadcast durable events to independent subscribers while separating event ownership, retention, and consumer progress.
+module: messaging
+order: 3
+difficulty: core
+estimatedMinutes: 30
+prerequisites:
+  - 06-02-message-queue-fundamentals
+  - 03-08-service-boundaries
+  - 01-10-consistency-models
+tags:
+  - pub-sub
+  - topics
+  - subscriptions
+  - events
+  - fanout
+objectives:
+  - Contrast work queues with pub/sub topics and independent subscriptions.
+  - Explain how retention, offsets, filters, and consumer groups affect replay and fan-out.
+  - Design an event envelope with identity, version, ordering key, and schema evolution fields.
+  - Choose queue, pub/sub, or direct RPC from subscriber and delivery requirements.
+relatedLessons:
+  - 06-04-partitions-and-consumer-groups
+  - 06-05-ordering
+  - 06-06-delivery-semantics
+  - 05-06-cache-invalidation
+---
+
+# Pub/Sub and Topics
+
+> A queue distributes work among workers; pub/sub retains an event and lets each subscription maintain its own progress, retry policy, and view of the event.
+
+## Why This Exists
+
+An order service needs to notify billing, inventory, email, analytics, and fraud independently. A single work queue gives the event to one consumer, so adding a second subscriber either loses a use case or forces the first worker to fan out synchronously. The improvement is a topic with one subscription per logical consumer. The new trade-off is duplicated storage and delivery work, schema evolution, lag in each subscriber, and no guarantee that all subscribers observe the event at the same time.
+
+## Mental Model
+
+```text
+producer → topic/event log ─┬─ billing subscription → consumer group
+                            ├─ inventory subscription → consumer group
+                            ├─ email subscription → consumer group
+                            └─ analytics subscription → replay/lagging consumer
+```
+
+Each subscription is a durable cursor or queue view. Consumers in one group share work; separate groups receive the event independently. A topic is not automatically a broadcast socket: retention, acknowledgment, replay, and filtering determine what a late subscriber sees.
+
+## How It Works
+
+Publish an envelope such as:
+
+```json
+{
+  "event_id": "evt_8f2",
+  "type": "OrderConfirmed",
+  "schema_version": 2,
+  "occurred_at": "2026-08-18T09:00:00Z",
+  "ordering_key": "order-123",
+  "payload": {"order_id": "order-123"}
+}
+```
+
+The publisher should define whether an event represents a fact (“confirmed”) or a command (“send receipt”). Facts may have many subscribers and can be replayed; commands usually target one handler and need a different ownership contract. Subscriptions should be independently monitored for backlog age, retry rate, and retention loss.
+
+## Example
+
+After an order transaction commits, an outbox publishes `OrderConfirmed`. Billing consumes it to charge, inventory reserves stock, email sends a receipt, and analytics builds metrics. Billing and inventory use idempotency and a workflow because duplicate or reordered events are possible. Email can lag and retry independently. A new fraud subscription can replay retained events without slowing billing.
+
+The naive “one topic, one shared consumer group” makes billing and analytics compete for the same event. The improvement gives each logical subscriber its own group. The new trade-off is N copies of delivery/retention work and N independent failure/replay paths.
+
+## Visualization We Eventually Want
+
+Build a **Topic Fan-out Explorer** with one topic, configurable subscriptions, consumer groups, filters, retention, and replay cursors. Controls should include publication rate, subscriber speed, subscription outage, schema version, and duplicate delivery. Show topic bytes, per-subscription lag, delivery attempts, replay range, and whether one slow subscriber affects others.
+
+## Scaling Behavior
+
+Fan-out cost grows with subscriptions and message size. A topic with many slow subscribers retains data or accumulates per-subscription backlog. Partitioning adds parallelism but moves ordering choices into the partition key. Filtering can reduce consumer work but may still incur broker scan/storage cost depending on implementation. Use compact envelopes and external references for large payloads.
+
+## Failure Modes
+
+- One subscriber is offline until retention expires and misses events.
+- A subscriber's retry loop delays newer messages or exhausts its backlog.
+- Schema change breaks old consumers that cannot parse the new version.
+- A fact is emitted before the source transaction commits, creating a phantom event.
+- One event drives multiple non-idempotent side effects and duplicates become visible.
+- A shared group accidentally load-balances events that should reach every subscriber.
+
+Use transactional outbox/CDC, schema compatibility checks, independent subscriptions, replay, DLQs, and idempotent consumers.
+
+## Trade-offs
+
+Pub/sub decouples subscribers and supports replay, but costs retention, fan-out, schema governance, and per-subscriber operations. Direct RPC gives immediate response semantics but couples availability and latency. A queue is cheaper for one work owner but cannot naturally broadcast. Topics do not remove business coordination; they make each subscriber's progress explicit.
+
+## Alternatives
+
+- **Direct RPC:** use when the caller needs an immediate, bounded response.
+- **One queue plus explicit fan-out worker:** useful for small systems; centralizes fan-out and becomes a bottleneck.
+- **Database change-data-capture:** useful when source commits are the event authority and consumers need row changes.
+- **Webhook delivery:** useful for external subscribers, with per-recipient retry and signing requirements.
+
+## When to Use
+
+Use pub/sub when multiple independent consumers need the same fact, can process at different rates, or need replay. Give each logical subscriber a durable subscription and explicit retention/failure policy.
+
+## When Not to Use
+
+Do not publish a topic when one synchronous owner must decide before the transaction commits. Avoid using events to hide a missing consistency boundary or an unowned schema.
+
+## Common Misconceptions
+
+- **A topic guarantees every consumer receives every event.** Retention, subscription creation time, filtering, and failures matter.
+- **Separate consumers mean separate subscribers.** Consumers in one group share work; groups define logical subscriptions.
+- **Events are commands.** Facts and commands have different ownership and replay semantics.
+- **Pub/sub is free fan-out.** Storage and delivery cost multiply with subscribers.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I use a topic when multiple independent subscribers need a durable fact. Each logical subscriber gets its own subscription and can scale with a consumer group, lag, retry, and replay policy. I include event ID, type, version, occurred time, ordering key, and source transaction boundary. Pub/sub decouples subscriber timing but adds retention, schema, duplicate, and eventual-consistency work.
+
+### When to Introduce It
+
+Introduce pub/sub when one producer event must feed multiple independently owned workflows or projections.
+
+### Common Follow-Ups
+
+- How does a late subscriber replay history?
+- What if one subscription is slow?
+- Which group receives the event?
+- What ensures the event follows a committed transaction?
+
+### Common Candidate Mistakes
+
+They use one consumer group for all subscribers, publish before commit, and omit event versioning or retention.
+
+## Summary
+
+- Queue = one logical work stream; pub/sub = independent subscription progress over shared events.
+- Consumer groups parallelize one subscription; separate groups receive the event independently.
+- Event identity, schema version, ordering key, source transaction, and retention are part of the contract.
+- Slow subscribers should not block unrelated subscribers, but they still consume capacity and retention.
+
+## Quiz Seeds
+
+1. Why do billing and analytics need separate consumer groups?
+2. Which fields help deduplicate and order an event?
+3. What happens if a new subscription is created after the topic's retention window?
+4. Why should a fact event be emitted after a source transaction commits?
+5. When is a command a better abstraction than an event?
+6. How does a slow subscription affect storage and replay cost?
+7. Why can pub/sub still create eventual-consistency bugs in a read model?
+
+## Related Topics
+
+- [Partitions and consumer groups](partitions-and-consumer-groups.mdx) adds parallelism and ordering constraints.
+- [Ordering](ordering.mdx) explains key and global order.
+- [Delivery semantics](delivery-semantics.mdx) covers duplicates and crash points.
+- [Cache invalidation](../05-caching/cache-invalidation.mdx) is a concrete event-driven subscriber.
+
+## References
+
+### Documentation / Articles
+
+- [Apache Kafka introduction](https://kafka.apache.org/42/documentation.html) — explains topics, partitions, consumer groups, independent subscribers, and replayable retention.
+- [Apache Kafka design](https://kafka.apache.org/42/design/design/) — grounds producer/consumer delivery semantics and durable log behavior.
+- [Google Cloud Pub/Sub overview](https://cloud.google.com/pubsub/docs/overview) — documents topics, subscriptions, message retention, and independent subscriber delivery.
+- [RabbitMQ exchanges](https://www.rabbitmq.com/docs/exchanges) — provides a broker implementation of routing and fan-out concepts.

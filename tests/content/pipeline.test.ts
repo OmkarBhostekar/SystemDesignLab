@@ -62,16 +62,23 @@ function expectValidationFailure(root: string, field: string, code?: string): Co
 }
 
 describe("the production content index", () => {
-  it("validates all four completed modules and 29 lessons", () => {
+  it("validates all nine completed modules and 82 lessons", () => {
     const index = loadContentIndex();
-    expect(index.lessons).toHaveLength(29);
+    expect(index.lessons).toHaveLength(82);
     expect(index.modules.map((module) => module.id)).toEqual([
       "interview-method",
       "foundations",
       "networking",
       "traffic-and-services",
+      "databases",
+      "caching",
+      "messaging",
+      "distributed-coordination",
+      "reliability",
     ]);
-    expect(index.modules.map((module) => module.lessons.length)).toEqual([4, 10, 7, 8]);
+    expect(index.modules.map((module) => module.lessons.length)).toEqual([
+      4, 10, 7, 8, 14, 9, 10, 10, 10,
+    ]);
     expect(index.lessons.every((lesson) => !Object.prototype.hasOwnProperty.call(lesson, "body"))).toBe(true);
   });
 

@@ -1,0 +1,199 @@
+---
+type: lesson
+id: 04-06-database-indexes
+slug: database-indexes
+title: Database Indexes
+description: Use B-tree, composite, covering, and selective indexes to make measured access paths fast without hiding write cost.
+module: databases
+order: 6
+difficulty: core
+estimatedMinutes: 40
+prerequisites:
+  - 04-01-data-modeling-from-access-patterns
+  - 04-02-sql-vs-nosql
+  - 01-03-latency-vs-throughput
+tags:
+  - indexes
+  - b-tree
+  - composite-index
+  - covering-index
+  - selectivity
+  - query-plans
+objectives:
+  - Explain how an index changes lookup work and why it is not free for writes or storage.
+  - Order a composite index from equality, range, ordering, and selectivity requirements.
+  - Distinguish a covering/index-only scan from a merely searchable index.
+  - Use query plans, selectivity, result size, and write cost to decide whether an index is justified.
+relatedLessons:
+  - 04-07-b-tree-vs-lsm
+  - 04-01-data-modeling-from-access-patterns
+  - 04-13-connection-pools
+---
+
+# Database Indexes
+
+> An index is a maintained access path that trades write/storage work for fewer pages or partitions examined on a read.
+
+## Why This Exists
+
+Without an index, a query such as “open the latest 50 orders for customer C” may scan every order, filter, sort, and then return 50 rows. The naive answer is to add an index for every column. That fails because each insert/update must maintain every relevant index, indexes consume cache and disk, and low-selectivity indexes may still examine most of the table.
+
+The improvement starts from a measured query and chooses an ordering that supports its predicates and result. The trade-off is ongoing: read latency, write throughput, storage, build time, cache pressure, and planner complexity all change.
+
+## Mental Model
+
+An index is a sorted or structured map from search key to row/location. A B-tree narrows the search by branches, then scans adjacent leaf entries for a range/order. The table or heap still holds the full row in many engines. A “good” index reduces the amount of data touched enough to pay for its maintenance.
+
+Important terms:
+
+- **Selectivity:** how much a predicate narrows the candidate set. `order_id` is usually highly selective; `status = 'open'` may not be.
+- **Composite index:** one ordered key such as `(customer_id, created_at DESC, order_id)`.
+- **Leading/leftmost columns:** equality/range predicates on early columns usually determine the searchable region of a B-tree.
+- **Covering/index-only scan:** the index contains all required output columns and visibility conditions permit avoiding the table lookup.
+- **Partial/expression index:** stores only rows or a computed value matching a stable access pattern.
+
+## How It Works
+
+Use this workflow:
+
+1. Capture the exact predicate, ordering, projection, and expected result bound.
+2. Inspect the plan and cardinality estimates; measure before and after with representative data and skew.
+3. Put equality/partitioning columns first, then the range/order column, and include a stable tie-breaker for pagination.
+4. Keep the index narrow. Add covering payload only when avoiding heap reads is likely to matter and the table is sufficiently stable.
+5. Consider partial or expression indexes for a high-value subset, but account for query predicate matching and maintenance.
+6. Roll out safely, watch write latency, index size, cache hit ratio, dead tuples/compaction, and whether the planner uses it.
+
+For example, `(customer_id, created_at DESC, order_id)` supports `WHERE customer_id = ? ORDER BY created_at DESC, order_id DESC LIMIT 50`. An index on `(created_at, customer_id)` may not narrow the customer region as effectively. It can still help a time-first query; the access pattern decides.
+
+## Example
+
+An order service begins with a table scan for a customer order page. At 5 million rows, p99 latency grows with data. The naive fix adds single-column indexes on `customer_id`, `created_at`, and `status`. The planner still sorts or combines indexes, and every insert pays for three structures.
+
+The improved index is:
+
+```sql
+CREATE INDEX orders_customer_recent
+  ON orders (customer_id, created_at DESC, order_id DESC)
+  INCLUDE (status, total_cents);
+```
+
+The leading customer key limits the scan; the timestamp supplies order; `order_id` makes the cursor deterministic; included fields may permit an index-only scan for the card view. If only active orders matter, a partial index can shrink maintenance:
+
+```sql
+CREATE INDEX orders_customer_open
+  ON orders (customer_id, created_at DESC, order_id DESC)
+  WHERE status = 'open';
+```
+
+Now writes that change `status` may enter or leave the partial index, the covering payload increases index size, and index-only scans still depend on visibility/maintenance. A query returning 40% of the table may be faster as a sequential scan; an index is not a command to avoid all scans.
+
+## Visualization We Eventually Want
+
+Build an **index planner lab** with a table of orders and configurable distributions for customer, status, and time. Let the learner add/reorder composite keys, include columns, choose predicates, and compare a sequential scan, index scan, bitmap scan, and index-only scan.
+
+Show pages read, rows examined/returned, selectivity, p50/p99 latency, index bytes, write amplification, build time, and planner choice. Presets should include a selective customer lookup, low-selectivity status filter, wrong composite-key order, and covering index on a frequently changing table. Include a text `EXPLAIN`-like explanation, step/reset, and reduced-motion controls.
+
+## Scaling Behavior
+
+Index size grows with rows, key width, included payload, and replicas. Larger indexes compete for memory and make cache misses more expensive. Write-heavy systems may saturate on index maintenance or log/compaction before table storage. Building an index can consume I/O and locks; online/concurrent build behavior is engine-specific.
+
+As data is partitioned, each shard may need a local index and a global query may fan out. A highly selective local index does not make a scatter-gather query cheap. Keep cardinality estimates fresh and test hot tenants and recent-time skew.
+
+## Failure Modes
+
+- **Wrong leading column:** A composite B-tree cannot efficiently narrow the intended region for the real predicate/order.
+- **Low selectivity:** The index visits most rows, then loses to a sequential scan while still costing writes.
+- **Stale statistics:** The planner chooses a bad plan because estimated cardinality differs from reality.
+- **Over-indexing:** Write latency, storage, cache pressure, and migration time grow silently.
+- **Wide covering index:** Payload bloat makes writes and reads heavier; a changing table rarely benefits from index-only scans.
+- **Shard fan-out:** Every shard has a good local plan, but the global query touches all shards.
+- **Index build incident:** A backfill consumes I/O/locks during peak traffic.
+
+Mitigate with query plans, realistic distributions, index usage/size monitoring, bounded rollout, online build options where supported, and dropping unused indexes only after observing a safe window.
+
+## Trade-offs
+
+Indexes reduce read work and can provide uniqueness/order, but they cost writes, disk, memory, build/rebuild time, and sometimes vacuum/compaction work. Composite and covering indexes make one query excellent while making neighboring queries or schema evolution more expensive. Partial indexes save space but are tied to a predicate. More indexes are not a substitute for a good partition or access pattern.
+
+## Alternatives
+
+- **Query/model rewrite:** Often the cheapest fix when the query asks for an unbounded result or joins the wrong owner.
+- **Materialized/read projection:** Better for repeated aggregates or multi-table views; adds freshness and rebuild cost.
+- **Partitioning:** Limits data touched by a tenant/time predicate but does not replace local indexes.
+- **Search index:** Better for text relevance/faceting than B-tree predicates.
+- **Cache:** Good for repeated hot reads, but does not fix arbitrary queries or invalidate itself correctly.
+
+## When to Use
+
+Use an index when a measured, recurring query has a selective/bounded access path and the write/storage budget supports maintenance. Define the query, expected cardinality, order, and projection in the decision record.
+
+## When Not to Use
+
+Do not index every column, a low-selectivity predicate without evidence, or a query that should be a bounded projection/partition. Do not assume a covering index is beneficial on a high-churn table.
+
+## Common Misconceptions
+
+- **An index always makes a query faster.** The planner may correctly choose a scan for a large result.
+- **Composite indexes work in any column order.** Leading keys and range boundaries matter.
+- **Covering means no table work in all engines.** Visibility/version checks and engine rules still apply.
+- **Indexes only cost disk.** They cost write I/O, CPU, cache, build, replication, and maintenance.
+- **A local index solves a distributed query.** Shard fan-out and merge work can dominate.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I index a measured access pattern, not a column by habit. For a customer order page, `(customer_id, created_at, id)` narrows the customer and supplies stable order/cursor; included fields may enable an index-only scan. I verify selectivity and the query plan, then account for index bytes, write amplification, build/replica cost, and shard fan-out. If the result is unbounded or a projection is more appropriate, I fix the model instead.
+
+### When to Introduce It
+
+Introduce indexes after the access-pattern table and baseline plan show an avoidable scan, sort, or heap lookup on a critical path.
+
+### Common Follow-Ups
+
+- Why this composite order?
+- What happens when status has low selectivity?
+- How does a covering index affect writes?
+- What metrics prove the planner uses it?
+- How does this behave after sharding?
+
+### Common Candidate Mistakes
+
+- Naming an index without showing the query it serves.
+- Ignoring stable pagination tie-breakers.
+- Claiming a B-tree solves text search or high-cardinality fan-out.
+- Adding many indexes to hide a bad data model.
+- Forgetting statistics, rollout, and backfill cost.
+
+## Summary
+
+- An index is a maintained access path, not free metadata.
+- Composite order, selectivity, result bound, and projection determine whether it helps.
+- Covering/index-only scans trade index bloat for fewer table reads and depend on engine visibility rules.
+- Measure plans and write cost, and revisit indexes when partitioning or workload shape changes.
+
+## Quiz Seeds
+
+1. Why is `(customer_id, created_at)` a better fit than `(created_at, customer_id)` for a customer's recent page?
+2. When can a sequential scan beat an index scan?
+3. What makes a cursor based on `(created_at, id)` stable?
+4. Why can adding an `INCLUDE` payload worsen a write-heavy workload?
+5. How does low selectivity affect the planner's choice?
+6. What does an index-only scan still need to check in an MVCC engine?
+7. Why can a local index fail to solve a scatter-gather query across shards?
+8. Which rollout and metrics would you use before keeping a new index?
+
+## Related Topics
+
+- [B-tree versus LSM trees](b-tree-vs-lsm.mdx)
+- [Data modeling from access patterns](data-modeling-from-access-patterns.mdx)
+- [Connection pools](connection-pools.mdx)
+
+## References
+
+### Documentation / Articles
+
+- [PostgreSQL: Indexes](https://www.postgresql.org/docs/current/indexes.html) — introduces index benefits, overhead, supported index types, and plan inspection.
+- [PostgreSQL: Multicolumn indexes](https://www.postgresql.org/docs/current/indexes-multicolumn.html) — documents leading-column behavior, range constraints, and why column order matters.
+- [PostgreSQL: Index-only scans and covering indexes](https://www.postgresql.org/docs/current/indexes-index-only-scans.html) — explains heap visibility, `INCLUDE` payload, and covering-index bloat.
+- [PostgreSQL: Using EXPLAIN](https://www.postgresql.org/docs/current/using-explain.html) — shows how to inspect estimated and actual query plans rather than guessing.

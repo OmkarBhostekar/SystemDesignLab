@@ -1,0 +1,192 @@
+---
+type: lesson
+id: 07-07-saga-pattern
+slug: saga-pattern
+title: Saga Pattern
+description: Coordinate a long-running business workflow as local transactions with forward retries and explicit compensation.
+module: distributed-coordination
+order: 7
+difficulty: advanced
+estimatedMinutes: 35
+prerequisites:
+  - 07-06-distributed-transactions-and-2pc
+  - 01-10-consistency-models
+  - 03-08-service-boundaries
+tags:
+  - saga
+  - compensation
+  - orchestration
+  - choreography
+  - workflows
+objectives:
+  - Decompose a cross-service business transaction into local atomic steps and explicit states.
+  - Compare saga orchestration and choreography using coupling, visibility, and failure-recovery criteria.
+  - Design compensating actions that are idempotent and semantically valid rather than pretending to undo history.
+  - Explain the consistency and isolation guarantees a saga does not provide.
+relatedLessons:
+  - 07-06-distributed-transactions-and-2pc
+  - 07-08-transactional-outbox
+  - 07-10-event-sourcing-and-cqrs
+---
+
+# Saga Pattern
+
+> A saga reaches a business end state through a sequence of local commits, retries, and compensating actions; it trades atomic isolation for availability and explicit workflow state.
+
+## Why This Exists
+
+An order may create an order record, reserve inventory, authorize payment, and request shipping. Each service owns its database and may be unavailable for minutes. A single 2PC transaction would hold resources across slow calls and may not include the payment provider. The naive alternative is a chain of calls with a boolean `success`; a crash after inventory reservation leaves no durable place to resume or compensate.
+
+A saga makes the workflow durable and observable. Each local transaction commits in one service, then triggers the next step. If a business failure occurs, earlier steps run compensations such as release inventory or void authorization. This is not a time machine: concurrent readers can observe intermediate state, and a compensation may be a new business action with its own failure modes.
+
+## Mental Model
+
+```text
+Create order (PENDING)
+      ↓
+Reserve inventory ──fail──> release reservation → cancel order
+      ↓
+Authorize payment
+      ↓
+Create shipment
+      ↓
+Order (CONFIRMED)
+```
+
+Classify each step:
+
+- **Compensable:** a business action has a meaningful inverse, such as release a hold.
+- **Pivot:** the point after which the flow cannot simply be undone.
+- **Retryable:** a later action that should eventually complete with idempotent retries, such as generating a label.
+
+The saga state machine—not a collection of transient messages—is the source of truth for what happened, what is pending, and which compensation is due.
+
+## How It Works
+
+### Orchestration
+
+An orchestrator stores saga state and sends commands: `ReserveInventory`, `AuthorizePayment`, `CreateShipment`. Participants reply with success/failure events. The orchestrator chooses the next step, timeout, retry, or compensation. This centralizes visibility and makes a complex workflow easier to test, but the orchestrator must be replicated/durable and can become a coupling point.
+
+### Choreography
+
+Participants publish domain events and subscribe to events they understand: `OrderCreated` triggers inventory, `InventoryReserved` triggers payment, and so on. There is no central controller. This can be simple for two or three participants, but the dependency graph becomes implicit; cycles, duplicate subscriptions, and failure diagnosis become harder as steps grow.
+
+Every message must carry saga ID, step ID, idempotency key, and version/state information. A participant must make local state plus the next event durable together—typically via a transactional outbox—otherwise the saga can stop after a local commit with no trigger.
+
+## Example
+
+For a hotel booking:
+
+1. Booking service creates `PENDING` booking with an expiration time.
+2. Inventory service reserves room/date using a version check and returns hold ID.
+3. Payment service authorizes (not necessarily captures) funds with idempotency key `booking-123`.
+4. Confirmation service commits the booking and emits confirmation.
+
+If authorization fails permanently, the saga releases the room and marks `CANCELLED`. If the payment provider times out, it queries by idempotency key before deciding to compensate; blindly releasing the room may produce a late payment for an already-cancelled booking. If shipment/confirmation fails after payment, the business policy may retry, refund, or route to manual review. The compensation is not “restore the database row”; it is a new action with user-facing semantics.
+
+## Visualization We Eventually Want
+
+Show the order workflow as a state machine with local databases, command/event arrows, retries, timeouts, and compensation arrows. Controls should fail a chosen participant, duplicate a message, delay a response, pause the orchestrator, and choose choreography/orchestration. Display saga state, pending holds, payment authorization status, compensation attempts, and user-visible state. Presets should compare a transient timeout (query/retry) with a permanent business rejection (compensate) and show why an outbox is required for each transition.
+
+## Scaling Behavior
+
+Saga instances consume durable state, timers, messages, and retries. Partition by saga ID or business aggregate to preserve per-workflow ordering while scaling workers. Hot customers/events can create skew. Orchestrators need a durable store and idempotent command delivery; choreography needs broker partitions and consumer concurrency controls.
+
+Long workflows increase retention and recovery work. Keep step payloads small, store references to large artifacts, and define a retention/archive policy after terminal state. Compensation traffic can spike during a shared dependency outage; bound it and use admission control.
+
+## Failure Modes
+
+- **Duplicate command/event:** participants must deduplicate by step/idempotency key.
+- **Lost transition:** local state commits but the next message is not published; outbox or log-based CDC closes this gap.
+- **Unknown external result:** query by provider idempotency key before retrying or compensating.
+- **Compensation failure:** retry, park for manual repair, or run a compensating saga; do not silently mark success.
+- **Concurrent saga conflict:** two workflows reserve or release the same resource; use versions, semantic locks, or commutative updates.
+- **Orchestrator loss:** durable state and lease/failover allow another instance to resume.
+- **Event cycle:** choreography can loop indefinitely or trigger actions in an unexpected order.
+- **Partial visibility:** users see `PENDING`/`CANCELLED` states; APIs must expose progress rather than imply atomic completion.
+
+## Trade-offs
+
+Sagas avoid long distributed locks and tolerate service boundaries, but they give up instantaneous atomicity/isolation and require domain-specific compensation. Orchestration improves visibility and explicit control at the cost of central workflow infrastructure. Choreography reduces a central coordinator but hides control flow and complicates change/testing. Both need durable state, idempotency, ordering, and operational repair.
+
+## Alternatives
+
+- **Local transaction:** prefer when the invariant fits one service/database.
+- **2PC:** prefer for short, strict atomic commit across compatible resource managers.
+- **Reservation protocol:** prefer when providers expose hold/capture/release semantics.
+- **Event sourcing:** prefer when immutable domain history and replay are primary requirements; it is not a required saga implementation.
+- **Manual review queue:** prefer for low-volume, high-value exceptions where automation cannot safely compensate.
+
+## When to Use
+
+Use a saga for multi-step, long-running workflows across independently owned stores, especially when intermediate states are acceptable and compensations have clear business meaning. Choose orchestration when the workflow needs centralized visibility or many participants; choose choreography for small, stable event graphs.
+
+## When Not to Use
+
+Do not use a saga to emulate a simple local transaction or to hide a missing data boundary. Avoid compensation when the business action is irreversible and no reconciliation policy exists. Do not claim a saga gives serializable isolation across services.
+
+## Common Misconceptions
+
+- **“Compensation is rollback.”** It is a new transaction and may fail or be observed.
+- **“Saga means eventual consistency with no design.”** Each step, state, timeout, and repair path must be explicit.
+- **“Orchestration has no single point of failure.”** Its state store/orchestrator must be replicated and recoverable.
+- **“Choreography is always more decoupled.”** Event subscriptions can create hidden coupling and cycles.
+- **“A timeout means the step failed.”** An external call may have succeeded; reconcile by operation ID.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> A saga decomposes a cross-service workflow into local transactions. Each step records durable state and triggers the next; transient failures retry, while business failures invoke idempotent compensations. Orchestration centralizes the state machine, choreography distributes it through events. The trade-off is eventual consistency and weaker isolation, so I expose pending states, conflict controls, and manual repair instead of pretending this is ACID rollback.
+
+### When to Introduce It
+
+Introduce a saga when a workflow spans service-owned databases or external providers and 2PC is unavailable or too blocking. Start by drawing the state machine and compensation table, not by naming a framework.
+
+### Common Follow-Ups
+
+- Which steps are compensable, pivot, or retryable?
+- How does a participant deduplicate commands?
+- What happens if a payment timeout actually charged the customer?
+- Who owns saga state and how is it recovered?
+
+### Common Candidate Mistakes
+
+- Calling a chain of synchronous API calls a saga without durable state.
+- Omitting the outbox/CDC publication boundary.
+- Assuming compensation restores isolation.
+- Not exposing pending/reconciliation states to clients/operators.
+
+## Summary
+
+Sagas are durable business state machines built from local commits, retries, and compensations. They make long workflows practical across service boundaries but explicitly accept intermediate visibility, conflict handling, and repair work. Pick orchestration or choreography based on workflow complexity and observability, not fashion.
+
+## Quiz Seeds
+
+1. Why should a payment timeout be reconciled before running a refund compensation?
+2. Which saga step is a pivot, and how does that change compensation planning?
+3. Compare choreography and orchestration for a workflow with ten participants.
+4. What data must a participant persist to make duplicate commands safe?
+5. Why does a saga not provide serializable isolation across services?
+6. What failure occurs if a local commit succeeds but its next event is lost?
+7. When is a local transaction better than a saga?
+
+## Related Topics
+
+- [Distributed Transactions and 2PC](./distributed-transactions-and-2pc.mdx)
+- [Transactional Outbox](./transactional-outbox.mdx)
+- [Change Data Capture](./change-data-capture.mdx)
+- [Event Sourcing and CQRS](./event-sourcing-and-cqrs.mdx)
+
+## References
+
+### Documentation / Articles
+
+- [Saga patterns](https://docs.aws.amazon.com/prescriptive-guidance/latest/cloud-design-patterns/saga-patterns.html) — AWS explains local transactions, forward recovery, compensation, and orchestration versus choreography.
+- [Saga distributed transactions pattern](https://learn.microsoft.com/en-us/azure/architecture/patterns/saga) — Microsoft describes pivot, compensable, and retryable transactions and their consistency limits.
+- [Pattern: Saga](https://microservices.io/patterns/data/saga.html) — Chris Richardson gives concrete choreography/orchestration flows and resulting-context trade-offs.
+- [Implement the serverless saga pattern by using AWS Step Functions](https://docs.aws.amazon.com/prescriptive-guidance/latest/patterns/implement-the-serverless-saga-pattern-by-using-aws-step-functions.html) — an implementation-oriented orchestration example with durable workflow state.
+
+### Papers
+
+- [Sagas](https://www.cs.princeton.edu/techreports/1993/405.pdf) — the original Garcia-Molina and Salem work introduces long-lived transactions and compensating subtransactions.

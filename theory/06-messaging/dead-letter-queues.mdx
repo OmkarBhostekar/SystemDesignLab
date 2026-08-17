@@ -1,0 +1,158 @@
+---
+type: lesson
+id: 06-08-dead-letter-queues
+slug: dead-letter-queues
+title: Dead-Letter Queues
+description: Quarantine poison messages after bounded retries while preserving enough context for diagnosis, repair, and safe replay.
+module: messaging
+order: 8
+difficulty: core
+estimatedMinutes: 30
+prerequisites:
+  - 06-06-delivery-semantics
+  - 06-07-idempotent-consumers
+tags:
+  - dead-letter-queue
+  - poison-message
+  - retries
+  - quarantine
+  - replay
+objectives:
+  - Explain why retrying a poison message forever can block useful work and exhaust capacity.
+  - Design retry limits, backoff, DLQ metadata, alerting, and operator ownership.
+  - Distinguish transient dependency failures from permanent schema or business failures.
+  - Define a safe replay path that preserves identity and avoids duplicate side effects.
+relatedLessons:
+  - 06-06-delivery-semantics
+  - 06-07-idempotent-consumers
+  - 06-09-backpressure
+---
+
+# Dead-Letter Queues
+
+> A dead-letter queue is a quarantine and investigation path, not a trash can or a guarantee that a message will eventually succeed.
+
+## Why This Exists
+
+A malformed invoice causes a worker to fail, requeue, and immediately receive the same message again. The poison message burns CPU, increases broker traffic, and may starve valid invoices. The naive response is infinite retry, which treats permanent input errors like transient outages. A DLQ caps automated attempts and preserves the message for diagnosis. The new trade-off is delayed business completion, operator work, and replay risk.
+
+## Mental Model
+
+```text
+main queue → attempt 1 → backoff → attempt N
+                             │ failure budget exhausted
+                             ↓
+                         DLQ/quarantine → inspect/fix/replay or discard
+```
+
+Classify failures: transient network/timeouts may retry with backoff; permanent schema, authorization, or business validation errors should usually quarantine; dependency-wide outages may require pausing or routing to a delayed retry queue. A DLQ should retain original payload, event ID, headers, error class, attempt count, first/last failure time, consumer version, and source subscription.
+
+## How It Works
+
+Use bounded attempts or an age budget, exponential backoff with jitter, and separate retry queues when immediate requeue would starve other work. On DLQ transfer, preserve the original identity and add diagnostic metadata. Alert on DLQ rate and oldest message age, not only count. Operators need a runbook: inspect, correct code/data, decide whether to replay, and record the decision.
+
+Replay should go through the normal consumer path with the original event ID so idempotency still works. If the bug fix changes schema, transform explicitly and retain a link to the original. Do not bulk replay an entire DLQ into a live dependency without a rate limit and capacity check.
+
+## Example
+
+An invoice consumer retries a transient storage timeout three times with jitter, then sends the message to a delayed retry queue. A message failing schema validation goes directly to the DLQ with `error_class=schema` and a sample payload hash. After deploying a parser fix, an operator replays only schema failures at 50 messages/s while watching downstream capacity. A duplicate event ID remains safe because the consumer's inbox table is idempotent.
+
+The naive “requeue immediately” design creates a hot loop and hides the real error. The improvement separates retryable and terminal failures. The new trade-off is that a bad classification can delay a recoverable job or repeatedly retry a permanent one.
+
+## Visualization We Eventually Want
+
+Build a **Retry and DLQ Triage Lab** with transient/permanent failure toggles, attempt budgets, backoff, retry queues, and a DLQ. Controls should include producer rate, worker capacity, failure class, schema version, replay rate, and idempotency. Show main backlog, retry age, DLQ count/age, source load, successful recovery, and duplicate outcomes during replay.
+
+## Scaling Behavior
+
+Retry traffic can multiply original load; delayed queues smooth it but consume storage. DLQ volume and retention need capacity and privacy controls. Replay is a second workload and can recreate the original incident. Partition DLQ triage by tenant/error class and rate-limit replay per dependency.
+
+## Failure Modes
+
+- Transient outage is misclassified as permanent and messages are quarantined too early.
+- Permanent poison message is retried indefinitely.
+- DLQ loses original headers or event ID, making diagnosis/replay unsafe.
+- Operator replays before fixing the consumer, recreating the flood.
+- Replay bypasses idempotency and duplicates side effects.
+- DLQ itself reaches retention or storage limits.
+
+Use explicit classification, durable metadata, alerts, retention policy, access controls, and a tested replay runbook.
+
+## Trade-offs
+
+DLQs protect the main queue and preserve evidence, but they turn automatic reliability into human or repair-pipeline work. More retry attempts can recover transient failures but increase latency and load. Fewer attempts reduce load but may push recoverable work to operators. A separate delayed retry queue adds complexity but avoids hot requeue loops.
+
+## Alternatives
+
+- **Delayed retry topic/queue:** suitable for transient dependencies and scheduled backoff.
+- **Circuit breaker/pause consumption:** useful during a broad downstream outage.
+- **Drop with metrics:** acceptable for explicitly lossy analytics.
+- **Workflow escalation:** good when a human decision or compensation is needed.
+
+## When to Use
+
+Use a DLQ when a message can fail repeatedly and the main stream must continue. Define the retry budget, metadata, alert, owner, replay rate, and data-retention policy before production.
+
+## When Not to Use
+
+Do not use a DLQ to hide unbounded data loss or as a replacement for fixing a transient outage. Do not replay sensitive messages without access, deletion, and audit controls.
+
+## Common Misconceptions
+
+- **DLQ means lost forever.** It should be recoverable evidence, but recovery is not automatic.
+- **Every failure deserves the same retry count.** Error class and downstream state matter.
+- **Requeue is free.** Immediate loops consume broker and worker capacity.
+- **Replay is harmless.** It re-executes side effects and can overload dependencies.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I classify transient versus permanent failures, retry transient work with bounded exponential backoff and jitter, and quarantine poison messages after an attempt or age budget. The DLQ retains event identity and diagnostic metadata, emits alerts on rate and age, and has an operator-owned replay path that uses the original idempotency key and a safe rate limit. It protects the main queue but introduces recovery and retention work.
+
+### When to Introduce It
+
+Introduce a DLQ when one bad message can repeatedly consume capacity or block valid work, and the message is valuable enough to diagnose or repair.
+
+### Common Follow-Ups
+
+- Which failures bypass retry?
+- How do you replay safely?
+- Who owns the DLQ?
+- What if the DLQ fills?
+
+### Common Candidate Mistakes
+
+They call every failure poison, requeue immediately forever, and omit metadata, alerts, ownership, or idempotent replay.
+
+## Summary
+
+- Retry budgets prevent poison loops; DLQs quarantine evidence after the budget.
+- Classify errors, preserve identity/metadata, and alert on age and rate.
+- Replay is a new workload and must use idempotency, rate limits, and a fixed consumer.
+- A DLQ is an operational workflow, not an automatic correctness guarantee.
+
+## Quiz Seeds
+
+1. Why can immediate requeue starve healthy messages?
+2. Which failure should go directly to a DLQ: malformed schema or transient timeout? Why?
+3. What metadata is essential for safe diagnosis and replay?
+4. Why can a replay duplicate an email even after the original consumer succeeded?
+5. How does a delayed retry queue differ from a DLQ?
+6. Which alert is more actionable: DLQ count or oldest DLQ message age?
+7. What should happen when a DLQ replay starts before downstream capacity is checked?
+
+## Related Topics
+
+- [Delivery semantics](delivery-semantics.mdx) explains why retries happen.
+- [Idempotent consumers](idempotent-consumers.mdx) makes replay safer.
+- [Backpressure](backpressure.mdx) limits retry and replay load.
+
+## References
+
+### Documentation / Articles
+
+- [Google Cloud dead-letter topics](https://docs.cloud.google.com/pubsub/docs/handling-failures) — documents forwarding undeliverable messages, approximate delivery-attempt counts, and separate analysis subscriptions.
+- [RabbitMQ dead letter exchanges](https://www.rabbitmq.com/docs/next/dlx) — defines dead-letter triggers such as reject, expiry, length limit, and delivery limit.
+- [Amazon SQS dead-letter queues](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-dead-letter-queues.html) — describes redrive policies and isolating repeatedly failed messages.
+- [Amazon SQS visibility timeout](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-visibility-timeout.html) — explains how failed/expired visibility leads to redelivery and why timeout settings affect retries.

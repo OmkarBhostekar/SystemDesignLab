@@ -1,0 +1,180 @@
+---
+type: lesson
+id: 07-09-change-data-capture
+slug: change-data-capture
+title: Change Data Capture
+description: Propagate committed database changes by reading durable database logs instead of placing every publish on the request path.
+module: distributed-coordination
+order: 9
+difficulty: advanced
+estimatedMinutes: 30
+prerequisites:
+  - 07-08-transactional-outbox
+  - 01-07-durability
+  - 01-10-consistency-models
+tags:
+  - change-data-capture
+  - cdc
+  - logical-decoding
+  - replication-log
+  - event-propagation
+objectives:
+  - Explain snapshot plus log-tail capture and how a connector resumes from an offset.
+  - Distinguish raw table-change replication from explicit domain-event publication.
+  - Reason about ordering, schema evolution, lag, backpressure, and connector recovery.
+  - Choose CDC, outbox, or application-level events based on ownership and consumer semantics.
+relatedLessons:
+  - 07-08-transactional-outbox
+  - 07-10-event-sourcing-and-cqrs
+  - 01-07-durability
+---
+
+# Change Data Capture
+
+> CDC turns a database's durable change record into a stream, but faithfully observing a row change is not the same as designing a stable business event.
+
+## Why This Exists
+
+An application may need to update a search index, warehouse, cache, or downstream service whenever a row changes. The naive approach adds a publish call after every `UPDATE`, recreating the dual-write crash window and forcing every code path—including backfills and admin scripts—to remember the event.
+
+Many databases already maintain a write-ahead log, binary log, or logical replication stream to recover and replicate changes. A CDC connector reads that durable stream and emits records downstream. The improvement centralizes observation of committed changes; the trade-off is connector operations, schema interpretation, raw row semantics, and lag/backpressure.
+
+## Mental Model
+
+```text
+database transaction → durable log (WAL/binlog)
+                              ↓ offset
+                        CDC connector
+                    snapshot + log tail
+                              ↓
+                 broker/topic → consumers
+```
+
+A new connector usually snapshots existing rows, records a safe log position, then streams changes after that point. The offset is a resumable position, not a business transaction ID. If a connector restarts, it replays from its last durable offset; consumers should tolerate duplicates.
+
+CDC can emit `row inserted`, `row updated`, and `row deleted` with before/after values. A domain event such as `OrderConfirmed` expresses intent and stable meaning; a table update such as `status='C'` exposes storage shape. An outbox table plus CDC combines atomic domain intent with log-based delivery.
+
+## How It Works
+
+1. Enable database logging/decoding appropriate to the engine and retention window.
+2. Capture a consistent initial snapshot, with a log position that prevents gaps between snapshot and stream.
+3. Decode committed log records into a schema-aware change envelope containing source table, transaction/LSN/position, operation, keys, values, and schema version.
+4. Publish to a partitioned stream; choose partition key and ordering scope deliberately.
+5. Persist connector offsets and monitor source log retention, connector lag, broker lag, and consumer errors.
+6. On schema change, evolve the envelope/consumer contract or pause and migrate; do not silently reinterpret old records.
+
+CDC generally observes commit order within a source log, but cross-table/global order, transaction boundaries, and multiple database sources require explicit metadata and routing. A connector can deliver at least once; downstream effects need deduplication and replay safety.
+
+## Example
+
+An orders database feeds a search index and analytics lake. A CDC connector snapshots 50 million existing orders, then tails the WAL. An update transaction that changes order status and audit row may produce multiple table events; the index consumer uses order ID and version to update one document, while analytics preserves transaction/LSN metadata for reconstruction.
+
+For public workflow events, the service writes an `OrderConfirmed` outbox row in the same transaction. CDC filters the outbox table and routes that row to the event topic. Consumers receive a stable event schema rather than coupling to every internal table migration. A direct table CDC stream remains useful for warehouse replication and cache invalidation where raw changes are the intended contract.
+
+## Visualization We Eventually Want
+
+Show a database with transaction commits entering a log, a connector performing snapshot then tailing, an offset checkpoint, a broker, and two consumers. Controls should add writes, pause the connector, compact/expire source logs, alter schema, duplicate/reorder delivery, and throttle a consumer. Display snapshot progress, source LSN, connector lag, broker lag, offset, duplicate count, and a gap alert. Compare direct row CDC with outbox-filtered domain events in one scenario.
+
+## Scaling Behavior
+
+Snapshot bandwidth can compete with production reads; throttle or run from a replica when safe. High write volume increases log retention/storage and connector throughput requirements. Partition downstream records by aggregate/key to preserve per-key order, but skewed keys can create hot partitions.
+
+Multiple tables and databases require schema registry/version policy and reconciliation. A slow consumer cannot always back up the source log indefinitely; retain enough log history for the RPO/replay plan and archive events when necessary. Connector fleets need ownership/failover and exactly one active reader per source partition or a safe cooperative scheme.
+
+## Failure Modes
+
+- **Snapshot gap/duplicate:** an incorrect snapshot-to-log handoff loses or repeats rows.
+- **Offset loss:** connector restarts from too early/late and replays or skips changes.
+- **Log retention expiry:** a stopped connector cannot resume from its old position; re-snapshot/reconcile is required.
+- **Schema drift:** consumers fail or misinterpret a column/type change.
+- **Transaction fragmentation:** consumers see row changes before all related views are updated unless transaction metadata/order is used.
+- **Backpressure:** broker/consumer lag grows and source resources are retained longer.
+- **Raw-table coupling:** internal schema refactors become downstream breaking changes.
+- **External side effects during replay:** rebuilding an index is safe; charging a card on replay is not.
+
+## Trade-offs
+
+CDC covers changes made outside one application code path and can provide high-throughput replay, but it couples operations to database internals, log retention, connector upgrades, and schema contracts. Application events express intent and hide storage changes, but every producer path must publish reliably; the outbox closes that gap. A polling query is simple but can miss deletes/order and burdens the database.
+
+## Alternatives
+
+- **Transactional outbox plus relay:** prefer for stable domain events tied to one service transaction.
+- **Database logical replication:** prefer for database-to-database replication where row semantics are desired.
+- **Application event bus:** prefer when events are derived from business decisions, with an outbox for reliability.
+- **Periodic full export/reconciliation:** prefer for low-frequency analytics where near-real-time change is unnecessary.
+- **Query polling:** acceptable for small, append-only tables when log access is unavailable and a watermark is reliable.
+
+## When to Use
+
+Use CDC when committed database changes must feed search/analytics/replicas, when multiple writers exist, or when replay and backfill are important. Pair it with schema/version governance, offset durability, lag alerts, idempotent consumers, and a clear raw-change versus domain-event contract.
+
+## When Not to Use
+
+Do not expose internal table changes as public API events by default. Do not use CDC to trigger irreversible external side effects without an idempotent command boundary. Avoid adding CDC when a local transaction plus a small outbox/relay is easier to operate.
+
+## Common Misconceptions
+
+- **“CDC is exactly once.”** Offsets and connector crashes commonly produce duplicates; effects must be idempotent.
+- **“A WAL is a domain event stream.”** It records storage changes, not necessarily business meaning.
+- **“Snapshot then stream is trivial.”** The handoff position must avoid gaps and duplicates.
+- **“CDC preserves global transaction order across databases.”** Ordering is scoped to a source/log/partition unless coordinated.
+- **“Replay can rerun every side effect.”** Replays should rebuild safe projections or use effect-specific guards.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> CDC reads a database's durable log, usually after an initial consistent snapshot, and emits committed row changes from a resumable offset. It is useful for replication, search, and analytics, but raw table changes are not automatically stable domain events. I choose outbox-filtered CDC for business events, preserve per-key order, evolve schemas, monitor source/consumer lag, and make consumers replay-safe.
+
+### When to Introduce It
+
+Introduce CDC when multiple downstream systems need committed database changes or replay and a direct publish on every code path is unsafe. First define whether consumers need row state or business intent.
+
+### Common Follow-Ups
+
+- How do you avoid snapshot/log gaps?
+- What happens when the connector is down past log retention?
+- How do you handle schema evolution and deletes?
+- Why use an outbox table with CDC instead of exposing every table?
+
+### Common Candidate Mistakes
+
+- Treating CDC as a replacement for event design.
+- Ignoring offset durability, log retention, and re-snapshot recovery.
+- Triggering non-idempotent external calls directly from row changes.
+- Claiming a global order across sources.
+
+## Summary
+
+CDC is a durable-log observation pipeline: snapshot, tail, checkpoint, publish, replay. It improves coverage and throughput but exposes storage semantics and operational obligations. Use outbox filtering when business events need atomic intent; make every consumer tolerate duplicates and schema/replay changes.
+
+## Quiz Seeds
+
+1. Why must a connector coordinate its initial snapshot with a log position?
+2. What is the difference between a row update and a domain event?
+3. What happens when source log retention expires while a connector is stopped?
+4. Which ordering guarantees can a single database log provide, and which does it not provide across databases?
+5. Why are CDC consumers required to be replay-safe?
+6. When is direct table CDC preferable to outbox CDC?
+7. What metrics distinguish source pressure from downstream lag?
+
+## Related Topics
+
+- [Transactional Outbox](./transactional-outbox.mdx)
+- [Event Sourcing and CQRS](./event-sourcing-and-cqrs.mdx)
+- [Durability](../01-foundations/durability.mdx)
+- [Consistency Models](../01-foundations/consistency-models.mdx)
+
+## References
+
+### Documentation / Articles
+
+- [PostgreSQL Logical Decoding](https://www.postgresql.org/docs/current/logicaldecoding.html) — official documentation for decoding committed database changes from PostgreSQL's write-ahead log.
+- [Debezium Architecture](https://debezium.io/documentation/reference/3.1/architecture.html) — explains snapshot, log tailing, connectors, offsets, and CDC event flow.
+- [PostgreSQL Logical Replication](https://www.postgresql.org/docs/current/logical-replication.html) — documents snapshot-plus-stream behavior and replication-slot considerations.
+- [MySQL Binary Log](https://dev.mysql.com/doc/refman/8.4/en/binary-log.html) — official MySQL reference for the binary log used by replication and CDC tooling.
+- [Outbox Event Router](https://debezium.io/documentation/reference/stable/transformations/outbox-event-router.html) — shows how an outbox table can be transformed into stable events through CDC.
+
+### Papers
+
+- [The Chubby Lock Service for Loosely-Coupled Distributed Systems](https://research.google/pubs/the-chubby-lock-service-for-loosely-coupled-distributed-systems/) — a contrast case for coordination state versus log-based data propagation.

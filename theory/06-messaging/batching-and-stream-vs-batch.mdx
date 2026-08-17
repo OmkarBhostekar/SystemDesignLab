@@ -1,0 +1,167 @@
+---
+type: lesson
+id: 06-10-batching-and-stream-vs-batch
+slug: batching-and-stream-vs-batch
+title: Batching and Stream versus Batch Processing
+description: Choose batch size, trigger, time model, and processing mode while balancing throughput, latency, completeness, and replay cost.
+module: messaging
+order: 10
+difficulty: advanced
+estimatedMinutes: 40
+prerequisites:
+  - 06-09-backpressure
+  - 06-04-partitions-and-consumer-groups
+  - 01-03-latency-vs-throughput
+  - 01-04-percentiles-tail-latency
+tags:
+  - batching
+  - stream-processing
+  - batch-processing
+  - event-time
+  - windows
+  - watermarks
+objectives:
+  - Explain how batching amortizes overhead while adding wait and failure granularity.
+  - Distinguish unbounded stream processing from bounded batch processing.
+  - Compare processing time, ingestion time, and event time for windowed results.
+  - Use watermarks, allowed lateness, and correction/replay policy for out-of-order events.
+relatedLessons:
+  - 06-04-partitions-and-consumer-groups
+  - 06-09-backpressure
+  - 06-05-ordering
+  - 01-03-latency-vs-throughput
+---
+
+# Batching and Stream versus Batch Processing
+
+> Batching improves amortized throughput by waiting to process a group, while stream and batch modes choose different boundaries for completeness, latency, state, and recovery.
+
+## Why This Exists
+
+The naive consumer performs one network write and one checkpoint per message. Per-message overhead dominates, but batching every message for an hour makes results unusably late and enlarges the retry unit. A stream processor handles an unbounded flow continuously; a batch job processes a bounded snapshot or window. The improvement is to choose a batch trigger and time model from the product's latency and correctness needs. The new trade-off is wait latency, partial failure, state size, and late-data correction.
+
+## Mental Model
+
+```text
+stream:  e1 e2 e3 e4 … (unbounded) → windows/state → incremental results
+batch:   [bounded input snapshot] → finite job → output/checkpoint
+
+batch trigger: count N OR time T OR bytes B OR punctuation/watermark
+```
+
+Batch size controls amortization and failure granularity. A batch can flush when it reaches `N` messages, `T` milliseconds, `B` bytes, or a semantic boundary. A stream is not “real time” by definition; it is a processing model for data that may never end.
+
+## How It Works
+
+Choose a time attribute:
+
+- **Processing time:** when the operator handles the event; low latency, sensitive to backlog and scheduling.
+- **Ingestion time:** when the system receives it; stable within the pipeline, but not when the event happened.
+- **Event time:** timestamp from the producer/device; supports correct historical windows but must handle out-of-order and late events.
+
+For event-time windows, a watermark estimates progress: “events at or before this timestamp should have arrived.” A tumbling window has no overlap, sliding windows overlap, and session windows close after inactivity. Allowed lateness keeps a window open after its nominal end; late events may update, retract, or be sent to a side output. No finite watermark proves that no late event will ever arrive.
+
+## Example
+
+An IoT dashboard computes five-minute temperature averages. Processing-time windows show what the collector received, but a device reconnect can send old readings into the wrong bucket. Event-time windows use device timestamps and a 60-second watermark delay; a reading 30 seconds late is included, while a reading two hours late is corrected through a replay path or marked late.
+
+The naive per-message pipeline has high network overhead and inconsistent partial writes. The improvement batches up to 500 readings or 100 ms, whichever comes first. The new trade-off is up to 100 ms of added latency and a larger retry unit if the sink fails. A nightly batch can recompute exact historical aggregates but cannot provide the dashboard's live response.
+
+## Visualization We Eventually Want
+
+Build a **Windowing and Batching Lab** with events arriving in order and out of order. Controls should include batch count/bytes/time, event-time skew, processing speed, watermark delay, allowed lateness, window type, sink failure, and replay. Show flush triggers, batch latency, throughput, window contents, watermark, late events, corrections, checkpoint/replay work, and memory state.
+
+## Scaling Behavior
+
+Larger batches amortize fixed network and storage overhead but increase memory, tail latency, and failure replay. More partitions and operators increase stream parallelism, while keyed state and hot keys remain limits. Window state grows with key cardinality and window/lateness duration. Batch jobs scale through partitioned input and checkpoints but can create synchronized load at start/end. Monitor batch size distribution, flush wait, throughput, watermark lag, state bytes, late-event rate, and end-to-end freshness.
+
+## Failure Modes
+
+- A full batch fails and replays all messages, causing duplicate writes without idempotency.
+- A time-triggered flush waits forever during low traffic unless a timeout exists.
+- Watermark advances too slowly because one input partition lags.
+- Late events are discarded despite a business requirement for correction.
+- Large windows exhaust state memory.
+- Batch recomputation and live stream both update a sink out of order.
+
+Use bounded batch triggers, checkpoints, idempotent/upsert sinks, state TTL, watermark/partition-lag metrics, late-event policy, and versioned result writes.
+
+## Trade-offs
+
+Batching improves throughput and cost efficiency but adds latency and larger retries. Stream processing delivers incremental results and reacts to events but keeps state and handles out-of-order data continuously. Batch recomputation gives completeness and simpler global joins but costs freshness and periodic compute. Event time improves semantic correctness at the cost of waiting and correction complexity.
+
+## Alternatives
+
+- **Micro-batch:** compromise that processes small bounded chunks at regular intervals.
+- **Pure batch:** best for bounded historical recomputation and large joins.
+- **Pure per-event stream:** lowest per-event delay when overhead is acceptable.
+- **Lambda-style correction:** stream for freshness plus batch recomputation for exact results; duplicate paths require reconciliation.
+
+## When to Use
+
+Use batching when per-message overhead is material and the product can tolerate bounded wait. Use stream processing for continuous decisions, alerts, or incremental projections. Use event-time windows when producer timestamps define the business interval and late data has a policy.
+
+## When Not to Use
+
+Do not choose a huge batch to hide a slow sink or unbounded backlog. Do not use processing time for a business report whose meaning depends on when events occurred. Do not promise complete event-time windows without a lateness/correction rule.
+
+## Common Misconceptions
+
+- **Streaming means every event is processed immediately.** Batching, backpressure, and watermarks add delay.
+- **A watermark proves no late events exist.** It is a progress heuristic with an allowed-lateness policy.
+- **Bigger batches always increase throughput.** Memory, sink limits, and failure replay can dominate.
+- **Batch and stream outputs automatically agree.** They can race and need version/reconciliation semantics.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I choose batch triggers from overhead versus freshness and bound the retry unit. Streams handle unbounded input incrementally; batches process bounded snapshots or windows. For time-sensitive aggregates I distinguish processing and event time, use watermarks to bound waiting for out-of-order events, and define allowed lateness and corrections. Larger batches and event-time completeness cost latency, memory, and replay work.
+
+### When to Introduce It
+
+Introduce batching/stream decisions when throughput, sink overhead, live freshness, historical recomputation, or out-of-order timestamps shape the architecture.
+
+### Common Follow-Ups
+
+- What closes a batch or window?
+- Which clock defines correctness?
+- What happens to a late event?
+- How do you recover a failed batch?
+
+### Common Candidate Mistakes
+
+They call any queue “stream processing,” ignore event time, and give no policy for late data, state growth, or batch failure.
+
+## Summary
+
+- Batching amortizes fixed overhead but adds wait and replay granularity.
+- Streams are unbounded; batches are bounded; micro-batches bridge the two.
+- Event-time windows need watermarks, allowed lateness, and correction/replay policy.
+- Measure freshness, state, late events, flush behavior, and sink capacity.
+
+## Quiz Seeds
+
+1. Why can a 500-message batch improve throughput but increase failure cost?
+2. Which time model fits a device report whose timestamp may arrive late?
+3. What does a watermark communicate, and why can it be wrong?
+4. How does allowed lateness affect memory and result latency?
+5. Why can a low-traffic stream need both count and time flush triggers?
+6. When is a nightly batch preferable to a live stream?
+7. What protects a sink when a failed batch is replayed?
+
+## Related Topics
+
+- [Backpressure](backpressure.mdx) controls batch and stream pressure.
+- [Partitions and consumer groups](partitions-and-consumer-groups.mdx) supplies stream parallelism and lag.
+- [Ordering](ordering.mdx) distinguishes per-key sequence from event-time arrangement.
+- [Latency versus throughput](../01-foundations/latency-vs-throughput.mdx) frames batching choices.
+
+## References
+
+### Documentation / Articles
+
+- [Timely stream processing](https://nightlies.apache.org/flink/flink-docs-stable/docs/concepts/time/) — explains processing/ingestion/event time, watermarks, lateness, and window semantics.
+- [Flink windows](https://nightlies.apache.org/flink/flink-docs-stable/docs/dev/datastream/operators/windows/) — documents window lifecycle, allowed lateness, and watermark-triggered computation.
+- [The Dataflow Model](https://research.google/pubs/the-dataflow-model-a-practical-approach-to-balancing-correctness-latency-and-cost-in-massive-scale-unbounded-out-of-order-data-processing/) — grounds the event-time, completeness, latency, and cost trade-off for unbounded data.
+- [Kinesis consumer optimization](https://docs.aws.amazon.com/streams/latest/dev/advanced-consumers.html) — provides an operational stream-consumer reference for throughput, throttling, and scaling.

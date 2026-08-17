@@ -1,0 +1,185 @@
+---
+type: lesson
+id: 08-02-retries
+slug: retries
+title: Retries and Error Classification
+description: Recover from transient faults with bounded, duplicate-safe attempts while refusing errors that cannot become successful.
+module: reliability
+order: 2
+difficulty: core
+estimatedMinutes: 30
+prerequisites:
+  - 08-01-timeouts
+  - 02-07-api-design-interviews
+  - 07-08-transactional-outbox
+tags:
+  - retries
+  - transient-errors
+  - idempotency
+  - error-classification
+  - bounded-work
+objectives:
+  - Classify errors as transient, throttling, overload, permanent, or unknown before retrying.
+  - Design bounded attempts and an overall deadline rather than an unbounded retry loop.
+  - Explain why idempotency and operation identity are required for retrying side effects.
+  - Decide which layer owns retries and how responses guide the policy.
+relatedLessons:
+  - 08-03-exponential-backoff-and-jitter
+  - 08-04-retry-storms-and-cascading-failures
+  - 07-08-transactional-outbox
+---
+
+# Retries and Error Classification
+
+> A retry is another load-bearing operation, not free resilience; classify the failure, preserve the deadline, and make duplicate side effects safe before adding one.
+
+## Why This Exists
+
+Packets drop, connections reset, and a dependency may briefly reject traffic during failover. A single failed request can succeed on a second attempt. The naive policy—retry every error three times—also retries malformed input, authorization failures, overloaded services, and writes whose first attempt may already have committed. Each retry consumes the same scarce capacity and can turn a small fault into an outage.
+
+Retries should answer: is the operation likely to succeed later, can the deadline afford another attempt, and is repeating it safe? If any answer is no, fail or surface an asynchronous reconciliation state instead.
+
+## Mental Model
+
+```text
+request
+  ├─ classify response/error
+  ├─ permanent? → return immediately
+  ├─ transient + budget? → wait/backoff → retry
+  └─ exhausted/ambiguous? → bounded failure or reconcile
+```
+
+Classify by semantics rather than only status code:
+
+| Class | Examples | Default |
+| --- | --- | --- |
+| Permanent | validation `400`, unknown user, permission `403` | Do not retry. |
+| Transient | connection reset, temporary DNS/leader failover, `503` | Retry if deadline/operation allow. |
+| Throttling/overload | `429`, explicit retry-after, queue full | Retry only under server guidance and budget. |
+| Ambiguous | timeout after a write, lost response | Query by operation ID or use idempotency before retry. |
+| Unknown | unclassified exception | Prefer fail/telemetry until policy is understood. |
+
+An operation may be technically retryable but business-permanent: “seat no longer available” should not be retried as if a network error. Conversely, a `POST` can be safely retried when it carries an idempotency key and the server stores the result.
+
+## How It Works
+
+1. Give the operation an overall deadline and attempt budget.
+2. Assign an operation/request ID and idempotency key at the boundary; propagate it through retries.
+3. Execute once, classify the outcome, and record attempt/error class.
+4. Retry only an allowlisted class, respecting `Retry-After`, deadline, per-process retry budget, and backoff/jitter policy.
+5. Stop when the deadline or attempt budget is exhausted; return a stable error or an asynchronous operation state.
+6. Make server-side mutation idempotent with a unique key/result record or conditional version check.
+
+Retry ownership should usually be one layer close to the operation. If the browser, gateway, service, SDK, and database each retry three times, one user action can produce up to `4 × 4 × 4` attempts downstream. Pick an owner, make lower layers expose clear errors, and account for provider/library retries you did not write.
+
+## Example
+
+`POST /payments` uses idempotency key `pay-123` and a 2-second deadline. A connection reset occurs after the provider may have accepted the charge. The payment service first queries provider status by `pay-123`; if the provider says unknown, it retries the same key once with backoff. A duplicate request returns the stored result instead of charging twice.
+
+For `GET /profile`, a `503` during a short database failover may be retried within the caller's deadline. For `GET /search?q=bad%ZZ`, retrying a `400` only adds load and delay. For `429 Retry-After: 10`, a 2-second request deadline cannot satisfy a 10-second wait; fail or enqueue rather than retry immediately.
+
+## Visualization We Eventually Want
+
+Show a client, gateway, service, and dependency with error categories on a timeline. Controls should inject transient/permanent/ambiguous errors, set max attempts, deadline, idempotency support, retry owner, and provider `Retry-After`. Display useful work versus total attempts, duplicate side effects, remaining budget, and outcome classification. A **“timeout after charge”** preset should compare naive repeat charge with idempotency/status reconciliation.
+
+## Scaling Behavior
+
+If base request rate is `Q` and each request averages `a` attempts, downstream load is approximately `Q × a`; during an outage `a` can approach the attempt limit for every request. Retry budgets cap aggregate amplification, but rejecting work can reduce apparent success. Asynchronous queues absorb temporary failure better than holding synchronous callers, provided retention and backpressure are bounded.
+
+Retries across a fan-out multiply: one parent request may retry a branch while the branch retries its dependency. Model the product, not just one loop. Per-tenant budgets prevent a noisy caller from consuming all recovery capacity.
+
+## Failure Modes
+
+- **Permanent-error retry:** wastes capacity and increases user latency.
+- **Duplicate write:** first attempt succeeded but response was lost; second attempt repeats a side effect.
+- **Retry multiplication:** multiple layers amplify attempts exponentially.
+- **Deadline exhaustion:** retry starts with no time to finish, producing useless work.
+- **Retrying overload:** the dependency's rejection is treated as a signal to send more work.
+- **Correlated clients:** all clients retry on the same schedule, causing a synchronized wave.
+- **Hidden library retries:** effective attempts exceed the design budget.
+
+## Trade-offs
+
+Retries improve success during brief transient faults but add latency, load, duplicate risk, and complexity. Fewer attempts reduce amplification but may expose recoverable blips. Synchronous retry preserves a simple API but consumes caller resources; asynchronous retry improves durability but requires job state, status APIs, and eventual completion semantics.
+
+## Alternatives
+
+- **Fail fast with fallback:** prefer for optional reads or overload protection.
+- **Queue and worker retry:** prefer for durable, slow, or user-independent work.
+- **Circuit breaker:** stop calls after sustained failure; pair with bounded retries.
+- **Reconciliation job:** prefer for ambiguous external writes.
+- **Client-directed `Retry-After`:** let the dependency signal a safe retry window, still bounded by the caller budget.
+
+## When to Use
+
+Retry allowlisted transient/idempotent operations when the expected recovery time fits the remaining deadline and the dependency's capacity can absorb attempts. Measure attempt rate separately from request rate.
+
+## When Not to Use
+
+Do not retry validation/auth errors, non-idempotent writes without a key, or overload responses without a budget. Do not retry at every layer or indefinitely. If a user can safely poll a durable operation, prefer an asynchronous contract to a long retry loop.
+
+## Common Misconceptions
+
+- **“Retryable means guaranteed to succeed.”** It only means a later attempt may be useful.
+- **“POST is never retryable.”** Idempotency keys can make a specific POST safe.
+- **“Three retries is a reliability setting.”** It is meaningless without deadlines, error classes, and aggregate load.
+- **“Timeout means the write failed.”** The remote side may have committed.
+- **“HTTP 500 always means transient.”** The business/error contract matters; classify deliberately.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I classify errors first: permanent errors fail immediately, transient errors may retry within an overall deadline and bounded attempt/retry budget, and ambiguous writes reconcile by operation ID or idempotency key. I choose one retry owner, propagate the request ID, honor server throttling signals, and measure attempts separately because retries can amplify an outage.
+
+### When to Introduce It
+
+Introduce retries after timeouts and error semantics are defined. Ask whether the operation is idempotent and what capacity remains if every caller retries at once.
+
+### Common Follow-Ups
+
+- Which errors are retryable for this API and why?
+- Who owns retries across client, gateway, service, and database?
+- How do you handle a timeout after a payment request?
+- What is the aggregate attempt rate during an outage?
+
+### Common Candidate Mistakes
+
+- Retrying every `5xx`/exception without a budget.
+- Forgetting provider/library retries.
+- Retrying a non-idempotent write blindly.
+- Ignoring `Retry-After`, deadline, and overload semantics.
+
+## Summary
+
+Retries are controlled recovery work. Classify errors, bound attempts by deadline and budget, propagate operation identity, and make side effects idempotent or reconcilable. Select one retry owner and treat aggregate retry load as part of capacity planning.
+
+## Quiz Seeds
+
+1. Why should a malformed request not be retried?
+2. A payment call times out after 1 second. What should happen before a retry?
+3. How can four retrying layers produce far more than three attempts?
+4. What does a retry budget protect during a dependency outage?
+5. When is `429 Retry-After` incompatible with a synchronous caller deadline?
+6. Why are operation IDs useful even when the API is nominally idempotent?
+7. Which operation would you move to a durable queue instead of retrying synchronously?
+
+## Related Topics
+
+- [Timeouts](./timeouts.mdx)
+- [Exponential Backoff and Jitter](./exponential-backoff-and-jitter.mdx)
+- [Retry Storms and Cascading Failures](./retry-storms-and-cascading-failures.mdx)
+- [API Design for Interviews](../02-networking/api-design-interviews.mdx)
+
+## References
+
+### Documentation / Articles
+
+- [Timeouts, retries, and backoff with jitter](https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/) — AWS covers retry classification, idempotency, deadlines, and amplification.
+- [Addressing Cascading Failures](https://sre.google/sre-book/addressing-cascading-failures/) — Google SRE documents retry storms, retry budgets, and avoiding multiple retry layers.
+- [Idempotent requests](https://docs.stripe.com/api/idempotent_requests) — Stripe's API documentation gives a concrete idempotency-key contract for safe repeat requests.
+- [HTTP Semantics (RFC 9110)](https://www.rfc-editor.org/rfc/rfc9110.html) — defines status-code and method semantics that inform retry classification.
+
+### Papers
+
+- [The Tail at Scale](https://research.google/pubs/the-tail-at-scale/) — explains why retries and tail latency interact badly in fan-out systems.

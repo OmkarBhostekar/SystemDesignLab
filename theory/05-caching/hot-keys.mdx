@@ -1,0 +1,166 @@
+---
+type: lesson
+id: 05-08-hot-keys
+slug: hot-keys
+title: Hot Keys
+description: Detect and distribute disproportionately popular keys before one cache shard or source path becomes the bottleneck.
+module: caching
+order: 8
+difficulty: advanced
+estimatedMinutes: 35
+prerequisites:
+  - 05-02-local-and-distributed-cache
+  - 05-05-eviction-and-ttl
+  - 05-07-cache-stampede
+  - 01-03-latency-vs-throughput
+tags:
+  - hot-keys
+  - skew
+  - zipf
+  - sharding
+  - replication
+objectives:
+  - Explain why aggregate cache capacity can be healthy while one key overloads a shard.
+  - Identify key popularity skew and distinguish hot-key load from a cache-wide capacity issue.
+  - Compare local copies, replicated key variants, key splitting, and request coalescing.
+  - Preserve correctness and invalidation semantics when a logical key has multiple physical copies.
+relatedLessons:
+  - 05-07-cache-stampede
+  - 05-09-multi-layer-caching
+  - 05-02-local-and-distributed-cache
+---
+
+# Hot Keys
+
+> A hot key is a distribution failure: one logical key receives enough traffic to exhaust its owner even though the cache cluster looks mostly idle.
+
+## Why This Exists
+
+Distributed caches usually route a key to one shard. A celebrity profile, a live sports score, or a feature flag can receive a large fraction of all reads. The naive response is to add more shards, but the same key still hashes to one owner. The improvement spreads reads for that logical value; the new trade-off is multiple copies, invalidation fan-out, and possible version disagreement.
+
+## Mental Model
+
+```text
+logical key: score:match-7
+      ├── shard A (original copy)
+      ├── local process copies
+      └── replicas / split keys
+```
+
+Popularity is often skewed rather than uniform. A useful first model is a Zipf-like distribution: a small rank of keys receives a large share of requests. The hot key's bottleneck can be network bandwidth, command CPU, serialization, lock contention, or the source behind a miss. Measure per-key or per-prefix rate with sampled/top-k telemetry; total QPS hides the shape.
+
+## How It Works
+
+Options include:
+
+- **Local short-TTL copy:** serve the hottest values from each API process, reducing shared-cache reads.
+- **Read replicas:** duplicate a value to several cache nodes and choose among them; writes/invalidation must fan out.
+- **Key splitting:** store `score:match-7:0..N-1` and route reads across copies, useful for append-heavy aggregates but awkward for a single mutable object.
+- **Request coalescing:** collapse concurrent misses or refreshes, reducing source work but not steady-state hit traffic.
+- **Push updates:** publish changes to local or edge copies for low-latency reads, trading freshness and delivery complexity.
+
+Do not split a value merely to spread reads if every read needs a global lock or a full recomposition. For counters, partition increments and aggregate; for a profile, replicate the immutable projection and invalidate all copies by version.
+
+## Example
+
+A live match endpoint receives 150,000 reads/s. The distributed cache has 30 shards and enough aggregate capacity, but `match-7` maps to one shard that can sustain 10,000 lookups/s. A 2-second local cache on API processes absorbs repeat reads, while a versioned update event refreshes copies. The source-of-truth score service remains separate, and a stale score is acceptable for browse but not for a betting decision.
+
+The naive key-splitting scheme stores one mutable JSON document in ten copies and writes only one copy. Readers observe disagreement. The improvement uses immutable versions or fan-out invalidation with a monotonically increasing sequence. The new trade-off is ten times the write/fan-out work and more memory.
+
+## Visualization We Eventually Want
+
+Build a **Hot-Key Observatory** with configurable key popularity, shard count, per-node capacity, local TTL, replica count, split factor, invalidation delay, and coalescing. Show top-k key share, per-shard QPS, queueing, hit ratio, stale copies, source fallback, and memory. Let the learner add shards, then compare why the hot key remains on one owner until a mitigation changes routing.
+
+## Scaling Behavior
+
+Adding shards helps uniform traffic but not an unsplit key. More API processes improve local-copy capacity but multiply memory and invalidation recipients. Replication multiplies writes and memory; key splitting multiplies recomposition and consistency work. A hot key can move from cache to source or network edge as mitigations change the bottleneck. Track top-k key rate, shard p99, command CPU, bytes/key, invalidation fan-out, and per-tenant quotas.
+
+## Failure Modes
+
+- One shard saturates while cluster-average CPU stays low.
+- Replicas diverge after a missed or reordered invalidation.
+- Local caches serve a deleted or unauthorized value.
+- Key splitting creates uneven sub-key popularity or expensive recombination.
+- Hot-key refreshes stampede the source at the same time.
+- A mitigation lets one tenant consume shared capacity indefinitely.
+
+Use versioned payloads, bounded local TTLs, admission controls, top-k alerts, per-tenant budgets, and a source fallback that is itself rate-limited.
+
+## Trade-offs
+
+Local copies minimize shared-cache traffic but multiply memory and stale windows. Replication improves read throughput but multiplies invalidation/write cost. Splitting distributes load but complicates reads and ordering. Coalescing reduces miss/refresh amplification but not hit lookups. Edge/CDN caching can absorb public hot keys, while private data needs tenant-aware keys and authorization checks.
+
+## Alternatives
+
+- **Single writer with push fan-out:** strong ordering for a small hot state, with fan-out and client lifecycle cost.
+- **Read-through database replicas:** useful if source reads are the true bottleneck and slightly stale replicas are okay.
+- **Approximate or sampled responses:** useful for metrics/leaderboards where exact per-request state is unnecessary.
+- **Rate limit or degrade:** appropriate when serving every request is less important than protecting the system.
+
+## When to Use
+
+Use hot-key mitigations when per-key telemetry shows one logical key is driving a node or source bottleneck. Choose replication or local copies for read-heavy immutable-ish values, splitting for aggregatable state, and coalescing for miss/refresh bursts.
+
+## When Not to Use
+
+Do not replicate sensitive mutable values without an access and invalidation plan. Do not split a transactional object if the operation needs a single authoritative write. Do not hide a tenant-abuse problem by adding unlimited shared capacity.
+
+## Common Misconceptions
+
+- **More shards fix every cache bottleneck.** A hot key still maps to one shard.
+- **Replication gives consistency.** It creates copies that need ordering and repair.
+- **Local cache is always enough.** It may multiply memory and fail on a rolling deploy.
+- **Hot key means large value.** A tiny value at high QPS can exhaust CPU or network.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I inspect per-key skew because a distributed cache can have healthy aggregate capacity while one shard is overloaded. For a read-heavy hot value I may add a short local or edge cache, replicate a versioned copy, or push updates. For counters I split writes and aggregate. Every mitigation must explain invalidation, tenant isolation, memory cost, and what happens if the hot value changes.
+
+### When to Introduce It
+
+Introduce hot-key analysis when traffic is skewed, a celebrity/live-event scenario appears, or one shard's p99 is high despite low cluster averages.
+
+### Common Follow-Ups
+
+- How do you detect hot keys without logging every key?
+- How do replicas converge after a write?
+- Why not add more cache nodes?
+- When does key splitting preserve correctness?
+
+### Common Candidate Mistakes
+
+They cite average cache QPS, add shards without changing key routing, or replicate mutable data without version/invalidation semantics.
+
+## Summary
+
+- Hot keys are per-key distribution bottlenecks, not merely aggregate capacity problems.
+- Local copies, replicas, split keys, push updates, and coalescing move load with different consistency costs.
+- Measure top-k keys and per-shard behavior; cluster averages can hide the incident.
+- Keep logical key versions and authorization consistent across every physical copy.
+
+## Quiz Seeds
+
+1. Why does adding 100 cache shards not necessarily help a single hot key?
+2. A key generates 150k reads/s and one shard sustains 10k/s. Which mitigations change the bottleneck?
+3. What additional write and memory cost comes with four replicas?
+4. When is key splitting natural for a counter but awkward for a profile document?
+5. How can local caching worsen invalidation fan-out?
+6. Which telemetry identifies a hot key hidden by healthy cluster averages?
+7. When should the system shed or rate-limit hot-key traffic instead of replicating it?
+
+## Related Topics
+
+- [Cache stampede](cache-stampede.mdx) covers hot-key miss and refresh amplification.
+- [Multi-layer caching](multi-layer-caching.mdx) places hot-key copies near users.
+- [Local and distributed cache](local-and-distributed-cache.mdx) compares copy scope and failure boundaries.
+
+## References
+
+### Documentation / Articles
+
+- [Client-side caching introduction](https://redis.io/docs/latest/develop/clients/client-side-caching/) — explains why small frequently accessed working sets benefit from client-local copies and invalidation tracking.
+- [Key eviction](https://redis.io/docs/latest/develop/reference/eviction/) — shows how access patterns and hot subsets influence eviction policy.
+- [Amazon ElastiCache best practices](https://docs.aws.amazon.com/AmazonElastiCache/latest/dg/BestPractices.html) — provides operational guidance for sizing, sharding, and monitoring managed cache clusters.
+- [Redis cache-aside](https://redis.io/docs/latest/develop/use-cases/cache-aside/) — discusses popular-key expiration and per-key stampede mitigation.

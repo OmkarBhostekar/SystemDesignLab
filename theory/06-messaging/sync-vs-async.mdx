@@ -1,0 +1,167 @@
+---
+type: lesson
+id: 06-01-sync-vs-async
+slug: sync-vs-async
+title: Synchronous versus Asynchronous Work
+description: Decide which work belongs on the request path and which should be durable, observable background processing.
+module: messaging
+order: 1
+difficulty: core
+estimatedMinutes: 30
+prerequisites:
+  - 01-03-latency-vs-throughput
+  - 01-04-percentiles-tail-latency
+  - 02-01-request-lifecycle
+  - 03-07-monolith-to-microservices
+tags:
+  - asynchronous
+  - synchronous
+  - queues
+  - latency
+  - workflows
+objectives:
+  - Separate user-visible decisions from work that can complete after a response.
+  - Explain how a queue decouples arrival bursts from worker throughput without making work free.
+  - State the acknowledgment, retry, visibility, and progress contract for an asynchronous command.
+  - Choose synchronous, asynchronous, or hybrid processing from correctness and UX requirements.
+relatedLessons:
+  - 06-02-message-queue-fundamentals
+  - 06-06-delivery-semantics
+  - 06-09-backpressure
+---
+
+# Synchronous versus Asynchronous Work
+
+> Synchronous work keeps the caller waiting for a result; asynchronous work returns a durable handoff and makes completion, failure, and progress explicit.
+
+## Why This Exists
+
+The naive signup endpoint sends an email, resizes an avatar, updates analytics, and returns only after every dependency responds. One slow email provider turns a fast account creation into a long-tail request, and retries can repeat side effects. Moving all work to a queue improves request latency, but now the user needs a status model and the system needs durable acceptance, retries, and duplicate-safe workers.
+
+## Mental Model
+
+```text
+synchronous: client → API → dependency → response
+asynchronous: client → API → durable command → 202/status
+                                ↓
+                         worker → side effect → outcome event/status
+```
+
+The key question is not “is a queue scalable?” but “what must be true before the caller is allowed to proceed?” A payment authorization may need a bounded synchronous result; receipt email and search indexing can usually follow asynchronously. A hybrid request can synchronously commit the command and return `202 Accepted` with a status URL.
+
+## How It Works
+
+For asynchronous work, define:
+
+1. **Acceptance:** when is the command durably recorded?
+2. **Identity:** which idempotency key identifies a retry of the same command?
+3. **Progress:** how does a client observe pending, succeeded, failed, or canceled?
+4. **Delivery:** what happens if a worker crashes after the side effect but before acknowledgment?
+5. **Deadline:** how long is the command retained and when is it escalated?
+
+A queue absorbs a burst only by storing work and delaying completion. If arrival rate exceeds worker service rate for long enough, backlog and age grow. A synchronous timeout is not proof that the work did not happen; the request may have committed while the response was lost.
+
+## Example
+
+For an image-upload API, store the object and a durable `ImageUploaded` command, return the object ID and processing status, and let workers create thumbnails and moderation results. A client can poll or receive a webhook. If moderation is a legal gate, the final publication decision waits for the result even though thumbnail generation does not.
+
+The naive asynchronous design writes to an in-memory queue before acknowledging. A process crash loses the command. The improvement uses a durable broker or transactional outbox. The new trade-off is eventual visibility and a recovery workflow for poison messages or a permanently unavailable dependency.
+
+## Visualization We Eventually Want
+
+Build a **Sync-to-Async Decision Lab** with a request graph and toggleable dependencies. Controls should include dependency latency distribution, failure rate, queue durability, worker rate, retry policy, client timeout, and whether the result is required before response. Show p99 response latency, accepted versus completed commands, queue age, duplicate side effects, and user-visible status. Presets should compare signup email, payment authorization, and thumbnail generation.
+
+## Scaling Behavior
+
+Synchronous fan-out increases critical-path latency and usually multiplies failure probability across serial dependencies. Asynchronous workers add capacity independently, but backlog storage, broker throughput, and completion latency become limits. More workers help only until partitions, source dependencies, or rate limits bind. Measure queue depth and age, accepted/completed rate, worker utilization, retry rate, and end-to-end completion latency.
+
+## Failure Modes
+
+- Client times out after the command is accepted and retries.
+- Broker accepts a message but worker crashes before side effect or acknowledgment.
+- Queue is durable but retention expires before processing.
+- Completion event is lost, leaving the UI stuck in pending.
+- A downstream outage grows backlog until storage or worker capacity fails.
+- A “background” side effect is actually required for correctness, but the API returns success too early.
+
+Use idempotency, durable status, bounded retention, dead-letter handling, backpressure, and explicit degraded UX.
+
+## Trade-offs
+
+Synchronous paths provide immediate results and simple user semantics but spend latency and availability budget on every dependency. Asynchronous paths improve isolation and burst absorption but add lag, duplicate/retry handling, status storage, and operational visibility. Hybrid designs require clear boundaries so “accepted” is not confused with “completed.”
+
+## Alternatives
+
+- **Inline bounded call:** use for a small, required decision with a tight timeout.
+- **Transactional outbox:** commit local state and a command atomically, then publish asynchronously.
+- **Scheduled poller:** adequate for low-rate deferred work, but less responsive than a broker.
+- **Workflow engine:** useful for long-running multi-step processes with timers and compensation.
+
+## When to Use
+
+Use asynchronous work when the caller can tolerate delayed completion, traffic is bursty, or a dependency is slow/unreliable. Keep correctness-critical validation on the synchronous path or return a pending state that cannot be mistaken for success.
+
+## When Not to Use
+
+Do not queue work merely to hide a capacity problem if the user must wait for the result. Avoid asynchronous acceptance without durable storage, idempotency, status, and a retry/DLQ plan.
+
+## Common Misconceptions
+
+- **`202` means success.** It means accepted for processing; completion is separate.
+- **A timeout means no side effect happened.** The server may have committed before the response was lost.
+- **A queue removes load.** It stores and delays load; workers still need capacity.
+- **Async means eventual consistency is always okay.** Some invariants must be enforced before acceptance.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I keep a dependency synchronous when the caller needs its decision before proceeding, and queue work when delayed completion is acceptable or a burst/slow dependency should not sit on the request path. For async acceptance I define durable enqueue, idempotency, status, retries, retention, and overload behavior. A queue buys isolation and burst absorption by introducing lag and operational state; it does not eliminate work.
+
+### When to Introduce It
+
+Introduce async processing after identifying the critical-path result, dependency latency/failure, burst shape, and user tolerance for pending state.
+
+### Common Follow-Ups
+
+- How do you know a timed-out command did not run twice?
+- What does the API return before completion?
+- What if workers are slower than producers?
+- Which work must remain synchronous?
+
+### Common Candidate Mistakes
+
+They put every dependency behind a queue, call acceptance success, and omit durable handoff, status, retries, or duplicate side effects.
+
+## Summary
+
+- Synchronous means the caller waits; asynchronous means durable acceptance and separate completion.
+- Move only work whose correctness and UX tolerate delay.
+- Queueing changes latency into backlog age and requires idempotency and observability.
+- A hybrid design should make accepted, completed, failed, and canceled states explicit.
+
+## Quiz Seeds
+
+1. Which part of image upload should be synchronous if the object must be durably stored before the client receives an ID?
+2. Why can a client retry after a timeout even when the command already completed?
+3. What does a queue absorb, and what resource eventually limits it?
+4. What fields are needed to expose asynchronous command status?
+5. When would payment authorization remain synchronous while receipt generation is asynchronous?
+6. How can a lost completion event leave an otherwise successful job stuck in pending?
+7. Why is an in-memory queue not a durable acceptance boundary?
+
+## Related Topics
+
+- [Message queue fundamentals](message-queue-fundamentals.mdx) defines brokers, acknowledgments, and retention.
+- [Delivery semantics](delivery-semantics.mdx) examines crash points and duplicates.
+- [Backpressure](backpressure.mdx) handles producers faster than workers.
+- [Request lifecycle](../02-networking/request-lifecycle.mdx) frames critical-path latency.
+
+## References
+
+### Documentation / Articles
+
+- [RabbitMQ reliability guide](https://www.rabbitmq.com/docs/reliability) — explains why acknowledgments transfer responsibility and why unacknowledged deliveries need retransmission.
+- [Amazon SQS visibility timeout](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-visibility-timeout.html) — documents deferred completion, retries, and in-flight work.
+- [Apache Kafka design](https://kafka.apache.org/42/design/design/) — grounds durable logs, consumer processing, and delivery semantics.
+- [Service Best Practices](https://sre.google/sre-book/service-best-practices/) — connects overload, latency, capacity, and graceful behavior in production services.

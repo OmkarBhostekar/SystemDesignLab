@@ -1,0 +1,180 @@
+---
+type: lesson
+id: 08-05-circuit-breaker
+slug: circuit-breaker
+title: Circuit Breaker
+description: Stop repeatedly calling a failing dependency, then probe recovery cautiously before reopening normal traffic.
+module: reliability
+order: 5
+difficulty: core
+estimatedMinutes: 25
+prerequisites:
+  - 08-01-timeouts
+  - 08-03-exponential-backoff-and-jitter
+  - 08-04-retry-storms-and-cascading-failures
+tags:
+  - circuit-breaker
+  - failure-isolation
+  - half-open
+  - graceful-degradation
+  - dependency-health
+objectives:
+  - Explain closed, open, and half-open circuit states and their intended transitions.
+  - Separate circuit-breaking from retries, timeouts, health checks, and load shedding.
+  - Choose failure windows, probe limits, and fallback behavior without masking partial failures.
+  - Identify when a circuit breaker adds complexity or is better implemented by infrastructure.
+relatedLessons:
+  - 08-04-retry-storms-and-cascading-failures
+  - 08-06-bulkhead
+  - 08-07-load-shedding-and-graceful-degradation
+---
+
+# Circuit Breaker
+
+> A circuit breaker converts repeated dependency failure into fast, bounded rejection and tests recovery with limited probes instead of sending every caller into the same outage.
+
+## Why This Exists
+
+If every request waits for a slow recommendation service and retries, the frontend exhausts its threads and the recommendation service receives even more work. A timeout limits each call but still allows thousands of doomed calls. The naive response is to keep retrying until the service recovers.
+
+A circuit breaker observes recent failures and temporarily refuses new calls. The caller can return cached/default data or a clear error. The breaker trades some availability during recovery for protection and fast response; bad thresholds or a shared breaker can hide healthy partitions.
+
+## Mental Model
+
+```text
+          failures threshold
+ CLOSED ─────────────────────> OPEN
+   ↑                            │ fast reject/fallback
+   │ success probes             │ cool-down
+   └──────── HALF-OPEN <────────┘
+                │ probe fails → OPEN
+```
+
+- **Closed:** calls pass; the breaker records failures in a window.
+- **Open:** calls fail fast or use a fallback; no dependency load is created.
+- **Half-open:** a small number of trial calls test recovery; success closes, failure reopens.
+
+State is usually local per process/instance or partition. A fleet-wide breaker can coordinate faster but introduces shared state and a new failure mode. Either way, define which errors count: connection failure/timeouts may trip; validation failures should not.
+
+## How It Works
+
+1. A request enters a breaker keyed to a dependency/resource partition.
+2. In closed state, the call uses its normal timeout/retry policy and records outcome, latency, and status.
+3. If failures exceed a threshold within a time window, transition open for a cool-down.
+4. In open state, reject immediately or invoke a documented fallback; emit state/decision metrics.
+5. After cool-down, allow a limited half-open probe/concurrency budget.
+6. Close after enough successful probes, or reopen immediately on a failure; use hysteresis to avoid flapping.
+
+The breaker should not retry an operation that it rejects. It should distinguish one bad shard/provider from a global dependency so an unhealthy partition does not block unrelated work. An open breaker is not a health verdict; it is a local policy based on delayed observations.
+
+## Example
+
+Product pages call a recommendations service with a 150 ms budget. After 20% timeouts in a 10-second window, the per-region breaker opens for 5 seconds. Product pages use a cached list or omit the module and label the response as degraded. After 5 seconds, two probes pass; the breaker admits 1% traffic, then gradually closes.
+
+If only one recommendation shard is failing, a single global breaker would suppress healthy recommendations. Key the breaker by shard/provider where possible. If the fallback itself queries the same overloaded database, the breaker merely moves the cascade; fallback capacity must be independent or cheaper.
+
+## Visualization We Eventually Want
+
+Render a state machine beside request/response charts. Controls should inject timeout/error ratios, failure window, threshold, cool-down, half-open probe count, fallback latency, and shard-specific failure. Display admitted/rejected/probed calls, dependency load, user-visible degraded responses, and state transitions. A **“recovering dependency”** preset should show why half-open probes prevent a flood; a **“single bad shard”** preset should compare global and partitioned breakers.
+
+## Scaling Behavior
+
+Local breakers react quickly but each instance has a partial sample and may admit a synchronized fleet of probes. A shared breaker gives a global view but adds coordination latency and state availability. Probe concurrency should be bounded per dependency/partition and ramp gradually.
+
+Breaker metrics and state transitions can themselves create cardinality/alert load. Use stable dependency/partition labels and sample detailed traces. Ensure fallback work is capacity-tested under the same incident that opens the breaker.
+
+## Failure Modes
+
+- **False open:** transient blip or one bad client error trips the circuit and reduces useful availability.
+- **False closed:** threshold/window too tolerant; callers continue overwhelming the dependency.
+- **Half-open stampede:** many instances probe at once and overload a recovering service.
+- **Fallback failure:** fallback depends on the same resource or is more expensive than the primary.
+- **Shared-state outage:** a centralized breaker becomes a new dependency.
+- **Flapping:** thresholds/cool-down are too sensitive; use hysteresis and minimum dwell times.
+- **Stale state:** local breaker remains open after recovery or closes before all partitions recover.
+
+## Trade-offs
+
+Circuit breakers lower dependency load and caller latency during sustained faults, but can reject work that might have succeeded and require correct fallback semantics. Local state is simple and fast but inconsistent across a fleet; shared state coordinates but costs availability and complexity. Half-open probes speed recovery but must be rate-limited.
+
+## Alternatives
+
+- **Timeout + bounded retry:** enough for short, low-volume transient faults.
+- **Load balancer outlier ejection:** appropriate for instance-level failures; may not express application fallback.
+- **Bulkhead:** isolate resources before calls so one dependency cannot exhaust unrelated work.
+- **Queue/DLQ:** natural for asynchronous message processing.
+- **Manual traffic switch:** appropriate for rare, operator-controlled regional/provider incidents.
+
+## When to Use
+
+Use a circuit breaker for a remote dependency with sustained failure/latency where fast fallback or rejection protects a critical path. Scope it to a dependency/partition, define counted errors, and make the open-state behavior user-meaningful.
+
+## When Not to Use
+
+Do not add a breaker around local pure computation or a queue that already has bounded retry/DLQ semantics. Do not use it as a substitute for timeouts, error classification, capacity, or observability. Avoid one global breaker if dependency partitions fail independently.
+
+## Common Misconceptions
+
+- **“Open means dependency is definitely down.”** It is a local protective decision.
+- **“Circuit breaker replaces retries.”** It complements retries; the combination must stop when the breaker rejects.
+- **“Half-open sends normal traffic.”** It should admit a small, controlled probe set.
+- **“Fallback is free.”** Cache/alternate computation needs independent capacity and consistency semantics.
+- **“A breaker guarantees recovery.”** It protects while an external repair/recovery occurs.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> A circuit breaker monitors a dependency and moves closed → open after a failure threshold, fast-failing or degrading while the dependency recovers, then half-open for limited probes. It is different from retries: retries expect eventual success, while the breaker prevents calls likely to fail. I scope it by dependency/partition, count only relevant failures, rate-limit probes, and capacity-test the fallback.
+
+### When to Introduce It
+
+Introduce a breaker when a dependency can be unavailable long enough that retries/timeouts would exhaust caller resources. Explain the fallback and how the breaker state is observed.
+
+### Common Follow-Ups
+
+- What errors trip the breaker?
+- How do you avoid a half-open probe storm across instances?
+- Does a local or shared breaker fit this failure domain?
+- What if only one shard/provider is unhealthy?
+
+### Common Candidate Mistakes
+
+- Using a single global counter for unrelated resources.
+- Omitting open-state fallback/rejection behavior.
+- Treating every `4xx` as a dependency failure.
+- Forgetting breaker flapping and state observability.
+
+## Summary
+
+Breakers protect callers and dependencies from sustained failure by failing fast and probing recovery cautiously. They complement deadlines, retries, bulkheads, and degradation; correct scope, thresholds, fallback, and probe budgets determine whether the protection helps.
+
+## Quiz Seeds
+
+1. What transition follows a failure threshold in the closed state?
+2. Why should half-open admit only a small probe set?
+3. Which failures should not trip a dependency circuit?
+4. Why can a global breaker hide healthy shards?
+5. What happens if the fallback calls the same overloaded database?
+6. How is a breaker different from a retry policy?
+7. When is queue/DLQ behavior preferable to a circuit breaker?
+
+## Related Topics
+
+- [Retry Storms and Cascading Failures](./retry-storms-and-cascading-failures.mdx)
+- [Bulkhead](./bulkhead.mdx)
+- [Load Shedding and Graceful Degradation](./load-shedding-and-graceful-degradation.mdx)
+- [Timeouts](./timeouts.mdx)
+
+## References
+
+### Documentation / Articles
+
+- [Circuit Breaker pattern](https://learn.microsoft.com/en-us/azure/architecture/patterns/circuit-breaker) — Microsoft documents state transitions, exception classes, half-open probes, and fallback concerns.
+- [Circuit breaking](https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/upstream/circuit_breaking) — Envoy describes resource limits and upstream circuit-breaking behavior at the proxy layer.
+- [Handling Overload](https://sre.google/sre-book/handling-overload/) — Google SRE connects fast rejection, degradation, and overload recovery.
+- [Timeouts, retries, and backoff with jitter](https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/) — AWS explains how breakers complement bounded retry behavior.
+
+### Papers
+
+- [Release It!](https://pragprog.com/titles/mnee2/release-it-second-edition/) — Michael Nygard's resilience patterns popularized circuit-breaker operational intuition; use official docs for exact state semantics.

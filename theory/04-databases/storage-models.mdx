@@ -1,0 +1,205 @@
+---
+type: lesson
+id: 04-03-storage-models
+slug: storage-models
+title: Relational, Key-Value, Document, Wide-Column, and Graph Models
+description: Compare storage models by how they represent relationships, locate data, and scale a workload.
+module: databases
+order: 3
+difficulty: core
+estimatedMinutes: 40
+prerequisites:
+  - 04-02-sql-vs-nosql
+  - 04-01-data-modeling-from-access-patterns
+tags:
+  - relational
+  - key-value
+  - document
+  - wide-column
+  - graph
+  - data-modeling
+objectives:
+  - Describe the unit of lookup and scaling boundary for relational, key-value, document, wide-column, and graph stores.
+  - Match a backend access pattern to a storage model without treating a product name as a guarantee.
+  - Explain how relationships, ordering, and multi-record operations differ across models.
+  - Identify the partition, item, index, or traversal limit that could invalidate a proposed design.
+relatedLessons:
+  - 04-01-data-modeling-from-access-patterns
+  - 04-02-sql-vs-nosql
+  - 04-06-database-indexes
+---
+
+# Relational, Key-Value, Document, Wide-Column, and Graph Models
+
+> A storage model is a promise about how data is grouped and found; select it from the dominant access path and relationship shape.
+
+## Why This Exists
+
+“Use a document database for JSON” or “use a graph database for users and friends” is an attractive shortcut. The same data can be represented in every model, but the cost of asking a question changes dramatically. A social graph can be a relational edge table, a document's embedded list, or a graph adjacency structure; what matters is whether the system needs bounded friend lists, arbitrary-depth traversals, or transactional profile updates.
+
+The naive design is one universal store with generic IDs and request-time joins. It fails when a hot feed, a multi-hop recommendation query, or a giant tenant all share the same access and scaling boundary. The improvement chooses a model whose natural unit of locality matches the most important query. The trade-off is that a model optimized for one question may make another question expensive or require a second derived representation.
+
+## Mental Model
+
+| Model | Natural lookup unit | Strength | Cost to watch |
+| --- | --- | --- | --- |
+| Relational | Row and indexed relation | Constraints, joins, transactions, rich predicates | Joins/transactions across partitions, write/index cost |
+| Key-value | One key or key plus condition | Simple predictable reads/writes, easy partition scale | Limited query shape, hot keys, application-owned relationships |
+| Document | Aggregate/document by ID | Co-located aggregate reads, nested evolving fields | Document size/contention, duplicated references, partial updates |
+| Wide-column | Partition key plus ordered clustering columns | Large scale, sequential/range reads inside a designed partition | Query-driven schema, partition size/skew, limited joins |
+| Graph | Vertex, edge, and adjacency traversal | Variable-depth relationship queries and path locality | Traversal fan-out, hotspot vertices, operational specialization |
+
+The “natural lookup unit” is also a likely failure domain. A key-value item can be hot; a document can become too large; a wide-column partition can grow without bound; a graph vertex can have millions of edges; a relational row can be protected by locks while a cross-table transaction blocks.
+
+## How It Works
+
+For each model, ask four questions:
+
+1. What is the partition or locality boundary?
+2. Which predicates and ordering are efficient without a full scan or traversal explosion?
+3. Which constraints and atomic operations are native, and over what scope?
+4. How are replicas, indexes, rebalancing, and backups operated?
+
+### Relational
+
+Rows are organized into tables with declared types and constraints. B-tree and other indexes support point, range, and ordering queries. Foreign keys and transactions can keep related facts consistent. A relational design is not obliged to join on every request: it can use composite indexes, partitions, materialized views, or a read model when measured pressure warrants it.
+
+### Key-value
+
+The application gives a key and receives a value, often with conditional or atomic operations. A compound key can encode tenant and item, but a new query usually needs a new key/index or a scan. This explicitness makes hot keys and write fan-out visible. It is a good fit for sessions, idempotency records, feature flags, and other bounded single-key access patterns.
+
+### Document
+
+A document stores an aggregate with nested fields and can be read or updated as a unit. Embed data when it is bounded and read together; reference it when it grows independently or has separate ownership. Flexible fields simplify evolution but do not remove validation, versioning, or indexing decisions.
+
+### Wide-column
+
+A partition key chooses a group of rows; clustering columns order rows within it. A table is usually designed for one query family, such as “events for account A between times T1 and T2.” The partition must be bounded by size and traffic, often using time buckets or a hash suffix. Joins are not the default; duplicate query-shaped rows when the consistency contract permits.
+
+### Graph
+
+Vertices represent entities and edges represent typed relationships, often with properties. Traversal engines can follow adjacency without materializing every join, which is useful for “friends of friends,” dependency paths, or authorization relationships. A high-degree vertex can still create a fan-out hotspot; a graph does not make an unbounded recommendation query free.
+
+## Example
+
+For a fraud-review system, consider four requests:
+
+- Fetch a payment and its immutable line items by payment ID.
+- Check a customer's recent transactions in time order.
+- Find whether two accounts are connected through suspicious shared devices within three hops.
+- Record an idempotent review decision with an audit trail.
+
+A relational store is a natural authority for payments, line items, and review decisions because constraints and transactions matter. A wide-column table keyed by customer plus time bucket can serve a large recent-transaction feed if the result is bounded. A graph projection can answer shared-device paths, but it should be rebuilt from payment/device authority and carry a lag contract. A key-value idempotency record can protect retries at the API edge.
+
+The naive “one graph for everything” makes monetary invariants and reporting awkward; “one relational table for everything” makes variable-depth traversal and high-volume feed reads expensive. The hybrid improves each access path but introduces projection lag, replay ordering, multiple backups, and a need to compare graph results with the authority.
+
+## Visualization We Eventually Want
+
+Create a **model chooser** with the fraud-review access patterns. Let learners switch the natural lookup unit, graph depth, partition key, document size, relationship fan-out, and transaction scope. Animate a point read, range scan, join, document update, wide-column partition read, and graph traversal over the same logical dataset.
+
+Metrics should include rows/partitions/documents touched, traversal frontier size, hot-key/partition rate, transaction conflicts, projection lag, index bytes, and write fan-out. Failure presets should include a high-degree account, an unbounded time partition, a document update conflict, and a stale graph projection. Include a text trace and step/reset controls for accessible behavior.
+
+## Scaling Behavior
+
+Relational scale-out commonly preserves a write owner and adds replicas or partitions; cross-partition joins and transactions become the pressure. Key-value and wide-column systems scale partitions more directly but need careful key distribution and bounded items/partitions. Documents scale aggregate reads until size, contention, or independent child growth dominates. Graph systems scale adjacency traversal until high-degree vertices and multi-hop fan-out dominate.
+
+Keep data movement and repair in the capacity plan. Adding a node may rebalance partitions; rebuilding a graph or secondary index consumes read capacity; changing a document shape may require lazy migration or a backfill. Multi-region copies change latency and conflict semantics for every model.
+
+## Failure Modes
+
+- **Wrong locality:** The dominant request touches many partitions or remote edges, destroying the assumed latency.
+- **Unbounded unit:** One document, wide-column partition, key, or graph vertex grows until reads and repair fail.
+- **High-degree hotspot:** A popular product, tenant, or graph vertex concentrates work despite many nodes.
+- **Projection divergence:** A search/graph/feed view misses or reorders source updates.
+- **Unsupported atomicity:** The design assumes a multi-record transaction that the model does not provide.
+- **Index/repair overload:** A new index, rebalancing operation, or graph rebuild competes with foreground traffic.
+
+Mitigate with bounded keys and buckets, admission limits, versioned projections, explicit transaction scope, measured query plans, and scheduled repair/backfill capacity.
+
+## Trade-offs
+
+The best model makes the critical access path local and predictable. It may constrain ad hoc queries, duplicate data, or require a specialized team. A universal relational model improves flexibility and constraints but can make hot analytics and high-fanout traversals expensive. A specialized model improves one workload while increasing operational and consistency complexity.
+
+## Alternatives
+
+- **Normalized relational tables:** A strong default for constraints, evolving relationships, and transactional workflows.
+- **Search index:** Better for text relevance and facets than a graph or key-value scan; it is normally derived.
+- **Columnar analytics store:** Better for large aggregates and scans than an OLTP model; do not use as the checkout authority.
+- **In-memory cache:** Better for bounded hot reads, but it needs a durable authority and freshness policy.
+- **Event log plus projections:** Useful when several query models derive from an append-only source, at the cost of replay/lag complexity.
+
+## When to Use
+
+Choose a model when its natural lookup unit matches the highest-value access path and its consistency, transaction, partition, and operational properties satisfy the requirements. Explain the one query it makes cheap and the query it makes harder.
+
+## When Not to Use
+
+Do not use a graph model for a few fixed foreign-key joins, a document for an unbounded child collection, or a wide-column store for ad hoc relational reporting. Do not introduce a specialized store without a rebuild and ownership plan.
+
+## Common Misconceptions
+
+- **A document model is schema-free.** Fields, size, indexes, versioning, and validation still form a schema.
+- **Wide-column means a spreadsheet with many optional columns.** Its partition/clustering key is a query and scaling contract.
+- **Graph databases make all relationship queries fast.** Traversal depth and degree can still explode.
+- **Key-value stores cannot have conditions or transactions.** Scope varies; verify the actual primitive and limits.
+- **One model must serve every workload.** Derived projections are valid when authority and lag are explicit.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I select the model by natural lookup unit: relational rows for constraints and joins, key-value for bounded key operations, documents for aggregates, wide-column partitions for designed range access, and graphs for variable-depth adjacency. I then state transaction scope, partition size/skew, indexing, replication, and rebuild behavior. A specialized projection can serve a distinct query, but it is not a second authority unless the workflow explicitly makes it one.
+
+### When to Introduce It
+
+Introduce the model comparison once the critical access patterns are written and a single storage shape starts showing a locality or transaction mismatch.
+
+### Common Follow-Ups
+
+- What is the partition key and its worst-case size?
+- How do you bound a graph traversal or child collection?
+- Which writes are atomic?
+- How is a derived model rebuilt after corruption?
+- How do replicas and failover change the read guarantee?
+
+### Common Candidate Mistakes
+
+- Choosing by payload format rather than access path.
+- Ignoring partition/hotspot behavior because a product is distributed.
+- Treating graph edges or document children as unlimited.
+- Claiming a projection is immediately consistent without an update protocol.
+- Hiding a missing transaction behind “the app will handle it.”
+
+## Summary
+
+- Storage models differ mainly in locality, lookup, relationship, and atomicity behavior.
+- Make the dominant access path local and bounded, then name the cost of alternative queries.
+- Partition/document/vertex limits and rebuild behavior are part of the model choice.
+- Specialized projections are powerful when their authority and lag are explicit.
+
+## Quiz Seeds
+
+1. Which request makes a graph model preferable to a relational edge table, and what bound must still be set?
+2. Why does a wide-column table often correspond to one query family?
+3. A document embeds 100 comments today and 10 million tomorrow. What failed in the model?
+4. What is the difference between a key-value item condition and a general multi-table transaction?
+5. How can a relational model serve a read-heavy feed without making the feed authority a new source of truth?
+6. Why can a high-degree graph vertex be a hotspot?
+7. Which model would you choose for idempotency keys and why?
+8. What recovery work follows when a graph projection is stale?
+
+## Related Topics
+
+- [Data modeling from access patterns](data-modeling-from-access-patterns.mdx)
+- [SQL versus NoSQL](sql-vs-nosql.mdx)
+- [Database indexes](database-indexes.mdx)
+
+## References
+
+### Documentation / Articles
+
+- [PostgreSQL: Data Definition](https://www.postgresql.org/docs/current/ddl.html) — documents the relational tables, constraints, and schema primitives that make ownership and integrity explicit.
+- [Amazon DynamoDB: Core components](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/HowItWorks.CoreComponents.html) — defines items, partition keys, sort keys, and item collections for key-value/document-style access.
+- [Amazon DynamoDB: NoSQL design](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/bp-modeling-nosql.html) — explains query-driven, denormalized modeling and partition-aware access.
+- [Apache Cassandra: Data modeling introduction](https://cassandra.apache.org/doc/3.11/cassandra/data_modeling/intro.html) — grounds partition and clustering choices in query, capacity, storage, and consistency requirements.
+- [Neo4j: Data modeling](https://neo4j.com/docs/getting-started/data-modeling/) — explains nodes, relationships, properties, and graph-specific modeling trade-offs.

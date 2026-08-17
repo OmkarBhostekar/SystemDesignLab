@@ -1,0 +1,160 @@
+---
+type: lesson
+id: 05-04-write-through-behind-refresh-ahead
+slug: write-through-behind-refresh-ahead
+title: Write-Through, Write-Behind, and Refresh-Ahead
+description: Compare cache update timing strategies and the durability, freshness, and write-latency costs each one creates.
+module: caching
+order: 4
+difficulty: core
+estimatedMinutes: 35
+prerequisites:
+  - 05-03-cache-aside
+  - 01-03-latency-vs-throughput
+  - 01-10-consistency-models
+tags:
+  - write-through
+  - write-behind
+  - refresh-ahead
+  - cache-strategies
+  - durability
+objectives:
+  - Distinguish cache-aside, write-through, write-behind, and refresh-ahead timelines.
+  - Explain which strategy puts a write on the critical path and which can lose acknowledged work.
+  - Choose a strategy from freshness, durability, read-hotness, and write-throughput requirements.
+  - Identify the reconciliation and ordering mechanisms needed for asynchronous cache updates.
+relatedLessons:
+  - 05-03-cache-aside
+  - 05-06-cache-invalidation
+  - 05-07-cache-stampede
+---
+
+# Write-Through, Write-Behind, and Refresh-Ahead
+
+> Cache strategy is a timing decision: decide whether the cache is filled on a read, updated before a write returns, updated later, or refreshed before expiry.
+
+## Why This Exists
+
+Cache-aside is easy to adopt but can leave a hot key cold immediately after a write. A naive fix is to update the cache on every write, which keeps reads warm but adds another synchronous operation and a consistency failure edge. Other systems enqueue cache updates to reduce write latency or refresh popular entries before they expire. Each improvement moves work and risk to a different point in the timeline.
+
+## Mental Model
+
+| Strategy | Read miss | Write acknowledgment | Main promise |
+| --- | --- | --- | --- |
+| Cache-aside | App loads and fills | Source commits; app invalidates | Cache only requested data |
+| Write-through | Cache/source wrapper loads | Source and cache update synchronously | Hot writes produce a warm value |
+| Write-behind | Cache accepts first | Source update happens asynchronously | Fast/coalesced writes, delayed durability |
+| Refresh-ahead | Hit returns current value | No special write path | Likely-to-expire keys refresh proactively |
+
+The words are not universal product guarantees. Always ask which component acknowledges, where data is durable, and what happens when the next step fails.
+
+## How It Works
+
+**Write-through** writes the source and cache in one request path, or uses a cache layer that synchronously forwards the write. It can keep cached values current, but a cache timeout can now block a source write unless the system has an explicit degraded mode. If source and cache cannot commit atomically, one can still be newer.
+
+**Write-behind** acknowledges after a cache or log records the update, then a worker persists it. Coalescing many updates can reduce source writes, but the cache or durable queue is now part of the durability boundary. A worker crash, reorder, poison record, or eviction before persistence can lose acknowledged data unless the cache is durable and replayable.
+
+**Refresh-ahead** watches TTL or access probability and reloads a key before expiry. It hides miss latency for predictable hot keys but consumes source capacity for keys that may never be read. Refresh work needs single-flight control so several workers do not refresh the same key.
+
+## Example
+
+For a user profile page, write-through can update a small profile cache after the profile row commits, making the next read warm. For click counters, write-behind may batch increments into a durable stream and periodically fold them into storage; the displayed count can be delayed. For a sports score endpoint, refresh-ahead can revalidate popular matches every few seconds while allowing a stale-while-revalidate fallback during an upstream outage.
+
+The naive write-behind implementation keeps only an in-memory dirty map. A process crash after acknowledging a write loses the map. The improvement is to append the mutation to a durable log before acknowledgment and make the sink idempotent. The new trade-off is queue lag and replay complexity: the user sees accepted work before the source projection catches up.
+
+## Visualization We Eventually Want
+
+Build a **Cache Strategy Timeline** with the same request workload run under four strategies. Controls should include read/write ratio, key hotness, source/cache latency, source or cache failure point, refresh threshold, batching window, and durable-log availability. Show acknowledgment time, source durability time, cache freshness, dirty backlog, lost/replayed updates, source QPS, and read miss latency. A crash button should stop the writer or worker at each timeline edge.
+
+## Scaling Behavior
+
+Write-through scales synchronous work with write rate and cache-node capacity. Write-behind scales ingestion and batching but requires durable backlog capacity and bounded lag; a faster producer can still exhaust the log or sink. Refresh-ahead scales with the number of hot keys and refresh frequency, not only user reads. Partition dirty work by key or tenant to preserve order and prevent one hot stream from blocking all updates.
+
+## Failure Modes
+
+- Cache update fails after source commit: reads may be stale until invalidation or TTL.
+- Source update fails after cache acceptance: write-through must not claim success without a repair path.
+- Write-behind worker crashes after acknowledgment: replay the durable mutation or report loss explicitly.
+- Out-of-order updates: an older delayed write can overwrite a newer cache value; include versions or sequence numbers.
+- Refresh storm: many workers refresh the same expiring hot keys and overload the source.
+- Eviction of dirty write-behind entries: acknowledged data disappears before persistence.
+
+## Trade-offs
+
+Write-through spends write latency and coupling for a warm, often fresher cache. Write-behind improves write throughput and batching but changes the durability contract and makes lag visible. Refresh-ahead improves hot-read tail latency but spends capacity on predicted demand and still needs stale/error behavior. Cache-aside remains simpler and lets cold data stay out of memory. None of these strategies makes two independent systems atomically consistent by naming it.
+
+## Alternatives
+
+- **Source-first invalidate:** simplest when stale reads are tolerable and writes are not extremely hot.
+- **Transactional outbox plus asynchronous projector:** durable source commit and replayable cache/read-model updates.
+- **Read-through with explicit loader:** centralizes miss policy without changing write durability.
+- **No cache with a materialized database view:** good when the source can maintain the read projection and freshness matters.
+
+## When to Use
+
+Use write-through for small hot records where a synchronous cache update fits the write SLO. Use write-behind only when the product can tolerate delayed source persistence and the update path is durable and replayable. Use refresh-ahead for predictable hot keys where a miss is costly and refresh capacity is budgeted.
+
+## When Not to Use
+
+Do not use write-behind for an acknowledged payment, inventory decrement, or audit record without an independent durable commit. Do not refresh every key merely because TTL is near; this can turn an idle cache into a source workload generator. Do not force write-through when a cache outage must not block authoritative writes.
+
+## Common Misconceptions
+
+- **Write-through is atomic.** Cache and source often remain separate failure domains.
+- **Write-behind is just faster persistence.** It changes when durability is promised.
+- **Refresh-ahead prevents stampedes automatically.** Refresh workers can stampede too.
+- **A warm cache means fresh data.** Warm entries may be old, reordered, or from a failed projection.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I choose cache update timing from the durability and freshness contract. Write-through keeps hot values warm but adds synchronous latency and a second failure edge. Write-behind can batch high-rate updates but must durably queue mutations before acknowledgment and handle lag, ordering, and replay. Refresh-ahead hides misses for predictable hot keys but spends source capacity speculatively. Cache-aside is usually the simpler default when the source remains authoritative.
+
+### When to Introduce It
+
+Introduce these strategies when the workload has a clear hot-write or hot-read pattern and cache warmth or write throughput is now the bottleneck.
+
+### Common Follow-Ups
+
+- What exactly is durable at acknowledgment?
+- How do you replay or deduplicate write-behind mutations?
+- What if cache and source updates disagree?
+- Which keys are eligible for refresh-ahead?
+
+### Common Candidate Mistakes
+
+They call write-behind “eventual consistency” without a durability story, or draw write-through as a transaction across cache and database without naming a protocol.
+
+## Summary
+
+- Strategies move work between reads, writes, refresh workers, and durable logs.
+- Write-through adds synchronous cache work; write-behind changes the durability boundary; refresh-ahead spends capacity before a miss.
+- Versions, idempotency, replay, and bounded lag are essential for asynchronous updates.
+- State the acknowledgment and source-of-truth contract explicitly.
+
+## Quiz Seeds
+
+1. Which strategy can acknowledge a write before the database has persisted it?
+2. Why can write-through still leave cache and source inconsistent after a crash?
+3. A counter receives 50k updates/s but users tolerate a 5-second delay. Which strategy fits and what must be durable?
+4. Why is refreshing every key before TTL expiry wasteful?
+5. How can sequence numbers stop an old write-behind mutation from overwriting a newer value?
+6. What happens to a write-behind entry if the cache evicts it before the sink consumes it?
+7. Compare cache-aside and refresh-ahead during a source outage.
+
+## Related Topics
+
+- [Cache-aside](cache-aside.mdx) is the baseline lazy-loading strategy.
+- [Cache invalidation](cache-invalidation.mdx) covers source/cache ordering after writes.
+- [Cache stampede](cache-stampede.mdx) handles coordinated refresh and expiry.
+- [Delivery semantics](../06-messaging/delivery-semantics.mdx) explains the durable-queue side of write-behind.
+
+## References
+
+### Documentation / Articles
+
+- [Caching strategies for Memcached](https://docs.aws.amazon.com/AmazonElastiCache/latest/dg/Strategies.html) — compares cache-aside, write-through, and write-behind considerations.
+- [Database caching strategies using Redis](https://docs.aws.amazon.com/whitepapers/latest/database-caching-strategies-using-redis/caching-patterns.html) — frames lazy loading, write-through, and expiration as workload choices.
+- [Cache write behavior](https://docs.aws.amazon.com/prescriptive-guidance/latest/dynamodb-elasticache-integration/cache-write.html) — explains why write-through can waste cache space when write keys are not subsequently read.
+- [Redis cache-aside](https://redis.io/docs/latest/develop/use-cases/cache-aside/) — provides a concrete source-first invalidation baseline for comparison.

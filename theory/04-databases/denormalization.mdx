@@ -1,0 +1,191 @@
+---
+type: lesson
+id: 04-12-denormalization
+slug: denormalization
+title: Denormalization and Read Models
+description: Duplicate data deliberately to serve read paths while making update ordering, freshness, and repair explicit.
+module: databases
+order: 12
+difficulty: core
+estimatedMinutes: 35
+prerequisites:
+  - 04-01-data-modeling-from-access-patterns
+  - 04-02-sql-vs-nosql
+  - 04-06-database-indexes
+  - 04-08-replication
+tags:
+  - denormalization
+  - read-models
+  - materialized-views
+  - projections
+  - consistency
+objectives:
+  - Identify when a join, index, cache, materialized view, or duplicated read model is the right optimization.
+  - Design an authoritative write path and update/rebuild protocol for a denormalized copy.
+  - Reason about lag, duplicates, reordering, partial updates, deletes, and schema evolution.
+  - Choose a read model whose storage and fan-out costs fit the workload.
+relatedLessons:
+  - 04-01-data-modeling-from-access-patterns
+  - 04-06-database-indexes
+  - 04-04-acid-and-transactions
+  - 04-11-read-write-quorums
+---
+
+# Denormalization and Read Models
+
+> Denormalization spends write and repair work to make a known read path local, bounded, and cheap.
+
+## Why This Exists
+
+A normalized schema stores each fact once and lets queries join it. That is an excellent authority for correctness, but a high-QPS dashboard may repeatedly join orders, users, and products, or a feed may need one row per viewer and post. The naive optimization copies fields into a second table without defining which copy is true. Updates then arrive out of order, deletes leave ghosts, and a stale total is mistaken for an authoritative balance.
+
+The improvement treats a duplicate as a projection with an owner, source version, freshness budget, update path, and rebuild plan. The trade-off is write amplification, storage, lag, duplicate handling, schema evolution, and extra observability.
+
+## Mental Model
+
+| Question | Required answer |
+| --- | --- |
+| Authority | Which store owns the fact and enforces its invariant? |
+| Shape | Which exact query/result bound is the copy optimizing? |
+| Update trigger | Transactional write, change stream, job, or periodic refresh? |
+| Ordering/version | How does the projection reject stale/reordered updates? |
+| Freshness | What max age is acceptable, and what does the user see beyond it? |
+| Repair | Can it be rebuilt from authority, and at what read/write budget? |
+| Delete/schema | How are tombstones, removed fields, and versions propagated? |
+
+Denormalization is not limited to copying columns. It includes embedding, materialized views, feed fan-out, search indexes, aggregates, cache entries, and query-shaped wide-column rows. A cache may be disposable; a durable read model may need auditability and replay. State which one it is.
+
+## How It Works
+
+Common update patterns:
+
+- **Synchronous dual write:** Update authority and projection in one request. Simple until one write succeeds and the other fails; a shared transaction may help only when both are in one engine.
+- **Transactional intent/event:** Commit authority plus a durable intent, then asynchronously apply the projection. Avoids silent loss but exposes lag and retry/duplicate handling.
+- **Change stream/CDC:** Derive changes from the authority log; ordering, retention, schema, and replay semantics must be understood.
+- **Periodic rebuild/materialized refresh:** Recompute from source on a schedule; easy to reason about but freshness is bounded by refresh time.
+- **Read-time join/cache:** Keep one authority and optimize selectively; lower consistency complexity but may not meet latency/scale.
+
+Every consumer should apply a version or monotonic sequence and make updates idempotent. A projection that receives version 8 after version 9 should not regress silently. A delete needs a durable tombstone or a source-of-truth check; simply omitting the row can allow an old replay to resurrect it.
+
+## Example
+
+An order history page needs customer name, order status, item summary, and latest shipment state. The normalized authority has `orders`, `order_items`, `customers`, and `shipments`. At 30,000 reads/s, a join plus remote service calls misses the p99 target.
+
+The naive fix copies current fields into `customer_order_view` during each API request. A timeout after the authority commit creates a missing view; a late shipment event overwrites a newer status; a customer rename requires a fan-out to every historical order.
+
+The improved design keeps order/payment state authoritative, records a versioned change intent in the local write path, and applies an idempotent projection keyed by `(customer_id, order_id)`. The projection stores an order snapshot and source versions. A rebuild reads authority in pages, writes a new generation, verifies counts/checksums, and swaps the reader to the new generation. Customer names can be copied with an explicit policy: historical orders may retain the name at purchase time, while a current profile name may be a separate field.
+
+The new trade-off is visible: a newly shipped order may show `shipment_pending` for seconds, and the UI/metrics must expose projection age. If the product requires immediate status, route that one read to the authority or wait for the projection version; do not silently call an eventually consistent view “real time.”
+
+## Visualization We Eventually Want
+
+Build a **projection consistency lab** with an order authority and read model. Controls should include write rate, event delay/reordering/duplication/loss, projection worker count, rebuild speed, read traffic, freshness budget, and fan-out policy for customer updates.
+
+Show source/projection versions, lag age, stale reads, duplicates rejected, missing/deleted rows, write amplification, rebuild backlog, and authority/read-model cost. Presets should compare synchronous dual write, versioned async projection, periodic materialization, and a late delete replay. Include a text event log, generation cutover, pause/step/reset, keyboard controls, and reduced-motion mode.
+
+## Scaling Behavior
+
+Denormalization moves work from reads to writes. A one-to-many fan-out can make a single source update touch millions of rows; a hot customer or celebrity post can dominate. Async workers need queue capacity, retry budgets, ordering keys, and replay throughput. Rebuilding a projection can compete with foreground reads and authority I/O.
+
+At high data volume, store only fields required by the query and use bounded buckets/generations. Track freshness by source-to-projection version/time, not merely worker health. Multi-region projections may be local and lagging; document whether a region can serve stale reads during a partition.
+
+## Failure Modes
+
+- **Dual-write split:** Authority commits but projection fails or vice versa.
+- **Reordered update:** Older event overwrites newer state.
+- **Duplicate event:** The same change is applied twice and increments/side effects duplicate.
+- **Lost delete:** A deleted row remains or is resurrected by replay.
+- **Fan-out storm:** One source update writes millions of copies and starves normal work.
+- **Projection drift:** A bug or dropped event leaves a view silently incorrect.
+- **Schema mismatch:** Producer changes fields before all projection consumers understand the version.
+- **Unsafe rebuild:** A backfill and live updates race, creating gaps or regressions at cutover.
+
+Mitigate with durable intents/CDC, idempotent version checks, tombstones, bounded fan-out, lag/drift metrics, schema compatibility, replay, shadow comparison, and generation-based cutover.
+
+## Trade-offs
+
+Denormalization can make critical reads fast, local, and predictable, reduce joins/fan-out, and isolate a read workload. It costs extra storage and write work, stale/duplicate copies, backfill/rebuild complexity, and a larger correctness surface. Synchronous copies reduce lag but couple request latency/failure; async copies improve decoupling but require an honest freshness contract.
+
+## Alternatives
+
+- **Composite/covering index:** Prefer when one query needs a better local access path without duplicating a full view.
+- **Materialized view:** Prefer for a database-managed aggregate/refresh policy; verify refresh locking and freshness.
+- **Cache:** Prefer for disposable repeated hot reads; still define invalidation and origin fallback.
+- **Read-time join:** Prefer at modest scale or when freshness is critical and latency budget permits.
+- **Search/analytics projection:** Prefer when the query semantics differ substantially; keep rebuildability and authority clear.
+
+## When to Use
+
+Use denormalization after identifying a measured read bottleneck or a query shape that cannot be served locally enough. Name the source, fields copied, update trigger/order, freshness, invalidation/delete, and rebuild plan.
+
+## When Not to Use
+
+Do not duplicate a mutable field just to avoid one cheap join, and do not use a projection as a correctness authority without a deliberate ownership transfer. Avoid unbounded fan-out when a query-time or bucketed alternative meets the target.
+
+## Common Misconceptions
+
+- **Denormalization means inconsistent data is acceptable.** The freshness/consistency contract still needs to be explicit.
+- **A dual write is atomic because it is in one function.** A crash can split the effects.
+- **Events arrive once and in order.** Delivery can duplicate, delay, reorder, or lose data without a durable protocol.
+- **Materialized views never need repair.** Bugs, missed updates, and schema changes require replay/rebuild.
+- **Every source update should fan out immediately.** Batch/coalesce, pull, or bounded projection strategies may be safer.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I denormalize a measured, bounded read path while keeping one authority for each fact. The projection update is synchronous only when latency/freshness and failure coupling justify it; otherwise a durable intent/CDC path applies versioned, idempotent updates. I state lag, duplicate/reorder/delete behavior, fan-out cost, schema compatibility, and how a new generation is rebuilt and cut over.
+
+### When to Introduce It
+
+Introduce it when joins/fan-out or a query-shaped store is the first measured bottleneck and stale-read budget is explicit.
+
+### Common Follow-Ups
+
+- What is the source of truth?
+- How do you prevent an old event from overwriting a new value?
+- What does a delete look like?
+- How is the projection rebuilt after a bug?
+- What happens to a celebrity update with millions of readers?
+
+### Common Candidate Mistakes
+
+- Writing two stores without an ordering/idempotency protocol.
+- Calling a projection “strongly consistent” because it is updated asynchronously.
+- Ignoring schema evolution and historical versus current copied fields.
+- Forgetting rebuild, drift detection, and cutover safety.
+- Treating fan-out writes as free at scale.
+
+## Summary
+
+- Denormalization is an intentional read/write trade, not an accidental duplicate.
+- Keep authority, versions, freshness, deletes, and rebuild behavior explicit.
+- Async projections need idempotency, ordering, lag metrics, replay, and drift repair.
+- A narrow index or cache may solve the bottleneck with less consistency machinery.
+
+## Quiz Seeds
+
+1. Why can a dual write leave a projection missing after a successful authority commit?
+2. How does a projection reject an event that arrives out of order?
+3. What is the difference between a disposable cache and a durable read model during rebuild?
+4. When does an index solve the same read problem with less write fan-out?
+5. Why do deletes need tombstones or an authority check?
+6. How would you serve a customer after projection lag exceeds the freshness budget?
+7. What failure occurs when one source update fans out to millions of rows?
+8. Describe a generation-based rebuild and cutover.
+
+## Related Topics
+
+- [Data modeling from access patterns](data-modeling-from-access-patterns.mdx)
+- [Database indexes](database-indexes.mdx)
+- [ACID and transactions](acid-and-transactions.mdx)
+- [Read/write quorums](read-write-quorums.mdx)
+
+## References
+
+### Documentation / Articles
+
+- [MongoDB: Embedding versus references](https://www.mongodb.com/docs/manual/data-modeling/concepts/embedding-vs-references/) — explains when related data should be embedded for locality versus referenced for independent growth/ownership.
+- [Amazon DynamoDB: NoSQL design](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/bp-modeling-nosql.html) — grounds query-shaped duplication and item-collection design in known access patterns.
+- [PostgreSQL: Materialized views](https://www.postgresql.org/docs/current/rules-materializedviews.html) — documents persisted query results and the explicit refresh/freshness trade-off.
+- [Martin Fowler: CQRS](https://martinfowler.com/bliki/CQRS.html) — provides a concise, implementation-independent explanation of separate read and write models and their complexity.

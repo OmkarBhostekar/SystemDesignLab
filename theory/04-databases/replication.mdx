@@ -1,0 +1,183 @@
+---
+type: lesson
+id: 04-08-replication
+slug: replication
+title: Database Replication
+description: Use copies for read scale, durability, and failover while making lag, promotion, and consistency visible.
+module: databases
+order: 8
+difficulty: core
+estimatedMinutes: 40
+prerequisites:
+  - 04-04-acid-and-transactions
+  - 01-08-redundancy-and-fault-tolerance
+  - 01-07-durability
+  - 01-10-consistency-models
+tags:
+  - replication
+  - read-replicas
+  - replication-lag
+  - failover
+  - high-availability
+objectives:
+  - Compare leader/follower, synchronous/asynchronous, multi-leader, and leaderless replication at a guarantee level.
+  - Explain replication lag, read-after-write routing, acknowledgments, promotion, and split-brain risk.
+  - Design read scaling and failover behavior with explicit RPO, RTO, and stale-read policy.
+  - Identify what replication protects and what it does not protect from corruption, bad writes, or operator error.
+relatedLessons:
+  - 04-09-partitioning-and-sharding
+  - 04-11-read-write-quorums
+  - 04-04-acid-and-transactions
+  - 01-08-redundancy-and-fault-tolerance
+---
+
+# Database Replication
+
+> Replication creates additional copies of state; it does not automatically make reads fresh, writes available, or failover safe.
+
+## Why This Exists
+
+A single database instance can become a read bottleneck or a single failure domain. The naive improvement is to copy it and send reads everywhere. That serves stale data during lag, can route a correctness decision to a replica that has not applied a write, and may promote two leaders during a network partition.
+
+Replication is a protocol about ownership, log/order transfer, acknowledgment, and promotion. First decide why copies exist: read scale, local latency, crash durability, or regional recovery. Then define which copy is authoritative for a write and what a successful acknowledgment means.
+
+## Mental Model
+
+| Choice | What it buys | Price/limit |
+| --- | --- | --- |
+| Leader/follower | One write order and simple authority; followers can serve reads/backups | Write bottleneck, lag, promotion/fencing complexity |
+| Synchronous follower | Commit waits for selected copy/copies | Higher write latency and reduced availability if required followers fail |
+| Asynchronous follower | Low write latency and more write availability | A crash can lose unshipped acknowledged writes; stale reads |
+| Multi-leader | Writes local to regions/owners | Conflicts, ordering, and reconciliation |
+| Leaderless/quorum | Multiple replicas can accept/read with tunable thresholds | Read repair/version conflicts, quorum availability/latency trade-offs |
+
+“Replica” can mean a physical copy, logical subscriber, read-only projection, or cache. The data and failure guarantees differ. A read replica is not a backup unless retention, isolation, restore, and corruption protection are designed.
+
+## How It Works
+
+In a leader/follower system, the leader records a write in a durable log and streams log records to followers. A synchronous policy waits for a defined follower acknowledgment before reporting commit; asynchronous policy returns before all followers apply it. A follower can be behind due to network, CPU, disk, long snapshots, or a paused process.
+
+Measure lag as bytes/LSN, commit timestamp age, or replay position—not only a boolean “healthy.” Route a read to the leader for read-your-writes, use a session token/commit position to require a follower to catch up, or explicitly allow stale data for a bounded feature. A load balancer health check that only tests TCP does not establish freshness.
+
+Failover requires detecting a failed leader, selecting a sufficiently current follower, fencing the old leader, promoting the new one, updating routes, and reconciling clients in flight. A distributed membership/lease/consensus system may coordinate this; do not imply that a DNS flip alone prevents split brain. Lost acknowledged writes depend on what was synchronously replicated and on the chosen RPO.
+
+## Example
+
+An orders API receives 1,000 writes/s and 20,000 reads/s. A single primary handles correctness-critical order writes; two asynchronous followers serve order history. The naive router sends every read to followers. After a customer places an order, the confirmation page is routed to a lagging follower and says “order not found.”
+
+The improvement routes the write response's session/commit token with subsequent customer reads, or sends a bounded post-write read to the primary until the follower catches up. Stale-tolerant reporting can continue using followers. If followers lag beyond a threshold, the router removes them from fresh-read eligibility rather than pretending they are healthy. The new trade-off is primary load, more routing state, and a possible availability reduction for fresh reads.
+
+For failover, suppose the leader acknowledges a write after local fsync but before follower receipt. A crash can lose that write under asynchronous replication. The system should state whether the order may be retried/reconciled, what the client sees, and whether the API's “success” contract accepts that RPO. A synchronous follower in another availability zone reduces this loss window but adds cross-zone latency and a dependency on that follower.
+
+## Visualization We Eventually Want
+
+Build a **replication timeline** with one leader and three followers. Controls should include write rate, log shipping bandwidth, follower CPU/disk, synchronous acknowledgment count, network delay, read routing, and failure timing.
+
+Show log positions, applied versions, replica lag age/bytes, read freshness, write acknowledgment latency, RPO, failover state, and split-brain warnings. Presets should include an async lag spike, a read-after-write miss, a synchronous follower outage, and leader failure before/after shipping. Let learners fence/promote a follower and observe client retries. Include a text timeline, step/pause/reset, and reduced-motion behavior.
+
+## Scaling Behavior
+
+Read replicas scale read capacity only for workloads that tolerate their freshness and do not saturate the leader's WAL/network. More replicas multiply log shipping, storage, backups, and failover candidates. Synchronous replicas add a latency term to every write and can reduce write availability.
+
+As data and write rates grow, replication bandwidth, apply throughput, index maintenance, vacuum/compaction, and lag catch-up time become capacity constraints. Sharding may scale write ownership, but each shard now has its own replica set and cross-shard read/failover behavior. Multi-region replication adds distance, conflict, data-residency, and recovery decisions.
+
+## Failure Modes
+
+- **Replication lag:** Followers return stale data or consume storage/log retention while catching up.
+- **Acknowledgment ambiguity:** Client times out after a commit; retry must be idempotent and route to an authority.
+- **Primary loss:** Promotion chooses a stale follower, losing acknowledged async writes within RPO.
+- **Split brain:** Old and new leaders accept writes without fencing, producing divergent histories.
+- **Cascading replica overload:** All followers fall behind, then catch up while serving reads and increase disk/CPU pressure.
+- **Corrupt/bad write replication:** Replication faithfully copies a deletion or bug; it is not an isolated backup.
+- **Failover route cache:** Clients keep sending writes to the old endpoint or pool.
+
+Mitigate with lag-aware routing, synchronous policy aligned with RPO, fencing/leases, idempotency, restore-tested backups/PITR, bounded catch-up, and failover drills.
+
+## Trade-offs
+
+Replication improves read capacity, fault tolerance, and locality but costs storage, log bandwidth, operational complexity, and potentially consistency/latency. Synchronous copies reduce acknowledged-loss risk at a write-latency/availability cost. Async copies preserve a fast write path but expose lag and RPO. More copies do not protect against a bad write or coordinated operator action.
+
+## Alternatives
+
+- **Read cache:** Lower-latency repeated reads; must handle invalidation and does not replace durable failover.
+- **Partitioning/sharding:** Adds write and storage ownership instead of only copies; rebalancing is a separate problem.
+- **Backup/PITR:** Recovers from corruption/operator error; usually not a low-latency read replica.
+- **Multi-region active/active:** Local writes and availability at the cost of conflict/version semantics.
+- **Quorum/leaderless replication:** Tunable read/write acknowledgment; requires version resolution and repair discipline.
+
+## When to Use
+
+Use replication when the requirement names read scale, failure-domain survival, local read latency, or a defined recovery objective. State the write authority, acknowledgment, freshness, promotion, fencing, and RPO/RTO behavior.
+
+## When Not to Use
+
+Do not add read replicas to fix an unindexed query or a write bottleneck. Do not route correctness-critical reads to eventually consistent copies without a freshness protocol. Do not call a replica a backup without independent retention and restore tests.
+
+## Common Misconceptions
+
+- **A replica is always current.** Lag is normal and must be measured/routed.
+- **Async replication is durable enough by default.** Acknowledged data can be lost within the configured RPO.
+- **Failover is a DNS update.** Fencing, promotion, clients, in-flight writes, and split-brain prevention matter.
+- **More replicas increase write capacity.** They often add write propagation work; sharding changes ownership.
+- **Replication protects from bad data.** It usually copies the bad write quickly; backups/PITR provide another recovery line.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I use a primary for writes and replicas for a stated purpose: read scale, locality, or failure recovery. I define whether commit waits for a follower, measure lag, route read-your-writes to a current authority, and specify promotion, fencing, RPO, and RTO. Async replicas can be stale or lose acknowledged writes; synchronous replicas cost latency/availability. Replication is not a backup against corruption or operator error.
+
+### When to Introduce It
+
+Introduce replication after identifying read/write pressure, failure domains, and freshness/durability objectives. Choose read replicas, synchronous copies, sharding, or backups for the actual bottleneck.
+
+### Common Follow-Ups
+
+- What happens to a read immediately after a write?
+- How much acknowledged data can failover lose?
+- How do you prevent split brain?
+- How do you know a replica is safe to promote?
+- What happens when a replica is lagging or rebuilding?
+
+### Common Candidate Mistakes
+
+- Treating replicas as independent writers without conflict semantics.
+- Claiming zero data loss with asynchronous replication.
+- Using a basic health check as a freshness check.
+- Forgetting client connection pools/routes after promotion.
+- Calling replication a backup or disaster-recovery plan by itself.
+
+## Summary
+
+- Replication copies state; the protocol defines ordering, acknowledgment, freshness, and failover.
+- Read replicas trade freshness and routing complexity for read capacity.
+- Synchronous replication trades write latency/availability for a smaller loss window; async replication exposes RPO.
+- Safe promotion needs fencing, lag awareness, client routing, and tested recovery—not only a DNS change.
+
+## Quiz Seeds
+
+1. Why can a read immediately after a successful write miss on an async follower?
+2. What does synchronous acknowledgment reduce, and what does it cost?
+3. A leader fails after local commit but before follower receipt. What is the RPO under async replication?
+4. Why is a TCP health check insufficient for replica read routing?
+5. What steps prevent split brain during failover?
+6. Which workload can use stale replicas safely, and which cannot?
+7. Why do more replicas not automatically increase write throughput?
+8. How do backups differ from replicas when a bad delete is replicated?
+
+## Related Topics
+
+- [Partitioning and sharding](partitioning-and-sharding.mdx)
+- [Read/write quorums](read-write-quorums.mdx)
+- [ACID and transactions](acid-and-transactions.mdx)
+- [Redundancy and fault tolerance](../01-foundations/redundancy-and-fault-tolerance.mdx)
+
+## References
+
+### Documentation / Articles
+
+- [PostgreSQL: High availability, load balancing, and replication](https://www.postgresql.org/docs/current/high-availability.html) — frames replication, failover, and load balancing as separate high-availability concerns.
+- [PostgreSQL: Log-shipping standby servers](https://www.postgresql.org/docs/current/warm-standby.html) — documents streaming standby behavior, recovery, and replication lag considerations.
+- [PostgreSQL: Replication settings](https://www.postgresql.org/docs/current/runtime-config-replication.html) — describes synchronous standby configuration and replication-related controls.
+- [MongoDB: Replication](https://www.mongodb.com/docs/manual/replication/) — provides a concrete replica-set model with primary election, secondaries, write concern, and read preference.
+- [Apache Cassandra: Dynamo architecture](https://cassandra.apache.org/doc/latest/cassandra/architecture/dynamo.html) — contrasts multi-primary, versioned, tunable replication with leader/follower storage.

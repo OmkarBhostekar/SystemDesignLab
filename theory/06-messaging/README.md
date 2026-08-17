@@ -1,10 +1,10 @@
 # Module 06 — Asynchronous Systems and Messaging
 
-**Status:** Scaffold only. Queue, stream, delivery, and backpressure lessons are not yet authored.
+**Status:** Theory complete for all ten indexed lessons. Interactive simulations remain future work.
 
 ## Purpose
 
-Teach when to separate work from a request, how queues and pub/sub move events, how partitions constrain parallelism and ordering, what delivery semantics really guarantee, and how systems respond when producers outrun consumers.
+Teach when to separate work from a request, how queues and pub/sub move events, how partitions constrain parallelism and ordering, what delivery semantics really guarantee, how duplicate-safe consumers and DLQs operate, and how systems respond when producers outrun consumers. Stream-processing edges make event time, windows, watermarks, batching, and late data explicit rather than treating “real time” as a magic property.
 
 ## Depth classification
 
@@ -17,18 +17,18 @@ Queue fundamentals, delivery semantics, idempotency, dead-letter handling, and b
 - [`03-traffic-and-services`](../03-traffic-and-services/README.md) for service boundaries.
 - Relevant [`04-databases`](../04-databases/README.md) transaction/storage concepts and [`05-caching`](../05-caching/README.md) only where they affect asynchronous work.
 
-## Intended lesson order
+## Completed lesson order
 
-1. `06-01-sync-vs-async` — Compare synchronous order/email processing with queue-backed work and its new failure modes.
-2. `06-02-message-queue-fundamentals` — Producers, brokers, consumers, queues, acknowledgments, visibility, and retention.
-3. `06-03-pub-sub-and-topics` — Queue versus pub/sub, topics, subscriptions, and independent consumers.
-4. `06-04-partitions-and-consumer-groups` — Partitioned topics, consumer groups, parallelism limits, rebalancing, and the partition count control.
-5. `06-05-ordering` — Global, partition, and per-key ordering, including why global order can reduce scalability.
-6. `06-06-delivery-semantics` — At-most-once, at-least-once, exactly-once claims, duplicates, retries, and crash points.
-7. `06-07-idempotent-consumers` — Event IDs, deduplication, and safe repeated side effects.
-8. `06-08-dead-letter-queues` — Poison messages, retry exhaustion, quarantine, and operational recovery.
-9. `06-09-backpressure` — Queue growth, slow consumers, throttling, buffering, dropping low-priority work, and adding consumers.
-10. `06-10-batching-and-stream-vs-batch` — Batching, stream versus batch processing, event time, and windows at an Advanced level.
+1. [`06-01-sync-vs-async`](sync-vs-async.mdx) — Request-path decisions, durable acceptance, status, and delayed completion.
+2. [`06-02-message-queue-fundamentals`](message-queue-fundamentals.mdx) — Producers, brokers, delivery, acknowledgments, visibility, retention, and crash behavior.
+3. [`06-03-pub-sub-and-topics`](pub-sub-and-topics.mdx) — Queue versus pub/sub, topics, subscriptions, event envelopes, replay, and fan-out.
+4. [`06-04-partitions-and-consumer-groups`](partitions-and-consumer-groups.mdx) — Partition keys, parallelism ceilings, lag, heartbeats, and rebalancing.
+5. [`06-05-ordering`](ordering.mdx) — Global, partition, per-key, causal, and best-effort order with sequence checks.
+6. [`06-06-delivery-semantics`](delivery-semantics.mdx) — At-most-once, at-least-once, scoped exactly-once, crash points, and end-to-end limits.
+7. [`06-07-idempotent-consumers`](idempotent-consumers.mdx) — Event identity, inbox/dedup records, atomic effects, and external-provider reconciliation.
+8. [`06-08-dead-letter-queues`](dead-letter-queues.mdx) — Poison messages, bounded retries, quarantine metadata, ownership, and safe replay.
+9. [`06-09-backpressure`](backpressure.mdx) — Queue growth, age, prefetch, throttling, priority, load shedding, and downstream protection.
+10. [`06-10-batching-and-stream-vs-batch`](batching-and-stream-vs-batch.mdx) — Batching triggers, stream versus batch, event time, windows, watermarks, and lateness.
 
 ## Downstream connections
 
@@ -38,7 +38,6 @@ Queue fundamentals, delivery semantics, idempotency, dead-letter handling, and b
 - [`11-building-blocks`](../11-building-blocks/README.md) uses messaging for schedulers, notifications, presence, and object workflows.
 - The write-heavy, streaming, notification, chat, crawler, and distributed-queue designs in modules [`12`](../12-architecture-archetypes/README.md) and [`13`](../13-design-labs/README.md) depend on this module.
 
-## Authoring boundary
+## Theory completion boundary
 
-The scaffold explicitly does not claim “exactly once” is magic. A future lesson must model crash points, duplicates, acknowledgments, and end-to-end coordination, and should separate simulation logic from rendering when the visual work begins.
-
+The ten lessons are authored as Markdown-first theory and include interview lenses, reasoning quiz seeds, relative lesson links, annotated references, and behavior-oriented visualization specifications. They explicitly scope delivery guarantees, model crash points, and treat idempotency, DLQs, and backpressure as operational mechanisms. Future visual work should separate deterministic queue/stream simulation from rendering and preserve the text explanations when interactive features are unavailable.

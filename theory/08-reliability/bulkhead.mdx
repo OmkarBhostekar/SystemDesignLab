@@ -1,0 +1,181 @@
+---
+type: lesson
+id: 08-06-bulkhead
+slug: bulkhead
+title: Bulkhead Pattern
+description: Partition resources and failure domains so one workload or dependency cannot exhaust capacity for everything else.
+module: reliability
+order: 6
+difficulty: core
+estimatedMinutes: 25
+prerequisites:
+  - 08-05-circuit-breaker
+  - 03-08-service-boundaries
+  - 01-08-redundancy-and-fault-tolerance
+tags:
+  - bulkhead
+  - resource-isolation
+  - tenant-isolation
+  - connection-pools
+  - failure-domains
+objectives:
+  - Explain how shared thread, connection, queue, and compute pools create cross-workload failure.
+  - Choose a bulkhead boundary based on tenant, endpoint, dependency, or failure domain.
+  - Compare hard partitioning, weighted shares, and adaptive concurrency limits.
+  - State the capacity and fairness costs of isolating resources.
+relatedLessons:
+  - 08-04-retry-storms-and-cascading-failures
+  - 08-07-load-shedding-and-graceful-degradation
+  - 03-08-service-boundaries
+---
+
+# Bulkhead Pattern
+
+> A bulkhead limits blast radius by giving independent workloads their own bounded resources, so one overloaded path cannot sink every path.
+
+## Why This Exists
+
+An API process has 200 worker threads and one connection pool shared by checkout, recommendations, and reporting. A reporting query stalls. Requests accumulate, consume all threads and connections, and checkout starts timing out even though its own database is healthy. The naive design maximizes average utilization by sharing everything; it minimizes idle capacity but turns one workload into a system-wide failure.
+
+The bulkhead improvement partitions resources or admission quotas. Checkout may reserve 100 threads/connections, recommendations 50, and reporting 50. Reporting can fail without exhausting checkout. The trade-off is lower aggregate utilization and the need to size, monitor, and rebalance pools.
+
+## Mental Model
+
+```text
+shared pool (naive)              isolated pools
+checkout ─┐                      checkout ──[100]
+recs ─────┼─>[200 workers]       recs ──────[50]
+reports ──┘                      reports ────[50]
+```
+
+Isolation can be applied to:
+
+- thread/event-loop concurrency,
+- database/HTTP connection pools,
+- queues and worker fleets,
+- CPU/memory/cell/zone capacity,
+- tenants, priority classes, or dependency providers.
+
+A bulkhead is not just multiple services. It is an explicit upper bound and admission rule that prevents one class of work from borrowing all capacity. Decide whether spare capacity can be borrowed under normal load and whether it can be reclaimed quickly under incident load.
+
+## How It Works
+
+1. Classify work by a stable boundary: critical endpoint, tenant tier, dependency, region/cell, or priority.
+2. Allocate separate resource pools or concurrency limits with a maximum per class.
+3. Apply a bounded queue or reject/degrade when that class reaches its limit.
+4. Measure utilization, queue age, rejected work, and unused reserve per pool.
+5. Rebalance deliberately or use adaptive limits with safeguards; do not let a local controller erase the isolation during a spike.
+
+Hard pools offer predictable blast radius. Weighted fair sharing allows unused capacity to be borrowed but must enforce a ceiling under contention. Process/cell isolation protects against memory corruption and noisy neighbors more strongly than a semaphore inside one process.
+
+## Example
+
+An API serves 90% product reads and 10% checkout writes. Product search calls a slow external provider. With one HTTP client pool, search consumes all 100 connections and checkout cannot reach payment. Give checkout a dedicated 30-connection pool and a reserved worker/concurrency budget; cap search at 50 and fail/degrade when full. Payment still has a dependency timeout and breaker, but its callers are not waiting behind search.
+
+At quiet times, allow search to borrow 10 checkout-safe connections only if the resource can reclaim them before checkout traffic arrives. If strict checkout SLO matters more than utilization, keep hard partitions. A tenant that submits a large export should receive its own queue/worker share rather than blocking every tenant's interactive requests.
+
+## Visualization We Eventually Want
+
+Show four traffic classes flowing into shared versus partitioned pools. Controls should change arrival rates, pool sizes, queue limits, tenant weights, dependency latency, and borrow policy. Display per-class concurrency, queue age, success/error/ rejection, unused reserved capacity, and cross-class impact. Inject a slow reporting dependency and compare how checkout behaves under shared, hard, and weighted bulkheads.
+
+## Scaling Behavior
+
+More tenants/classes increase pool and queue management overhead and can fragment capacity. Per-tenant hard pools may waste memory and create a long tail of tiny pools; group tenants into tiers or cells when appropriate. A regional/cell bulkhead can preserve service during one cell outage but requires routing and data-locality design.
+
+Bulkheads need enough capacity after failure. Reserving 30 checkout connections does not guarantee checkout succeeds if payment itself has 0 capacity. Size each pool at target SLO and model zone loss, retries, health probes, and recovery warmup.
+
+## Failure Modes
+
+- **Misclassification:** critical work enters a low-priority pool or a noisy tenant bypasses limits.
+- **Pool starvation:** one pool is oversized or has a slow dependency and still fails internally.
+- **Capacity fragmentation:** hard partitions leave idle capacity while another class rejects.
+- **Borrow leakage:** borrowed capacity is not reclaimed before a protected workload spikes.
+- **Shared host failure:** all process pools die together despite logical isolation.
+- **Queue hiding:** large per-pool queues preserve throughput illusion while latency violates the SLO.
+- **Controller oscillation:** adaptive limits chase noisy metrics and cause flapping.
+
+## Trade-offs
+
+Bulkheads reduce blast radius and improve fairness, but reserve capacity, complicate routing/configuration, and can lower average utilization. Hard partitions are predictable; weighted sharing is efficient but less isolated. Process/cell boundaries are stronger but cost deployment and operational overhead. A small rejected fraction may be preferable to global timeout collapse.
+
+## Alternatives
+
+- **Load shedding:** reject low-value work when every pool is under pressure.
+- **Circuit breaker:** stop calls to a failing dependency; it does not isolate unrelated caller resources by itself.
+- **Priority queue/fair scheduler:** share one pool with explicit fairness when hard isolation is too expensive.
+- **Autoscaling:** add capacity for sustained demand, but does not replace immediate isolation.
+- **Cell-based architecture:** use stronger fault-domain isolation across hosts/regions.
+
+## When to Use
+
+Use bulkheads when multiple workloads, tenants, or dependencies share finite pools and their failure/priority requirements differ. Draw the pool boundary, reserve/borrow policy, queue limit, and behavior when full.
+
+## When Not to Use
+
+Do not create one pool per endpoint without a meaningful failure/fairness boundary. Avoid hard partitions when the workload is small and a simpler bounded concurrency limit suffices. Do not call autoscaling a bulkhead.
+
+## Common Misconceptions
+
+- **“Separate services automatically isolate resources.”** Shared databases, nodes, queues, or connection pools can still couple failures.
+- **“A semaphore guarantees the dependency is safe.”** It protects callers; the dependency may still be overloaded by other clients.
+- **“Unused reserve is waste.”** It is the capacity margin that keeps critical work alive during a fault.
+- **“Weighted sharing has no blast-radius risk.”** Borrowing must have hard caps and reclamation.
+- **“Bulkhead fixes bad requests.”** Classification, timeouts, and per-request limits still matter.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I isolate finite pools by workload or failure domain so a slow dependency or noisy tenant cannot consume every thread, connection, or queue slot. Critical paths get reserved capacity and bounded queues; lower-priority work sheds or degrades when its pool is full. I explain the utilization cost, borrowing policy, and how the design behaves after a zone loss.
+
+### When to Introduce It
+
+Introduce bulkheads when one process handles independent paths or multi-tenant traffic with different SLOs. Tie each partition to a concrete exhaustion scenario.
+
+### Common Follow-Ups
+
+- Which resource is actually shared: threads, DB connections, CPU, or queue slots?
+- Can a low-priority pool borrow unused capacity?
+- How do you size reserves after one zone fails?
+- Why not use a circuit breaker alone?
+
+### Common Candidate Mistakes
+
+- Drawing logical partitions without resource enforcement.
+- Ignoring capacity fragmentation and borrow rules.
+- Using one global connection pool for critical and best-effort calls.
+- Forgetting tenant fairness and queue age.
+
+## Summary
+
+Bulkheads enforce finite-resource boundaries that limit blast radius and preserve critical work. Choose meaningful partitions, cap/queue/reject explicitly, measure both isolation and fragmentation, and combine with timeouts, breakers, and shedding.
+
+## Quiz Seeds
+
+1. How does a reporting query exhaust checkout without a bulkhead?
+2. Which resource would you isolate first: threads, HTTP connections, or database connections, and why?
+3. What is the cost of hard partitions under quiet traffic?
+4. How can weighted borrowing undermine isolation?
+5. Why does a reserved checkout pool not guarantee payment success?
+6. When is a priority scheduler preferable to hard pools?
+7. What metrics reveal a bulkhead is hiding long queues rather than protecting latency?
+
+## Related Topics
+
+- [Circuit Breaker](./circuit-breaker.mdx)
+- [Retry Storms and Cascading Failures](./retry-storms-and-cascading-failures.mdx)
+- [Load Shedding and Graceful Degradation](./load-shedding-and-graceful-degradation.mdx)
+- [Service Boundaries](../03-traffic-and-services/service-boundaries.mdx)
+
+## References
+
+### Documentation / Articles
+
+- [Bulkhead pattern](https://learn.microsoft.com/en-us/azure/architecture/patterns/bulkhead) — Microsoft explains pool isolation, noisy consumers, and the cell-based analogy.
+- [Handling Overload](https://sre.google/sre-book/handling-overload/) — Google SRE connects resource exhaustion, queueing, and admission control.
+- [Addressing Cascading Failures](https://sre.google/sre-book/addressing-cascading-failures/) — details how shared resources create cross-service cascades.
+- [Static stability using Availability Zones](https://aws.amazon.com/builders-library/static-stability-using-availability-zones/) — AWS describes pre-provisioned isolation and failure-domain capacity rather than relying only on reactive scaling.
+
+### Papers
+
+- [The Tail at Scale](https://research.google/pubs/the-tail-at-scale/) — grounds isolation and hedging decisions in tail behavior and correlated latency.

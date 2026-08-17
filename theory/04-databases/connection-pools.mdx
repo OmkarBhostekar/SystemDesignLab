@@ -1,0 +1,193 @@
+---
+type: lesson
+id: 04-13-connection-pools
+slug: connection-pools
+title: Database Connection Pools
+description: Bound application concurrency and reuse database sessions without turning pool capacity into a hidden queue.
+module: databases
+order: 13
+difficulty: core
+estimatedMinutes: 30
+prerequisites:
+  - 04-04-acid-and-transactions
+  - 04-06-database-indexes
+  - 01-03-latency-vs-throughput
+  - 03-08-service-boundaries
+tags:
+  - connection-pools
+  - concurrency
+  - queueing
+  - backpressure
+  - database-capacity
+objectives:
+  - Explain a connection pool as reuse plus a concurrency limit and queue.
+  - Size a pool from database capacity, request hold time, instance count, and failure headroom rather than a framework default.
+  - Diagnose pool exhaustion, connection leaks, idle transactions, and pool oversubscription.
+  - Compare direct pools, transaction/session poolers, and bounded admission with explicit timeout behavior.
+relatedLessons:
+  - 04-14-concurrency-control
+  - 04-04-acid-and-transactions
+  - 04-06-database-indexes
+  - 01-03-latency-vs-throughput
+---
+
+# Database Connection Pools
+
+> A connection pool is a reusable set of database sessions and a queueing boundary; it cannot create database capacity that does not exist.
+
+## Why This Exists
+
+Opening a new database connection for every request adds handshake/authentication cost, consumes server resources, and creates connection storms during bursts. The naive fix is a large pool per application process. If 20 instances each open 50 connections, a database with capacity for 100 active queries may receive 1,000 sessions competing for CPU, memory, locks, and cache. Requests still queue—inside the database, the network, or the operating system—with less visibility.
+
+The improvement reuses sessions and bounds application concurrency near a measured database budget. The new trade-off is an explicit pool wait: when all connections are busy, callers must wait, fail fast, shed work, or use another path. That queue can protect the database, but only if it has a timeout and an observable limit.
+
+## Mental Model
+
+For a request:
+
+```text
+request → acquire pool slot → use session/transaction → release/rollback → next waiter
+```
+
+The pool has:
+
+- **Maximum connections:** concurrent database sessions this process may hold.
+- **Minimum/idle connections:** warm capacity and resource cost.
+- **Acquire queue:** requests waiting for a slot; its age is user-visible latency.
+- **Acquire timeout:** bound on waiting before failure/degradation.
+- **Lifetime/idle limits:** recycle dead or stale connections, but avoid synchronized churn.
+- **Validation/reset:** ensure no open transaction, session setting, cursor, or tenant context leaks to the next borrower.
+
+Pool size is not the same as request concurrency or database throughput. A query that holds a connection for 50 ms can support about 20 operations/s per active connection in a simple no-queue model, but CPU, I/O, locks, and variability set the real limit. Measure active time and wait time; do not copy a vendor formula blindly.
+
+## How It Works
+
+When a service starts, it may establish a small number of sessions and grow to a cap. A handler acquires one, runs a bounded transaction, commits/rolls back, clears session state, and releases it. The connection remains open for reuse. If a handler leaks it or leaves it “idle in transaction,” the pool's effective capacity shrinks.
+
+There are two different multiplexing choices:
+
+- **Session pooling:** A client keeps one backend session while checked out; session variables, prepared statements, temporary tables, and transactions can be used, but the connection is occupied for the whole checkout.
+- **Transaction pooling:** A proxy returns a backend connection after each transaction, allowing many client sessions to share fewer servers. Session state and features that span transactions need special handling.
+
+A pooler does not make a long query short. It can reduce connection overhead and protect the database, but the service still needs query timeouts, cancellation, a bounded wait queue, and isolation between critical/background work.
+
+## Example
+
+An order API runs 20 instances. Each default pool has 20 connections, so 400 sessions can hit a primary configured for 100 active connections. During a traffic spike, all 400 queries contend; p99 rises, health checks time out, instances retry, and the database becomes less responsive. The naive answer—raise the pool to 50—amplifies the storm.
+
+The improvement measures database CPU/I/O, query hold time, lock waits, and useful concurrency. It sets a per-instance cap from a shared connection budget, for example 60 foreground slots plus reserved capacity for migrations/operations, then divides that budget across expected instances with headroom. The exact number is a testable hypothesis, not a universal rule. Pool acquisition has a 100 ms timeout; an order request returns a bounded overload response or queues elsewhere rather than waiting indefinitely. Background reports use a separate low-priority pool or replica.
+
+If autoscaling adds 10 instances, the pool budget is recalculated or enforced by a proxy; otherwise aggregate capacity silently jumps. A pooler can multiplex short transactions, but prepared/session state and transaction boundaries must be compatible. The new trade-off is that requests can fail at the pool boundary even while the database is technically up; that is intentional backpressure and should be included in the SLO/degradation story.
+
+## Visualization We Eventually Want
+
+Build a **connection-pool queue simulator**. Controls should include instance count, pool min/max, request rate, query hold-time distribution, database service capacity, connection setup cost, acquire timeout, leak probability, and autoscaling delay.
+
+Show checked-out/idle connections, pool waiters/age, database active sessions, CPU/I/O utilization, query p50/p99, rejected acquisitions, leaked/idle-in-transaction sessions, and retry volume. Presets should compare one oversized pool, a bounded shared budget, a leak, and transaction pooling. A text queue timeline must explain where a request waits. Include play/pause/step/reset, keyboard controls, and reduced motion.
+
+## Scaling Behavior
+
+With `I` application instances and pool cap `P`, the theoretical session ceiling is approximately `I × P`, before admin/replica pools and poolers. Database capacity is shared, so pool caps must be planned globally. More connections can improve throughput only until a CPU/I/O/lock bottleneck; after that they increase context switching and queueing.
+
+Track request concurrency separately from database concurrency. A slow dependency or query holds a connection longer, reducing effective capacity. During failover, stale connections may all fail at once; reconnect storms need jitter and a cap. Reserve capacity for health, migrations, and recovery or they can be starved by user traffic.
+
+## Failure Modes
+
+- **Pool exhaustion:** All slots are checked out; request latency grows in an invisible queue.
+- **Connection leak:** An exception skips release/rollback and permanently reduces capacity.
+- **Idle transaction:** A session holds locks/snapshots while doing no query, blocking cleanup or writers.
+- **Oversubscription:** Per-instance caps multiply beyond database memory/CPU capacity.
+- **Reconnect storm:** Database failover causes every instance to reconnect simultaneously.
+- **Pool starvation:** Long reports consume all slots needed by short correctness-critical requests.
+- **Stale session state:** Tenant/search path/isolation settings bleed across borrowers.
+- **Unbounded wait/retry:** Requests occupy worker threads while waiting, then retry and amplify load.
+
+Mitigate with `finally`-style release/rollback, acquire/query/transaction timeouts, leak and wait-age metrics, separate pools/priorities, jittered reconnects, session reset, and load tests with failure injection.
+
+## Trade-offs
+
+Pooling cuts connection setup and bounds database concurrency, but adds configuration, queue latency, failure behavior, and session-state hazards. Large pools reduce pool waits at low load but overload the database at high load. Small pools protect the database but can underuse capacity or increase application rejection. A proxy pooler improves multiplexing but adds another failure/observability boundary and feature constraints.
+
+## Alternatives
+
+- **One connection per request:** Simple but usually expensive and storm-prone; only consider at very low, controlled traffic.
+- **Direct bounded pool per instance:** Simple and transparent; requires global budget coordination.
+- **Transaction pooler:** Efficient for short stateless transactions; session features need care.
+- **Queue/worker with fixed concurrency:** Good for background writes; adds delay and asynchronous semantics.
+- **Read replica/separate workload pool:** Isolates reporting or stale-tolerant reads; does not solve primary write limits.
+
+## When to Use
+
+Use a pool for services that issue repeated database operations. Choose caps from measured service time, database capacity, instance count, and failure headroom; define acquire/query/transaction timeouts and overload behavior.
+
+## When Not to Use
+
+Do not create a large pool to mask slow queries, and do not share one unbounded pool between unrelated workloads. Do not use transaction pooling when application logic depends on session state without adapting it.
+
+## Common Misconceptions
+
+- **More connections mean more throughput.** After the bottleneck, they increase contention and queueing.
+- **Pool size is a per-service number.** Per-instance pools multiply with autoscaling.
+- **A healthy TCP connection is a healthy session.** It may be stuck, idle in transaction, or carrying leaked state.
+- **Poolers remove database limits.** They multiplex clients but backend CPU/I/O/locks remain.
+- **Timeouts only belong at the HTTP layer.** Acquire, query, transaction, and reconnect timeouts shape overload behavior.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I treat the pool as both connection reuse and a concurrency limiter. I budget total active database work across all instances, set a bounded acquire timeout, reset/release sessions safely, isolate background work, and monitor wait age, checked-out count, query hold time, and database saturation. Increasing pool size past database capacity amplifies contention; a pooler can multiplex short transactions but has session-state constraints.
+
+### When to Introduce It
+
+Introduce connection pools when a service has concurrent database traffic, autoscaling, or connection setup/limit pressure. Revisit the global budget whenever instance count or query latency changes.
+
+### Common Follow-Ups
+
+- How many instances and total connections can the database sustain?
+- What happens when the pool is empty?
+- How do you detect leaked/idle-in-transaction sessions?
+- Should reporting share the foreground pool?
+- What happens during database failover?
+
+### Common Candidate Mistakes
+
+- Multiplying a “reasonable” pool size by future autoscaling without a cap.
+- Ignoring wait queues and acquire timeout behavior.
+- Treating a pool as a fix for slow SQL.
+- Forgetting rollback/session reset on release.
+- Letting retries create reconnect or query storms.
+
+## Summary
+
+- A pool reuses sessions and bounds concurrency; it does not add database capacity.
+- Size globally across instances and workloads, with headroom and measured service time.
+- Acquire/query/transaction/reconnect timeouts and wait-age metrics make saturation visible.
+- Leaks, idle transactions, session state, failover reconnects, and background isolation need deliberate handling.
+
+## Quiz Seeds
+
+1. Why can 20 instances with pools of 20 overload a database capped at 100 useful active queries?
+2. What is the difference between pool wait latency and database query latency?
+3. Why should a request release/rollback a session in an exception path?
+4. When is transaction pooling preferable, and which session features become unsafe?
+5. How should pool budget change when autoscaling adds instances?
+6. Why can increasing a pool worsen p99 during a database slowdown?
+7. Which metrics identify a leak versus a slow query?
+8. What overload behavior should occur when acquire timeout expires?
+
+## Related Topics
+
+- [Concurrency control](concurrency-control.mdx)
+- [ACID and transactions](acid-and-transactions.mdx)
+- [Database indexes](database-indexes.mdx)
+- [Latency versus throughput](../01-foundations/latency-vs-throughput.mdx)
+
+## References
+
+### Documentation / Articles
+
+- [PostgreSQL: Connections and authentication](https://www.postgresql.org/docs/current/runtime-config-connection.html) — documents server connection limits, reserved capacity, and timeout settings that bound pool design.
+- [PgBouncer features](https://www.pgbouncer.org/features.html) — explains session, transaction, and statement pooling modes and their compatibility trade-offs.
+- [HikariCP: About pool sizing](https://github.com/brettwooldridge/HikariCP/wiki/About-Pool-Sizing) — provides a practical explanation of why smaller, measured pools can outperform oversized pools under contention.
+- [Amazon RDS Proxy](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/rds-proxy.html) — illustrates managed connection pooling/multiplexing and the operational boundary it adds.

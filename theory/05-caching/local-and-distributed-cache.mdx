@@ -1,0 +1,168 @@
+---
+type: lesson
+id: 05-02-local-and-distributed-cache
+slug: local-and-distributed-cache
+title: Local and Distributed Cache
+description: Choose cache placement by balancing lookup cost, copy coherence, capacity, and failure scope.
+module: caching
+order: 2
+difficulty: core
+estimatedMinutes: 30
+prerequisites:
+  - 05-01-why-cache
+  - 03-01-reverse-proxy-and-load-balancer
+  - 03-07-monolith-to-microservices
+tags:
+  - caching
+  - local-cache
+  - distributed-cache
+  - coherence
+  - failure-domains
+objectives:
+  - Compare process-local, node-local, and distributed cache placement for a shared service.
+  - Explain why local copies can be faster but harder to invalidate consistently.
+  - Identify network, capacity, failover, and noisy-neighbor costs of a distributed cache.
+  - Choose a placement or layered combination from workload and freshness requirements.
+relatedLessons:
+  - 05-01-why-cache
+  - 05-06-cache-invalidation
+  - 05-08-hot-keys
+  - 05-09-multi-layer-caching
+---
+
+# Local and Distributed Cache
+
+> Cache placement chooses which failure domain owns the copy: local memory is fast and private, while a distributed cache is shared and operationally remote.
+
+## Why This Exists
+
+Suppose six stateless API instances repeatedly read the same user profile. A process-local map gives each instance a fast copy, but it duplicates memory and lets the copies diverge. A distributed cache gives all instances one shared working set, but every hit crosses a network boundary and the cache becomes a dependency with its own capacity and failover behavior.
+
+The naive choice is “local is always faster” or “shared is always correct.” The improvement is to name the scope of reuse and the freshness promise. The new trade-off is that two layers can serve different versions at once; placement is therefore part of the consistency design, not only a latency optimization.
+
+## Mental Model
+
+```text
+client → API process → local cache → distributed cache → source
+```
+
+Each layer has a scope:
+
+| Placement | Reuse scope | Main advantage | Main cost |
+| --- | --- | --- | --- |
+| Process-local | One process | No network hop; simple lookup | Duplicated memory and per-process staleness |
+| Node-local | Processes on one host | Shared host capacity | Host failure and coordination boundary |
+| Distributed | Service or region | Shared working set and centralized policy | Network latency, cluster failure, hot shard |
+
+Local entries are hints owned by a process. A distributed cache is still usually disposable state, not automatically the source of truth.
+
+## How It Works
+
+On a local hit, the request avoids both network and distributed-cache load. On a local miss, the process can check the shared cache before querying the source. Invalidation must reach every local holder or local TTLs must bound staleness. A version number in the value or a namespace epoch lets a reader reject an older local entry even if an invalidation message was delayed.
+
+Distributed caches commonly partition keys across nodes. The client chooses a node, sends a lookup, and handles node failures, timeouts, retries, and topology changes. A cache cluster can increase capacity, but a key still belongs to one shard unless it is replicated or split. One process-local copy of a hot key may protect the shared cluster, while many uncoordinated copies can consume large memory.
+
+## Example
+
+For a public product description, use a short-lived local cache in each API process backed by a distributed cache. On a miss, read the distributed value; only one bounded loader should query the database. On a product update, publish an invalidation with product version `v=42`. A process that receives `v=41` or misses the event keeps a local TTL of 10 seconds, so the stale window is bounded, but checkout still validates the authoritative price.
+
+For per-user authorization decisions, a local cache can leak one tenant's decision if the key omits tenant and policy version. A distributed layer does not fix a bad key; it only shares the mistake more efficiently.
+
+## Visualization We Eventually Want
+
+Build a **Cache Placement Lab** with one to eight API processes and optional local/distributed layers. Controls should include request skew, local TTL, distributed TTL, invalidation delay/loss, cache-node latency, node failure, and value size. Show hit ratio per layer, network calls, duplicated memory, stale-version responses, shard load, and source QPS. A scenario toggle should compare a cold deploy, an invalidation outage, and a hot key.
+
+## Scaling Behavior
+
+Adding API processes multiplies local memory and warm-up traffic; a distributed cache amortizes the working set but may require more shards or replicas. Adding regions raises the question of whether the cache is regional, globally replicated, or rebuilt from a regional source. Local caches scale lookup throughput with application instances, while distributed caches concentrate traffic and simplify shared capacity accounting. Watch cache-node CPU, memory, network, evictions, p99 lookup latency, local invalidation lag, and source fallback rate.
+
+## Failure Modes
+
+- A process restart loses its local warm set and causes a miss burst.
+- A distributed-cache timeout makes every local miss slower; unbounded retries amplify load.
+- An invalidation message is delayed or dropped, leaving an old local value.
+- A cache cluster rebalances and a client briefly targets the wrong or unavailable shard.
+- A shared cache becomes a noisy neighbor for unrelated services.
+- A local cache key omits tenant, locale, authorization scope, or schema version.
+
+Mitigate with bounded timeouts, circuit breakers, versioned entries, namespace separation, capacity reservations, and explicit stale/fallback policy.
+
+## Trade-offs
+
+Local placement buys latency and isolates cache traffic but spends memory per process and makes invalidation fan-out hard. Distributed placement buys sharing and centralized eviction but pays network, serialization, and cluster operations. A two-level cache can reduce both costs for a hot set, but it creates more copies and more ordering edges. The correct answer often differs by data class rather than choosing one placement for the whole service.
+
+## Alternatives
+
+- **No cache plus read replicas:** good when freshness dominates and a replica can absorb reads.
+- **CDN or HTTP cache:** good for public, cacheable responses close to users.
+- **Embedded read model:** good for immutable or versioned reference data bundled with a release.
+- **Client-side cache with server invalidations:** good for long-lived clients and small, frequently reused data, at the cost of connection state.
+
+## When to Use
+
+Use local caching for tiny, read-heavy, low-risk values where per-process staleness is acceptable. Use a distributed cache when many instances need a shared working set, common invalidation, or centralized capacity. Layer them only when the second copy has a measurable purpose.
+
+## When Not to Use
+
+Do not use local caching for correctness-critical mutable state without a validation path. Do not centralize every value in one distributed cluster when isolation, tenant boundaries, or failure domains demand separate capacity. Avoid two layers when the coherence and operating cost exceed the saved source work.
+
+## Common Misconceptions
+
+- **Distributed means strongly consistent.** A shared cache can still be stale or lose writes.
+- **Local is free.** It consumes every process's memory and multiplies warm-up traffic.
+- **One invalidation event guarantees coherence.** Delivery, ordering, and process lifecycle can break that assumption.
+- **A cache cluster removes hot keys.** A single key can still map to one overloaded shard.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I choose local versus distributed placement from reuse scope, freshness, memory, and failure boundaries. Local cache hits are cheapest but copies diverge and duplicate memory. A distributed cache shares the working set and invalidation policy but adds network latency, shard/hot-key limits, and a cluster failure path. I often use a short local layer for hot, stale-tolerant values and keep an authoritative validation path for correctness-sensitive reads.
+
+### When to Introduce It
+
+Introduce placement after defining whether instances share keys, how much memory is available per process, and what stale window is acceptable.
+
+### Common Follow-Ups
+
+- How do local entries learn about writes?
+- What happens during a distributed-cache outage?
+- How are tenants and versions isolated?
+- Why not put everything in process memory?
+
+### Common Candidate Mistakes
+
+They describe a local map as globally shared, ignore invalidation fan-out, and assume a distributed cache is durable or strongly consistent.
+
+## Summary
+
+- Local caches minimize lookup cost but duplicate memory and coherence work.
+- Distributed caches share capacity but introduce network, shard, and cluster-failure costs.
+- Layering is useful only when each copy has a measurable role and a bounded freshness policy.
+- Key scope, versioning, and invalidation are correctness concerns at either placement.
+
+## Quiz Seeds
+
+1. Why can adding ten API instances increase source traffic even if each has the same local hit ratio?
+2. Which failure modes are unique or especially likely for a distributed cache?
+3. How would a version number prevent a delayed invalidation from overwriting a newer local value?
+4. Why might a two-level cache reduce distributed-cache traffic but worsen stale reads?
+5. Which placement fits immutable country-code metadata, and which fits a hot personalized feed page?
+6. What metrics reveal duplicated local memory versus a hot distributed shard?
+7. How should tenant identity appear in a local-cache key?
+
+## Related Topics
+
+- [Why cache](why-cache.mdx) defines the working-set and source-load problem.
+- [Cache invalidation](cache-invalidation.mdx) explains coherence and ordering strategies.
+- [Hot keys](hot-keys.mdx) covers skew that can overload one shard or local process.
+- [Multi-layer caching](multi-layer-caching.mdx) applies placement across browser, CDN, and service boundaries.
+
+## References
+
+### Documentation / Articles
+
+- [Client-side caching introduction](https://redis.io/docs/latest/develop/clients/client-side-caching/) — describes local copies, server-assisted invalidation, and the state cost of tracking readers.
+- [Client-side caching reference](https://redis.io/docs/latest/develop/reference/client-side-caching/) — explains invalidation messages and why cached clients must remove stale keys.
+- [Caching strategies for Memcached](https://docs.aws.amazon.com/AmazonElastiCache/latest/dg/Strategies.html) — provides a concrete distributed-cache integration and cache-aside flow.
+- [Reverse proxies and caches](https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/Caching) — gives the HTTP-layer analogue for shared and intermediary cache placement.

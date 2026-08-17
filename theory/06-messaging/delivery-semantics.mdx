@@ -1,0 +1,164 @@
+---
+type: lesson
+id: 06-06-delivery-semantics
+slug: delivery-semantics
+title: Delivery Semantics
+description: Reason from crash points to at-most-once, at-least-once, and scoped exactly-once guarantees without overstating end-to-end behavior.
+module: messaging
+order: 6
+difficulty: advanced
+estimatedMinutes: 40
+prerequisites:
+  - 06-02-message-queue-fundamentals
+  - 06-04-partitions-and-consumer-groups
+  - 06-05-ordering
+  - 01-10-consistency-models
+tags:
+  - delivery-semantics
+  - at-most-once
+  - at-least-once
+  - exactly-once
+  - crash-points
+objectives:
+  - Define at-most-once and at-least-once at a specific producer, broker, or consumer boundary.
+  - Trace loss and duplicate outcomes for publish, process, side effect, and acknowledgment crashes.
+  - Explain why broker-scoped exactly-once does not make an external database side effect exactly once.
+  - Design an end-to-end approach using idempotency, transactions, outbox, or reconciliation.
+relatedLessons:
+  - 06-07-idempotent-consumers
+  - 06-08-dead-letter-queues
+  - 03-08-service-boundaries
+  - 01-10-consistency-models
+---
+
+# Delivery Semantics
+
+> “Exactly once” is meaningful only with a scope and boundary; most end-to-end systems make durable delivery at least once and make side effects idempotent.
+
+## Why This Exists
+
+The naive worker acknowledges a message before doing work, avoiding duplicates but losing work when it crashes. Acknowledge after the side effect and work survives a crash, but a crash between side effect and acknowledgment causes redelivery. Asking for “exactly once” without naming the crash point hides this unavoidable gap.
+
+## Mental Model
+
+```text
+publish → broker durable? → deliver → process → side effect → ack/offset
+   A             B             C          D          E          F
+```
+
+- **At-most-once:** acknowledge/advance before processing; loss is possible, duplicate processing is avoided by this path.
+- **At-least-once:** acknowledge after processing; loss is reduced, duplicate delivery/processing is possible.
+- **Exactly-once:** one logical effect is observed once within a defined transactional boundary, often requiring broker transactions or a deduplication sink.
+
+Delivery is not the same as effect. A broker can deliver one message once while a database transaction, email provider, or payment processor observes a retry.
+
+## How It Works
+
+At each crash point ask what durable record exists. If publish confirmation is lost, a producer retry may create two messages. If the consumer crashes before the side effect, redelivery is harmless; after the side effect but before ack, redelivery repeats it. If the offset is committed before the database transaction commits, a crash can lose the effect; if after, duplicates are possible.
+
+Kafka transactions can atomically write Kafka records and offsets for supported read-process-write pipelines. A cloud subscription may offer exactly-once delivery within a region or subscription under documented conditions. Neither automatically wraps an arbitrary external payment API and database transaction. End-to-end “effectively once” usually means at-least-once transport plus a stable event ID and an atomic/idempotent sink.
+
+## Example
+
+An order event triggers an email and a billing record. The consumer writes an inbox row with unique `event_id`, applies the billing transaction, then acknowledges. A crash after commit but before ack redelivers; the unique row makes the retry a no-op. Email is sent through a provider with its own idempotency key or an outbox worker. The broker guarantee is at-least-once; the business effect is designed to be effectively once.
+
+The naive claim “Kafka exactly once means one email” is false because Kafka cannot roll back the email provider. The improvement scopes transactions and adds deduplication at the effect boundary. The new trade-off is retained idempotency state, provider support, and a reconciliation process for ambiguous external outcomes.
+
+## Visualization We Eventually Want
+
+Build a **Crash-Point Delivery Lab** with toggles at publish, broker persist, consumer process, side effect, and acknowledgment. Let learners choose ack-before/after, transactional sink, dedup table, and retry policy. Show lost messages, duplicate deliveries, duplicate effects, committed offsets, and which boundary's guarantee is being claimed. Include a broker-only transaction preset and an external API preset.
+
+## Scaling Behavior
+
+Deduplication tables, inboxes, and idempotency keys grow with retention and event volume. Exactly-once transactions can reduce throughput or increase coordination/commit latency. At-least-once retries increase traffic under failure and need backoff and DLQs. Replay requires deterministic or idempotent effects and enough event retention.
+
+## Failure Modes
+
+- Producer retries after an ambiguous publish result.
+- Consumer side effect succeeds but acknowledgment fails.
+- Offset commit races database commit.
+- Transaction times out while an external call already happened.
+- Dedup record expires before a late replay.
+- A “successful” provider call has unknown outcome after network loss.
+
+Use stable IDs, atomic inbox/effect transactions where possible, provider idempotency keys, reconciliation, bounded replay windows, and clear operator handling for unknown outcomes.
+
+## Trade-offs
+
+At-most-once minimizes duplicate work but can lose messages. At-least-once preserves work but pushes duplicate handling to consumers. Scoped exactly-once improves consistency inside a broker/sink transaction but adds latency, transaction timeouts, and limits the set of included systems. End-to-end correctness usually costs storage, idempotency, and reconciliation rather than a magic broker setting.
+
+## Alternatives
+
+- **At-most-once + compensating scan:** acceptable for non-critical analytics where loss is cheaper than duplicate cost.
+- **At-least-once + idempotent consumer:** strong general-purpose default.
+- **Transactional outbox/inbox:** couples local state and event/effect atomically.
+- **Synchronous two-phase transaction:** possible for tightly controlled resources, but high coordination and availability cost.
+
+## When to Use
+
+Use at-least-once plus idempotency for payments, notifications, and state changes. Use broker transactions for a pipeline wholly inside that broker ecosystem. Use at-most-once only when loss is acceptable and observable.
+
+## When Not to Use
+
+Do not claim global exactly-once across an arbitrary database and external service. Do not use at-most-once for financial or audit events without an independent recovery path.
+
+## Common Misconceptions
+
+- **Exactly once delivery equals exactly once side effect.** The sink boundary matters.
+- **Acknowledgment means processing cannot repeat.** Acknowledgment can be lost or race a crash.
+- **At-least-once means every effect duplicates.** Idempotent consumers make repeats safe.
+- **Transactions remove timeouts.** A transaction can time out after an external system acted.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I draw the crash points from publish through side effect and acknowledgment, then state the guarantee at each boundary. At-most-once can lose work; at-least-once can redeliver, so consumers use event IDs and idempotent or transactional effects. Exactly-once is usually scoped to a broker and sink transaction, not an arbitrary external API. For end-to-end correctness I add outbox/inbox, provider idempotency, and reconciliation for ambiguous outcomes.
+
+### When to Introduce It
+
+Introduce delivery semantics whenever a design has retries, durable queues, offsets, payments, notifications, or user-visible side effects.
+
+### Common Follow-Ups
+
+- What if the crash occurs after the side effect but before ack?
+- Where is the idempotency key stored?
+- Is exactly-once broker-scoped or end-to-end?
+- How do you reconcile an unknown external outcome?
+
+### Common Candidate Mistakes
+
+They state “exactly once” as a product feature without drawing crash points or the external side-effect boundary.
+
+## Summary
+
+- Delivery guarantees need a named boundary and crash-point analysis.
+- Ack-before-work risks loss; ack-after-work permits duplicates.
+- End-to-end effectively-once effects use stable IDs, idempotency, local transactions, and reconciliation.
+- Scoped exactly-once transactions do not magically include external systems.
+
+## Quiz Seeds
+
+1. Which crash point creates a duplicate side effect under at-least-once processing?
+2. Why can a producer retry create two messages after an ambiguous confirmation?
+3. What does a unique inbox row protect?
+4. What is the difference between Kafka exactly-once processing and one email exactly once?
+5. When is at-most-once acceptable?
+6. Why must deduplication retention cover the replay/duplicate window?
+7. What should an operator do with an external payment call whose outcome is unknown?
+
+## Related Topics
+
+- [Idempotent consumers](idempotent-consumers.mdx) implements duplicate-safe effects.
+- [Dead-letter queues](dead-letter-queues.mdx) bounds retry-exhausted failures.
+- [Service boundaries](../03-traffic-and-services/service-boundaries.mdx) explains why source ownership and event publication boundaries must be explicit.
+- [Consistency models](../01-foundations/consistency-models.mdx) frames visibility and guarantees.
+
+## References
+
+### Documentation / Articles
+
+- [Apache Kafka design](https://kafka.apache.org/42/design/design/) — defines at-most-once, at-least-once, and exactly-once and warns that claims depend on scope.
+- [Google Pub/Sub exactly-once delivery](https://docs.cloud.google.com/pubsub/docs/exactly-once-delivery) — documents a scoped exactly-once delivery feature and its acknowledgment conditions.
+- [RabbitMQ reliability guide](https://www.rabbitmq.com/docs/reliability) — explains why acknowledgments provide at-least-once delivery and redelivery after connection loss.
+- [Amazon SQS visibility timeout](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-visibility-timeout.html) — documents standard-queue at-least-once behavior and duplicate delivery caveats.

@@ -1,0 +1,199 @@
+---
+type: lesson
+id: 04-04-acid-and-transactions
+slug: acid-and-transactions
+title: ACID and Transactions
+description: Use transaction boundaries and ACID guarantees to keep related state correct through concurrency and crashes.
+module: databases
+order: 4
+difficulty: core
+estimatedMinutes: 35
+prerequisites:
+  - 04-01-data-modeling-from-access-patterns
+  - 04-02-sql-vs-nosql
+  - 01-07-durability
+  - 01-10-consistency-models
+tags:
+  - acid
+  - transactions
+  - atomicity
+  - durability
+  - invariants
+objectives:
+  - Explain atomicity, consistency, isolation, and durability as distinct properties with distinct failure boundaries.
+  - Choose a transaction scope that protects an invariant without holding locks or snapshots across user think time.
+  - Distinguish a local database transaction from a distributed workflow or multi-service transaction.
+  - Describe commit, rollback, write-ahead logging, retries, and the limits of a successful commit.
+relatedLessons:
+  - 04-05-transaction-isolation
+  - 04-14-concurrency-control
+  - 04-08-replication
+  - 01-07-durability
+---
+
+# ACID and Transactions
+
+> A transaction is a deliberate boundary around a set of state changes whose invariants must survive concurrency and failure.
+
+## Why This Exists
+
+Suppose a wallet transfer debits Alice and credits Bob. The naive design sends two independent updates. A process crash between them creates money from nowhere or destroys it. Concurrent transfers can also observe an intermediate balance, and a successful response can be lost if the client times out before learning whether the commit happened.
+
+A transaction groups the changes so other transactions observe an all-or-nothing outcome. It does not make every operation globally safe, does not cross service boundaries automatically, and does not replace idempotency or backups. Its value comes from choosing the narrowest boundary that protects a stated invariant.
+
+## Mental Model
+
+| Property | Practical question | What it does not promise |
+| --- | --- | --- |
+| Atomicity | Are all changes applied, or none? | A retry is duplicate-safe, or an external side effect is undone |
+| Consistency | Does a committed state satisfy declared invariants/constraints? | The database knows every business rule unless encoded or checked |
+| Isolation | What can concurrent transactions observe or change? | No contention, deadlocks, or serialization retries |
+| Durability | After acknowledgment, can a crash lose the commit? | Backups, region survival, or protection from operator error |
+
+“Consistency” in ACID means transition from one valid database state to another under constraints; it is not the same phrase as a distributed system's read consistency model. Always name the exact guarantee and scope.
+
+## How It Works
+
+A typical transaction lifecycle is:
+
+```text
+begin → read/check → write → prepare commit → durable log flush → commit visible
+  └────────────── failure ────────────────→ rollback / recovery
+```
+
+The database tracks the transaction's changes and concurrency metadata. With write-ahead logging (WAL), log records describing changes are flushed before data pages, so crash recovery can redo committed changes and discard incomplete ones. The exact visibility and lock behavior depends on the isolation level; see [transaction isolation](transaction-isolation.mdx).
+
+Keep transactions short and deterministic. Put validation and the writes that protect the invariant inside the boundary, but not network calls, user input, sleeps, or a payment provider call. If an external call must participate, record an intent in the local transaction and use an idempotent workflow/reconciliation step rather than pretending a database commit can atomically control the provider.
+
+## Example
+
+For a wallet transfer, define the invariant: **the sum of all wallet balances plus held funds is conserved, and a transfer is applied at most once for its idempotency key.** A relational implementation can:
+
+```sql
+BEGIN;
+
+-- Lock or otherwise serialize the two wallet rows in a stable order.
+UPDATE wallets SET balance = balance - 100
+WHERE wallet_id = 'alice' AND balance >= 100;
+
+-- Verify one row changed, then insert a unique transfer idempotency key.
+INSERT INTO transfers (idempotency_key, source_id, destination_id, amount)
+VALUES ('client-7f', 'alice', 'bob', 100);
+
+UPDATE wallets SET balance = balance + 100 WHERE wallet_id = 'bob';
+COMMIT;
+```
+
+The naive two-request version fails on a crash and on duplicate client retries. The improved transaction protects local rows and a unique key. The new trade-off is contention: hot wallets serialize, deadlocks are possible if lock order differs, and a client may need to retry a serialization/deadlock failure. If a payment processor is also involved, the transaction cannot roll back money already captured; model states such as `authorized`, `captured`, `refund_pending`, and a reconciliation job instead.
+
+Atomicity also has a scope. A database transaction can cover several tables in one database, but not arbitrary queues, caches, email sends, or another service unless a distributed transaction protocol is deliberately used. Even a distributed transaction adds coordinator, timeout, recovery, and availability costs; it is not “ACID across the internet for free.”
+
+## Visualization We Eventually Want
+
+Build a **transaction timeline simulator** for the wallet transfer. Let learners interleave two transfers, crash at any step, change isolation, vary lock order, and retry a timed-out client request. Show committed versions, locks, WAL records, visible snapshots, idempotency rows, and external-provider states.
+
+Metrics should include invariant violations, lock wait time, deadlocks, abort/retry rate, commit latency, WAL bytes, and unresolved external intents. Presets should compare two independent updates, one local transaction, and a local intent plus reconciliation workflow. The event log must state that durability is local to the configured store and does not imply backup or multi-region survival.
+
+## Scaling Behavior
+
+Transaction cost grows with rows touched, indexes maintained, log volume, lock/snapshot lifetime, and contention—not just statement count. Larger transactions hold resources longer and make retries more expensive. At higher write rates, a hot account or counter can become a serialization point even with many database nodes.
+
+Partitioning can improve scale only when the transaction boundary remains local. If a transfer crosses shards, choose an explicit distributed protocol, a workflow with compensating actions, or a data ownership change. Measure commit latency, lock waits, active transactions, WAL/redo throughput, aborts, and replica apply lag.
+
+## Failure Modes
+
+- **Crash before commit:** Changes must be rolled back or absent after recovery.
+- **Client timeout after commit:** A retry can duplicate the effect unless an idempotency key/unique constraint returns the original outcome.
+- **Deadlock:** Two transactions acquire locks in different orders; the database aborts one and the application retries the whole transaction safely.
+- **Long transaction:** User think time or a network call holds locks/snapshots, causing queueing and bloat.
+- **External side effect split:** Database commit succeeds but email/payment/queue publish fails; use an intent/outbox-style workflow and reconciliation.
+- **Replica/read confusion:** A write commits on the primary but a lagging read replica does not show it immediately.
+- **False durability:** A commit reaches one durable device but backups or another region are not current.
+
+## Trade-offs
+
+Transactions simplify invariants and recovery reasoning but consume locks, memory, log bandwidth, and concurrency. Stronger isolation can prevent anomalies at the cost of blocking or abort/retry work. Distributed transactions can preserve atomic semantics across participants but add coordination and failure states. Workflows and compensations improve decoupling and availability but expose intermediate states and require idempotency/reconciliation.
+
+## Alternatives
+
+- **Single-statement conditional update:** Best for a one-row invariant such as decrement-if-positive.
+- **Local transaction plus outbox/intent:** Best when durable local state must trigger asynchronous external work.
+- **Saga/workflow:** Best for multi-service steps with explicit compensation rather than one atomic commit.
+- **Event-sourced append:** Best when an immutable history and deterministic projections matter; it still needs concurrency/version rules.
+- **Distributed transaction/2PC:** Consider only when participants and availability/latency costs are acceptable and recovery is operable.
+
+## When to Use
+
+Use a transaction when multiple changes must obey one invariant and share a manageable authority. Define the boundary, isolation, retry condition, timeout, and idempotency behavior before writing the SQL or API call.
+
+## When Not to Use
+
+Do not wrap unrelated reads, network calls, or long workflows in one transaction. Do not use a transaction to hide an ownership boundary or to claim exactly-once behavior for an external effect. A successful database commit is not evidence that a client saw the response or that every derived system has updated.
+
+## Common Misconceptions
+
+- **ACID means globally consistent across services.** It usually describes one engine and an explicit transaction scope.
+- **Durability means backups and disaster recovery.** WAL/commit durability and restore/region objectives are separate.
+- **Atomicity means retries are safe.** A retry after an unknown outcome needs idempotency.
+- **Serializable means no failures.** It may abort transactions and requires a bounded, correct retry loop.
+- **One huge transaction is safer.** It may increase contention, lock duration, log usage, and blast radius.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I use a transaction to protect a named invariant across a bounded set of changes. Atomicity gives all-or-nothing visibility, constraints define valid committed states, isolation controls concurrent observations, and durability covers crash recovery after commit. I keep the transaction local and short, make retries idempotent, and use an intent/workflow with reconciliation for external services rather than claiming a database transaction is distributed exactly-once.
+
+### When to Introduce It
+
+Introduce transactions when a requirement says “never oversell,” “debit and credit together,” “unique once,” or “all fields change together.” Name what can remain eventually consistent.
+
+### Common Follow-Ups
+
+- Which rows/tables are in the transaction?
+- What isolation level and lock order are needed?
+- What happens when the client retries after a timeout?
+- What if the external payment or queue call fails?
+- What does a committed write mean for replicas/backups?
+
+### Common Candidate Mistakes
+
+- Calling two service requests a transaction without a protocol.
+- Holding a transaction open across a remote call.
+- Forgetting deadlock/serialization retries and idempotency.
+- Treating a cache, search index, or email as atomically committed.
+- Confusing ACID consistency with distributed read consistency.
+
+## Summary
+
+- ACID properties answer different failure/concurrency questions and have a defined scope.
+- Choose the smallest transaction that protects a local invariant; keep it short and retryable.
+- WAL and commit acknowledgment support crash recovery, not backups or global durability.
+- External side effects need intents, idempotency, and reconciliation or an explicitly chosen distributed protocol.
+
+## Quiz Seeds
+
+1. Which ACID property prevents a debit without its matching credit, and which property handles a crash after acknowledgment?
+2. Why does a client timeout require an idempotency key even if the transaction is atomic?
+3. What should happen if a payment provider call occurs inside a database transaction and the provider times out?
+4. How can stable lock ordering reduce deadlocks?
+5. Why can partitioning make a previously local transaction harder?
+6. What does WAL let recovery do, and what does it not say about backups?
+7. Compare a local intent/outbox workflow with a distributed 2PC transaction.
+8. Which metrics reveal that transaction contention, not raw CPU, is the bottleneck?
+
+## Related Topics
+
+- [Transaction isolation](transaction-isolation.mdx)
+- [Replication](replication.mdx)
+- [Concurrency control](concurrency-control.mdx)
+- [Durability](../01-foundations/durability.mdx)
+
+## References
+
+### Documentation / Articles
+
+- [PostgreSQL: Transactions](https://www.postgresql.org/docs/current/tutorial-transactions.html) — defines all-or-nothing visibility, commit/rollback, and the scope of a transaction block.
+- [PostgreSQL: Write-Ahead Logging](https://www.postgresql.org/docs/current/wal-intro.html) — explains log-before-data ordering, crash redo, and why WAL reduces commit I/O.
+- [SQLite: Atomic commit](https://sqlite.org/atomiccommit.html) — gives a concrete engine-level walkthrough of atomic commit and rollback under crashes.
+- [PostgreSQL: Transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html) — connects transaction boundaries to snapshots, locks, serialization failures, and retries.

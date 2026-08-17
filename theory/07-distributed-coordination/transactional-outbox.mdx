@@ -1,0 +1,185 @@
+---
+type: lesson
+id: 07-08-transactional-outbox
+slug: transactional-outbox
+title: Transactional Outbox
+description: Atomically persist a business change and the intent to publish its event, then relay it with duplicate-safe consumers.
+module: distributed-coordination
+order: 8
+difficulty: advanced
+estimatedMinutes: 30
+prerequisites:
+  - 07-07-saga-pattern
+  - 01-10-consistency-models
+  - 03-08-service-boundaries
+tags:
+  - transactional-outbox
+  - dual-write
+  - event-publication
+  - idempotency
+  - relay
+objectives:
+  - Explain the database/event dual-write gap and why changing operation order only moves the failure.
+  - Design an outbox row written in the same local transaction as the business state.
+  - Describe relay retries, at-least-once publication, ordering, cleanup, and idempotent consumers.
+  - Identify when CDC, a broker transaction, or a simpler synchronous call is a better fit.
+relatedLessons:
+  - 07-09-change-data-capture
+  - 07-07-saga-pattern
+  - 07-10-event-sourcing-and-cqrs
+---
+
+# Transactional Outbox
+
+> The outbox makes “state changed” and “event should be published” one local commit; it does not make the relay or consumer exactly once.
+
+## Why This Exists
+
+An order service writes a row and then publishes `OrderCreated`:
+
+```text
+BEGIN → insert order → COMMIT → publish event
+```
+
+If the process crashes after commit, downstream inventory never hears about the order. Reverse the order and a crash after publish but before commit creates an event for a state that does not exist. A distributed transaction between the database and broker may be unavailable or too expensive.
+
+The transactional outbox stores the event intent in the same database transaction as the business change. A separate relay publishes committed outbox rows. This closes the dual-write gap while accepting eventual delivery, duplicates, relay lag, and cleanup complexity.
+
+## Mental Model
+
+```text
+local DB transaction
+  ├─ orders(id=123, status=PENDING)
+  └─ outbox(id=e1, type=OrderCreated, aggregate=123, status=READY)
+
+relay → broker → idempotent consumer
+             ↘ retry / dead-letter / observability
+```
+
+The database is authoritative for whether the change and intent exist. The broker is authoritative for delivery after relay success. A consumer must treat the event as at-least-once because the relay can publish successfully and crash before marking the row sent.
+
+## How It Works
+
+1. The service validates the command.
+2. In one local transaction, it changes business tables and inserts an outbox row with event ID, aggregate ID, version/sequence, payload/schema version, and created time.
+3. Commit makes both durable or neither visible.
+4. A relay polls rows or reads the database log, publishes to the broker, and records a sent/attempt state or advances an offset.
+5. If publication or acknowledgement is uncertain, the relay retries the same event ID.
+6. Consumers deduplicate by event ID or aggregate version before applying a side effect.
+
+Marking a row sent is itself not atomically coupled to broker publication in the usual design. That is why a duplicate is normal. Do not delete rows immediately after one publish; retain enough history for retries, auditing, lag measurement, and replay, then archive with a policy.
+
+Ordering is scoped. A relay can preserve order per aggregate by sequence number, but parallel relays may publish different aggregates concurrently. Consumers should reject or park a version gap rather than apply version 5 before version 4 if per-aggregate order matters.
+
+## Example
+
+When `POST /orders` succeeds, the Order service commits `orders(123, PENDING)` and outbox event `e1`. The relay publishes `e1` to `orders.events`. Inventory consumes it and records `processed_event(e1)` in the same transaction as its reservation. If the consumer crashes after reserving but before recording the event, it retries; the reservation uses idempotency key `e1` or a unique constraint so inventory is not decremented twice.
+
+If the relay publishes `e1` and crashes before marking the row sent, a duplicate reaches inventory. That duplicate is expected, not evidence that the outbox failed. If the database commit rolls back, no committed outbox row exists and no event should be published. If a relay is down, the order remains visible but downstream state lags; APIs should expose `PENDING`/processing state when that matters.
+
+## Visualization We Eventually Want
+
+Show the order database, outbox table, relay, broker, and consumer. Controls should crash at each boundary (before commit, after commit, after publish, before sent-mark), delay relay polling, duplicate delivery, reorder unrelated aggregates, and fail the consumer. Metrics should show committed orders, outbox depth/age, publish attempts, duplicate events, consumer lag, and final business state. Compare naive dual-write and outbox paths in the same timeline.
+
+## Scaling Behavior
+
+Outbox writes add a row and index to every business transaction; partition or index by status/created time and aggregate ID. Relay throughput must match event creation rate or backlog grows. Multiple relays need claim/lease semantics and should avoid locking the business tables for long. CDC can stream the committed log more efficiently than polling at high volume, but adds operational coupling to database log retention and schema.
+
+Large payloads inflate the primary database; store immutable event payloads or references according to recovery needs. Retention/archival and backfill require a clear contract so cleanup does not remove events still needed by slow consumers.
+
+## Failure Modes
+
+- **Outbox insert omitted:** the code path can still produce an unsafe dual write; enforce transaction boundaries and tests.
+- **Relay duplicate:** consumer idempotency and event IDs make repeat safe.
+- **Relay lag:** downstream views/workflows are stale; monitor age, not just count.
+- **Poison event:** retry limits and a repair/DLQ path are needed; do not silently skip a business event.
+- **Ordering gap:** consumer must wait/park or use commutative updates.
+- **Schema change:** version payloads and support old consumers during rollout.
+- **Cleanup race:** deleting a row before all required consumers have processed it loses replay ability.
+- **Database outage:** both business changes and outbox writes fail together; the system should fail clearly rather than publish partial intent.
+
+## Trade-offs
+
+Outbox provides strong local atomicity and simple recovery, but adds storage, relay code, lag, duplicates, and retention work. Polling is portable and easy to reason about but adds query load and latency. CDC reduces polling but depends on log decoding/connector operations. A broker-native transaction may simplify producer atomicity for broker state but does not automatically atomically update an external database.
+
+## Alternatives
+
+- **CDC from the database log:** prefer when many tables/events need high-throughput propagation and log infrastructure is available.
+- **Broker transaction plus database integration:** prefer only when both systems share a well-defined transaction boundary.
+- **Event sourcing:** prefer when the event log is the primary state model, not merely publication intent.
+- **Synchronous downstream call:** prefer for a truly user-critical action that can tolerate coupled availability, but still design idempotency.
+- **Periodic reconciliation:** use as a safety net, not as the only fix for a known dual-write gap.
+
+## When to Use
+
+Use the outbox when a local database mutation must reliably trigger asynchronous work, notifications, indexing, or a saga step, and the database and broker cannot participate in one transaction. Pair it with idempotent consumers and outbox lag/age metrics.
+
+## When Not to Use
+
+Do not use an outbox for every internal function call or when no downstream event exists. Do not promise zero duplicates. Avoid putting megabyte blobs in a hot transactional table if a durable object reference is sufficient.
+
+## Common Misconceptions
+
+- **“Outbox gives exactly-once delivery.”** It gives atomic intent plus usually at-least-once publication.
+- **“Mark sent after publish is safe.”** A crash between publish and mark causes a duplicate; that is expected.
+- **“CDC and outbox are identical.”** CDC observes database changes; an outbox explicitly models public event intent.
+- **“One global ordering exists.”** Ordering needs an aggregate/partition scope.
+- **“Deleting sent rows immediately is harmless.”** Slow consumers and replay/reconciliation may still need them.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> The dual-write problem is a crash gap between committing a database row and publishing its event. I write the business change and an outbox event in one local transaction, then a relay publishes committed rows. Publication is at least once because a relay can crash after publish, so event IDs, idempotent consumers, per-aggregate ordering, lag monitoring, and retention are required.
+
+### When to Introduce It
+
+Introduce outbox when a service must emit an event after a database change and the design currently shows two independent writes. Draw the crash window first, then the local transaction and relay.
+
+### Common Follow-Ups
+
+- How do you handle relay duplicates and ordering?
+- Polling or CDC—which one and why?
+- What happens if the outbox grows faster than the relay?
+- How does a consumer know it can safely apply an event twice?
+
+### Common Candidate Mistakes
+
+- Claiming the outbox solves consumer exactly once.
+- Omitting outbox indexes, cleanup, and lag metrics.
+- Publishing uncommitted rows or skipping failed/poison events silently.
+- Using one global sequence when only per-aggregate ordering is required.
+
+## Summary
+
+The outbox moves the atomic boundary to the local database: business state and event intent commit together. A relay turns intent into at-least-once publication; consumers, ordering, retention, and monitoring complete the design.
+
+## Quiz Seeds
+
+1. Which crash window does the outbox close?
+2. Why can an event be delivered twice after a successful publish?
+3. What should a consumer store to make processing idempotent?
+4. Why is outbox age a more useful alert than row count alone?
+5. When might CDC be preferable to polling?
+6. How would you preserve order for one order while scaling relays across many orders?
+7. Why is a broker transaction not automatically a database transaction?
+
+## Related Topics
+
+- [Saga Pattern](./saga-pattern.mdx)
+- [Change Data Capture](./change-data-capture.mdx)
+- [Event Sourcing and CQRS](./event-sourcing-and-cqrs.mdx)
+- [Delivery semantics and idempotent consumers](../06-messaging/README.md)
+
+## References
+
+### Documentation / Articles
+
+- [Transactional outbox pattern](https://docs.aws.amazon.com/prescriptive-guidance/latest/cloud-design-patterns/transactional-outbox.html) — AWS explains the dual-write failure, relay, duplicates, ordering, and idempotent consumers.
+- [Outbox Event Router](https://debezium.io/documentation/reference/stable/transformations/outbox-event-router.html) — Debezium documents routing outbox rows into broker events through CDC.
+- [Pattern: Transactional Outbox](https://microservices.io/patterns/data/transactional-outbox.html) — a canonical pattern description with relay duplicate and ordering caveats.
+- [Data Processing Pipelines](https://sre.google/sre-book/data-processing-pipelines/) — Google SRE context for durable processing, retries, and operational correctness.
+
+### Papers
+
+- [Time, Clocks, and the Ordering of Events in a Distributed System](https://lamport.azurewebsites.net/pubs/time-clocks.pdf) — useful background for the causal/order metadata often carried by outbox events.

@@ -1,0 +1,184 @@
+---
+type: lesson
+id: 08-09-backups-rpo-rto
+slug: backups-rpo-rto
+title: Backups, RPO, RTO, and Restore Validation
+description: Turn acceptable data loss and downtime into backup cadence, restore capacity, and measurable recovery tests.
+module: reliability
+order: 9
+difficulty: core
+estimatedMinutes: 30
+prerequisites:
+  - 08-08-disaster-recovery
+  - 01-07-durability
+  - 01-05-availability
+tags:
+  - backups
+  - rpo
+  - rto
+  - point-in-time-recovery
+  - restore-testing
+objectives:
+  - Define RPO as tolerated data loss and RTO as tolerated recovery time for a workload.
+  - Compare full, incremental, snapshot, continuous-log, and replicated recovery points.
+  - Design restore validation for data integrity, dependencies, and actual elapsed recovery time.
+  - Identify how backup cadence, retention, encryption, isolation, and restore bandwidth shape cost and risk.
+relatedLessons:
+  - 08-08-disaster-recovery
+  - 08-10-multi-region-and-region-failover
+  - 01-07-durability
+---
+
+# Backups, RPO, RTO, and Restore Validation
+
+> A backup protects only what can be restored, within the stated data-loss and downtime targets, and verified by a repeatable procedure.
+
+## Why This Exists
+
+“We have daily snapshots” sounds reassuring until a database is corrupted six hours before the last snapshot, the restore takes twelve hours, or the backup role cannot decrypt the data. The naive design measures backup success, not recovery success. A reliable plan starts with business objectives and tests the actual restore path.
+
+**Recovery Point Objective (RPO)** is the maximum acceptable amount of data/time that may be lost after a failure. **Recovery Time Objective (RTO)** is the maximum acceptable time until the service is usable at the agreed level. They differ by workload: a recommendation index may rebuild with high RPO, while a ledger may need near-zero loss and strict integrity.
+
+## Mental Model
+
+```text
+failure at F
+      ← RPO window → last acceptable recovery point
+      └──────────── data potentially lost
+recovery begins ──────── RTO window ─────── service acceptable
+```
+
+Backup mechanisms create recovery points:
+
+- full/snapshot copies,
+- incremental/differential backups,
+- continuous log/WAL/binlog capture for point-in-time restore,
+- asynchronous replicas or cross-region copies,
+- immutable/offline copies for corruption/ransomware scenarios.
+
+A replica is not automatically a backup: corruption or deletion can replicate. A backup is not automatically a recovery point for all dependencies: schema, keys, configuration, and external state need coverage.
+
+## How It Works
+
+1. Classify data and define RPO/RTO with product/operations owners.
+2. Choose recovery points, retention, geographic/isolation boundary, encryption/key access, and deletion protection.
+3. Capture data plus metadata needed for restore: schema version, migrations, indexes, tenant mapping, event offsets, and secrets process.
+4. Monitor backup freshness, job success, size, and coverage; alert on age beyond RPO.
+5. Periodically restore into an isolated environment using the production runbook.
+6. Validate checksums/counts/referential integrity, sample business queries, permissions, application compatibility, and data loss against the target.
+7. Measure restore + replay + warmup + traffic shift against RTO. Fix gaps and repeat after changes.
+
+If the restore takes longer than RTO, increasing backup frequency may not help; warm capacity, parallel restore, incremental logs, or a different topology may be needed. If RPO is too wide, add more frequent snapshots or continuous log replication—but state the cost and partition behavior.
+
+## Example
+
+An order ledger has RPO 5 minutes and RTO 30 minutes. Daily snapshots fail the RPO. Use a weekly full plus incremental snapshots and continuous WAL archive, with immutable cross-region copies. A quarterly drill restores to a clean account, replays logs to within 2 minutes of failure, validates balances and idempotency records, starts the application, and measures 24 minutes to accept read traffic and 31 minutes to accept writes—an RTO miss that requires parallel restore or warm standby.
+
+An analytics index has RPO 24 hours/RTO 8 hours; nightly export and rebuild may be cheaper. Its backup need not preserve every ephemeral cache entry, but the source data and schema must be recoverable.
+
+## Visualization We Eventually Want
+
+Show a timeline of writes, recovery points, failure, restore, log replay, validation, and service return. Controls should set backup cadence, log lag, retention, restore bandwidth, dataset size, RPO/RTO, corruption scope, and validation duration. Display data loss, elapsed recovery time, restored record checks, checksum/integrity result, and target pass/fail. Presets should compare “backup exists” versus “restore tested” and show a replica that copied corruption.
+
+## Scaling Behavior
+
+Backup volume and restore time grow with data size, retention, encryption, compression, and cross-region transfer. Restore bandwidth often dominates RTO. Parallel restore improves time but consumes compute/storage/network and may create hotspots. Multi-tenant systems need tenant-level recovery/consistency rules and must avoid restoring one tenant's data into another's scope.
+
+More frequent recovery points reduce RPO but increase write/log/storage cost. Immutable copies and isolated credentials add operational complexity but protect against deletion or compromised production identities. Retention must balance compliance, storage cost, and privacy deletion obligations.
+
+## Failure Modes
+
+- **Silent backup corruption:** job succeeds but bytes/data cannot be read.
+- **Wrong point in time:** restored copy is older/newer than the stated RPO or includes corrupted writes.
+- **Restore dependency gap:** keys, schema, IAM, network, or feature flags are missing.
+- **RTO miss:** restore/replay/warmup is slower than assumed.
+- **Replicated corruption:** replicas and snapshots capture the same bad write.
+- **Credential coupling:** production key/account is required to decrypt recovery copies.
+- **Unvalidated success:** operators restore a resource but never query/check real records.
+- **Unsafe cutover:** recovered data is served before integrity and ownership are verified.
+
+## Trade-offs
+
+Frequent/continuous recovery points reduce data loss but cost storage, log bandwidth, and operational coupling. Immutable/offline copies improve corruption protection but slow recovery. Warm standby lowers RTO at ongoing cost; restore-on-demand is cheaper but less predictable. Deep validation increases drill time but exposes failures before the incident.
+
+## Alternatives
+
+- **Synchronous replication:** lower RPO but may reduce write availability/latency during partition.
+- **Asynchronous replica:** fast failover with nonzero lag and corruption propagation risk.
+- **Event log rebuild:** suitable for derived projections when the source event history is durable.
+- **Recompute from source-of-truth:** economical for caches/indexes with relaxed RPO.
+- **Active/active:** reduces service downtime but still needs backups for corruption and historical recovery.
+
+## When to Use
+
+Define RPO/RTO for every durable data class and verify with restore drills. Choose backup frequency, log capture, retention, isolation, and restore capacity from the target—not from a generic “daily backup” checklist.
+
+## When Not to Use
+
+Do not claim an RPO/RTO without measuring actual recovery. Do not rely solely on replicas for corruption recovery. Do not store backup keys/credentials only in the failed production plane.
+
+## Common Misconceptions
+
+- **“RPO is recovery time.”** RPO is tolerated data loss; RTO is tolerated downtime.
+- **“Snapshot frequency equals RPO.”** Capture, lag, corruption, and restore point selection affect actual RPO.
+- **“Backup success proves restore.”** Only a tested, validated restore proves recoverability.
+- **“A replica is a backup.”** It may replicate deletion/corruption and have no historical point-in-time.
+- **“Zero RPO is free.”** Synchronous replication imposes latency/availability/cost trade-offs.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> RPO says how much data loss is acceptable; RTO says how long recovery may take. I choose snapshot/log/replica mechanisms and retention to meet those targets, then periodically restore in isolation, validate real data and dependencies, and measure the full recovery clock. A replica improves failover but is not sufficient for corruption recovery, so immutable backups and tested runbooks remain important.
+
+### When to Introduce It
+
+Introduce RPO/RTO after the prompt names durability, compliance, regional failure, or recovery. Ask which data can be rebuilt and which must be exact.
+
+### Common Follow-Ups
+
+- How do you validate a backup beyond checksum?
+- What dominates restore time at larger data volumes?
+- How do you meet a 5-minute RPO?
+- Can a replica satisfy the target after a bad deploy?
+
+### Common Candidate Mistakes
+
+- Quoting “daily backups” without RPO/RTO arithmetic.
+- Ignoring restore bandwidth, keys, schema, and application dependencies.
+- Failing to test restoration and data correctness.
+- Treating active/active as a replacement for backups.
+
+## Summary
+
+RPO/RTO turn vague recovery into measurable objectives. Back up data and the metadata/dependencies needed to use it, isolate copies from corruption, test restore and validation repeatedly, and adjust topology when measured recovery misses the target.
+
+## Quiz Seeds
+
+1. A daily snapshot is six hours old at failure. Which RPO does it satisfy?
+2. What belongs in the RTO clock besides database restore?
+3. Why can an asynchronous replica fail a strict RPO?
+4. Which validation checks prove a restored ledger is usable?
+5. Why does continuous log capture not automatically meet RTO?
+6. How can immutable backups help against corrupted/deleted data?
+7. Which workload could use a longer RPO and rebuild instead of warm standby?
+
+## Related Topics
+
+- [Disaster Recovery](./disaster-recovery.mdx)
+- [Multi-Region and Region Failover](./multi-region-and-region-failover.mdx)
+- [Durability](../01-foundations/durability.mdx)
+- [Availability](../01-foundations/availability.mdx)
+
+## References
+
+### Documentation / Articles
+
+- [Perform periodic recovery of the data to verify backup integrity and processes](https://docs.aws.amazon.com/wellarchitected/latest/framework/rel_backing_up_data_periodic_recovery_testing_data.html) — AWS explicitly requires restore, integrity, RPO, and RTO validation.
+- [Disaster recovery architecture on AWS: Strategies for recovery](https://aws.amazon.com/blogs/architecture/disaster-recovery-dr-architecture-on-aws-part-i-strategies-for-recovery-in-the-cloud/) — compares recovery strategies and the RPO/RTO cost curve.
+- [Disaster recovery planning guide](https://cloud.google.com/architecture/dr-scenarios-planning-guide) — Google Cloud describes backup/restore, replication, testing, and recovery dependencies.
+- [PostgreSQL Continuous Archiving and Point-in-Time Recovery](https://www.postgresql.org/docs/current/continuous-archiving.html) — an authoritative example of WAL-based recovery points and restore procedures.
+
+### Papers
+
+- [Site Reliability Engineering: Testing for Reliability](https://sre.google/sre-book/testing-reliability/) — grounds failure/recovery tests as a reliability practice.

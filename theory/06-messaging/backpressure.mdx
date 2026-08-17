@@ -1,0 +1,171 @@
+---
+type: lesson
+id: 06-09-backpressure
+slug: backpressure
+title: Backpressure
+description: Keep producers, brokers, consumers, and downstream dependencies within capacity when arrival rate exceeds service rate.
+module: messaging
+order: 9
+difficulty: core
+estimatedMinutes: 35
+prerequisites:
+  - 06-02-message-queue-fundamentals
+  - 06-04-partitions-and-consumer-groups
+  - 01-03-latency-vs-throughput
+  - 01-04-percentiles-tail-latency
+tags:
+  - backpressure
+  - queue-growth
+  - flow-control
+  - load-shedding
+  - consumer-lag
+objectives:
+  - Use arrival rate, service rate, backlog, and age to explain queue growth.
+  - Compare bounded buffers, prefetch, producer throttling, consumer scaling, and dropping/degrading work.
+  - Prevent retries and autoscaling from amplifying downstream overload.
+  - Choose a backpressure signal and response for priority-aware workloads.
+relatedLessons:
+  - 06-08-dead-letter-queues
+  - 06-10-batching-and-stream-vs-batch
+  - 06-04-partitions-and-consumer-groups
+  - 01-03-latency-vs-throughput
+---
+
+# Backpressure
+
+> Backpressure is the feedback that stops a faster producer from exhausting the queue, consumer memory, or downstream capacity.
+
+## Why This Exists
+
+If producers publish 10,000 jobs/s and workers complete 8,000 jobs/s, backlog grows by roughly 2,000 jobs/s. The naive response is to increase prefetch and buffer more, which hides the problem until memory, retention, or downstream connections fail. The improvement makes capacity and admission explicit: slow producers, add safe consumers, prioritize, shed, or degrade. The new trade-off is rejected work, higher completion latency, or reduced fidelity.
+
+## Mental Model
+
+```text
+arrival λ ──→ bounded broker/buffer ──→ service μ ──→ downstream capacity
+                  ↑                         │
+            feedback: lag/age/credits ─────┘
+```
+
+If `λ > μ` for long enough, queue length grows. Little's Law (`in-flight = rate × time`) explains why increasing buffer size increases memory and can increase end-to-end latency. Backpressure can be push-side (producer waits for credits), broker-side (publish quota), consumer-side (prefetch/receive limit), or policy-side (drop low priority).
+
+## How It Works
+
+Define a bounded budget: maximum queue bytes/messages, maximum in-flight per consumer, maximum age, and downstream concurrency. Feed queue depth, age, partition lag, worker utilization, and dependency saturation back to producers or autoscalers. Prefetch controls how many unacknowledged messages a consumer holds; too high increases memory and unfairness, too low may underutilize workers.
+
+Responses include:
+
+- throttle or reject new low-priority work;
+- reduce producer batch/rate or use admission tokens;
+- add consumers if partitions and downstream capacity permit;
+- pause a subscription or route to delayed retries;
+- drop/aggregate explicitly lossy telemetry;
+- serve a degraded result while background work catches up.
+
+Do not autoscale only on queue depth: a downstream outage can make more workers create more failing calls and retries.
+
+## Example
+
+An image processor accepts 5,000 uploads/minute but the thumbnail dependency handles 4,000/minute. The queue has a 20-minute age budget. At 10 minutes of age, the API lowers optional thumbnail quality and slows non-premium uploads; at 18 minutes it rejects new optional work with `Retry-After`. Premium moderation work keeps reserved capacity. Consumers use prefetch 20 and cap downstream concurrency.
+
+The naive unbounded queue preserves every job until the broker fills. The improvement applies priority and age budgets. The new trade-off is that some users see delayed or rejected thumbnails, which must be visible and measurable rather than silently lost.
+
+## Visualization We Eventually Want
+
+Build a **Backpressure Flow Lab** with producer, broker, partitions, workers, and downstream service. Controls should include arrival rate, service rate, queue capacity, prefetch, consumer count, downstream limit, retry multiplier, priority, and shedding policy. Show queue depth/age, in-flight memory, throughput, rejection/drop counts, dependency saturation, and recovery time after a burst or outage.
+
+## Scaling Behavior
+
+Adding consumers helps only until partition, CPU, I/O, or downstream limits. Increasing buffer capacity absorbs a finite burst but increases maximum age and memory cost. Batching can increase throughput but add wait latency. Multiple producers should receive fair feedback; otherwise one tenant can fill the buffer. Separate priority queues or reserved capacity prevent critical work from being starved.
+
+## Failure Modes
+
+- Unbounded prefetch exhausts consumer memory.
+- Autoscaling adds workers that overload a failing dependency.
+- Retry traffic creates a second queue behind the first.
+- One hot partition starves other partitions or consumers.
+- Queue retention expires work silently.
+- Shedding drops business-critical work because priority is misclassified.
+
+Use bounded buffers, rate limits, circuit breakers, retry budgets, per-tenant quotas, priority isolation, and alerts on age and rejection—not only depth.
+
+## Trade-offs
+
+Backpressure protects stability by spending throughput, freshness, or availability for some work. Buffering preserves work but increases latency and storage. Throttling preserves downstream health but slows producers. Dropping is cheap but must be an explicit product contract. Adding consumers improves throughput only within the true bottleneck and can worsen an outage.
+
+## Alternatives
+
+- **Load shedding:** reject or discard work when age/freshness is no longer useful.
+- **Rate limiter/token bucket:** smooth or cap admission per tenant.
+- **Priority queues/reserved pools:** protect critical work.
+- **Batching/compaction:** combine redundant updates to reduce service work.
+- **Circuit breaker:** stop calling an unhealthy dependency while it recovers.
+
+## When to Use
+
+Use backpressure whenever work can queue or a producer can outpace a consumer/dependency. State finite capacity, feedback signal, policy, and user-visible outcome.
+
+## When Not to Use
+
+Do not hide overload by making queues infinite or by increasing timeouts. Do not drop work without an explicit loss budget and a way to tell users/operators what happened.
+
+## Common Misconceptions
+
+- **More buffering increases capacity.** It increases burst tolerance and latency, not steady-state service rate.
+- **More workers always help.** The downstream bottleneck may be elsewhere.
+- **Queue depth is enough.** Age, rate, bytes, partition skew, and priority matter.
+- **Backpressure means failure.** It is controlled feedback that avoids catastrophic failure.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I compare arrival and service rates and set finite budgets for queue bytes, age, in-flight work, and downstream concurrency. Feedback can throttle producers, limit prefetch, add consumers where partitions allow, pause/retry later, or shed low-priority work. I avoid autoscaling into a dependency outage and expose priority, rejection, and degraded outcomes rather than letting an unbounded queue hide latency.
+
+### When to Introduce It
+
+Introduce backpressure when producers can burst, consumers are slower, downstream dependencies have quotas, or queue age threatens the user value of work.
+
+### Common Follow-Ups
+
+- What is the capacity bottleneck?
+- What signal tells producers to slow down?
+- Which work can be dropped?
+- Why not add more workers?
+
+### Common Candidate Mistakes
+
+They use infinite queues, scale consumers without checking dependencies, and monitor depth without age or priority.
+
+## Summary
+
+- If arrival exceeds service, backlog and age grow; buffers only buy time.
+- Backpressure needs bounded capacity, feedback, and explicit throttle/shed/degrade policy.
+- Prefetch and consumer count affect memory and concurrency, not just throughput.
+- Protect downstream dependencies and preserve critical work with priorities and budgets.
+
+## Quiz Seeds
+
+1. At 10,000 arrivals/s and 8,000 completions/s, how fast does backlog grow before retries?
+2. Why can increasing prefetch exhaust memory without increasing service rate?
+3. Which signal is better for an age-sensitive queue: depth, age, or both?
+4. Why can autoscaling worsen a downstream outage?
+5. What work can be safely shed in a telemetry pipeline but not in a payment pipeline?
+6. How do priority queues protect critical work?
+7. What is the difference between burst absorption and steady-state capacity?
+
+## Related Topics
+
+- [Dead-letter queues](dead-letter-queues.mdx) handles retry-exhausted work.
+- [Batching and stream versus batch](batching-and-stream-vs-batch.mdx) changes service rate and latency.
+- [Partitions and consumer groups](partitions-and-consumer-groups.mdx) bounds consumer parallelism.
+- [Latency versus throughput](../01-foundations/latency-vs-throughput.mdx) frames capacity and queueing.
+
+## References
+
+### Documentation / Articles
+
+- [RabbitMQ consumer acknowledgments and publisher confirms](https://www.rabbitmq.com/docs/next/confirms) — documents prefetch as a bound on unacknowledged deliveries and its throughput/memory trade-off.
+- [Kafka consumer configurations](https://kafka.apache.org/28/configuration/consumer-configs/) — explains polling, heartbeats, and settings that influence consumer liveness and lag.
+- [Google Cloud Pub/Sub flow control](https://cloud.google.com/pubsub/docs/flow-control-messages) — describes client-side limits on outstanding messages and bytes.
+- [Service Best Practices](https://sre.google/sre-book/service-best-practices/) — connects overload, capacity, load shedding, and graceful degradation.

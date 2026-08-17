@@ -1,0 +1,188 @@
+---
+type: lesson
+id: 04-07-b-tree-vs-lsm
+slug: b-tree-vs-lsm
+title: B-Tree versus LSM Trees
+description: Compare in-place sorted indexes with log-structured storage by read, write, space, and compaction behavior.
+module: databases
+order: 7
+difficulty: advanced
+estimatedMinutes: 45
+prerequisites:
+  - 04-06-database-indexes
+  - 04-03-storage-models
+  - 01-03-latency-vs-throughput
+tags:
+  - b-tree
+  - lsm-tree
+  - compaction
+  - sstable
+  - write-amplification
+objectives:
+  - Trace a point write and read through a B-tree and an LSM-based engine.
+  - Explain memtables, immutable sorted files, compaction, tombstones, and Bloom-filter-assisted reads.
+  - Compare read amplification, write amplification, space amplification, and tail-latency risk.
+  - Choose a storage engine shape from workload and state the tuning/operational costs.
+relatedLessons:
+  - 04-06-database-indexes
+  - 04-03-storage-models
+  - 04-08-replication
+  - 04-09-partitioning-and-sharding
+---
+
+# B-Tree versus LSM Trees
+
+> B-trees organize durable pages for predictable lookup and update; LSM trees batch writes into sorted immutable files and pay later through reads and compaction.
+
+## Why This Exists
+
+An OLTP database wants point lookups, range scans, updates, crash recovery, and predictable tail latency. A naive disk layout updates a random row in place for every write; under high write rates, random I/O, page splits, and fsync pressure dominate. The first improvement is a B-tree: keep keys ordered and update pages, often with a WAL. For an append-heavy workload, even page updates may be too expensive, so an LSM tree batches writes in memory and sequential files. That improves write throughput but creates read/compaction work.
+
+Neither family is “faster.” They move cost between the foreground write, foreground read, background compaction, storage space, and tail latency.
+
+## Mental Model
+
+| Property | B-tree family | LSM family |
+| --- | --- | --- |
+| Write path | Find/update a page; split/rebalance when needed; log for recovery | Append WAL, update in-memory sorted memtable, flush immutable sorted file |
+| Read path | Traverse a small tree, then scan adjacent leaves | Check memtable and multiple sorted files; merge newest visible value |
+| Range reads | Natural ordered leaf scan | Efficient within sorted files but may merge many files |
+| Write amplification | Page rewrites/splits and WAL | Flush plus compaction rewrites, often workload/strategy dependent |
+| Read/tail risk | Page/cache misses and locks | Read amplification, compaction contention, tombstone/filter misses |
+| Space behavior | Page fill/free space and old versions | Overlapping files/tombstones until compaction; space amplification |
+
+“LSM” is a family of implementations. Leveling, tiering, size-tiered, and hybrid compaction make different trade-offs. A B-tree also has WAL, caches, vacuum/MVCC, and background maintenance; the comparison is about the dominant organization, not a claim that one has no log or background work.
+
+## How It Works
+
+### B-tree path
+
+Keys are stored in sorted pages. Internal pages route a search to a leaf; adjacent leaves support ranges and order. An update may rewrite a page, split a full page, update secondary indexes, and append WAL before commit. Cached upper levels make tree depth small, but random leaf access can miss cache.
+
+### LSM path
+
+1. Append a mutation to a WAL and apply it to a mutable memtable.
+2. When the memtable fills, freeze it and flush a sorted string table (SSTable) to disk.
+3. Read the newest value by consulting memtables and SSTables from newest to oldest; Bloom filters can often skip files that cannot contain a key.
+4. Compact files in the background, merging sorted runs, discarding overwritten values/tombstones when safe, and producing a bounded set of files.
+
+Compaction is not free cleanup. It consumes CPU, disk bandwidth, write I/O, temporary space, and sometimes locks. A tombstone cannot be discarded until the engine knows older replicas/snapshots will not resurrect the deleted value. Read and write amplification are workload-dependent measurements, not constants.
+
+## Example
+
+An event-ingestion service receives 50,000 appends/s and serves recent-by-device reads. A B-tree with several secondary indexes keeps reads straightforward, but random page updates and index maintenance saturate write I/O. The naive “add more memory” fix postpones the problem and leaves page churn.
+
+An LSM-based store batches appends in memtables and sequential SSTable flushes. Write throughput improves, but a read may check several levels; a compaction burst increases p99 latency and disk usage. Add a Bloom filter and tune compaction/leveling, but the new trade-off is background I/O competing with ingestion. If the workload changes to many point reads with modest writes and strict tail latency, a B-tree or a tuned cache may be preferable.
+
+Deletes are another trap. In an LSM, a delete writes a tombstone; returning “not found” from a new file is not enough because an older file may still contain the value. Compaction and snapshot/replica safety determine when the tombstone can be removed. In a B-tree/MVCC engine, old row versions and vacuum have analogous cleanup considerations.
+
+## Visualization We Eventually Want
+
+Build a **storage-engine pipeline simulator** with identical operations fed to a B-tree and LSM lane. Controls should include write/read ratio, key distribution, cache size, memtable/SSTable size, compaction strategy, tombstone rate, range-read width, and disk throughput.
+
+Animate page traversal/splits versus memtable flush/compaction. Show read amplification, write amplification, space amplification, queue depth, compaction debt, p50/p99 latency, cache hit rate, and temporary disk usage. Presets should include sequential ingest, random updates, point reads, long range scans, and delete-heavy workload. A text event stream must explain a compaction stall or page split; add step/pause/reset and reduced-motion behavior.
+
+## Scaling Behavior
+
+On one node, CPU, cache, memory, WAL/disk bandwidth, and tail latency dominate. Across shards, each engine repeats its local behavior and adds routing/rebalancing/replication. More nodes can raise aggregate throughput while a single hot partition remains bound by one engine.
+
+LSM capacity planning includes compaction bandwidth and headroom: if incoming bytes approach sustained compaction capacity, files accumulate and p99 grows. B-tree planning includes page/cache locality, index count, random I/O, and split/vacuum work. Replicas multiply write/compaction cost and can have independent lag.
+
+## Failure Modes
+
+- **Compaction debt:** Incoming writes outrun compaction; files and read amplification grow.
+- **Compaction cliff:** A strategy needs a large merge, causing temporary disk or tail-latency spikes.
+- **Tombstone resurrection:** Cleanup occurs before an old snapshot/replica is safe, or repair semantics are misunderstood.
+- **Cache-thrash:** A range scan evicts hot point-read pages or filters.
+- **Write amplification surprise:** Secondary indexes or compaction rewrite more bytes than the logical workload.
+- **Disk exhaustion:** Temporary compaction files and replicas exceed the simple data-size estimate.
+- **B-tree hotspot/page contention:** Random writes concentrate on a narrow key range.
+
+Mitigate with amplification dashboards, disk headroom, compaction throttling, backpressure, appropriate key distribution, snapshot/repair-aware cleanup, and workload-specific benchmarks.
+
+## Trade-offs
+
+B-trees often provide strong point/range read behavior and mature indexing, while random writes and page/index maintenance cost I/O. LSMs can absorb sequential/high write rates and compress sorted data, while reads may touch more structures and compaction competes with foreground work. Tuning one amplification dimension often worsens another; choose for the workload and tail objective.
+
+## Alternatives
+
+- **Append-only log plus batch index:** Good for immutable event archives and sequential scans; poor for low-latency updates unless another index exists.
+- **In-memory engine:** Good for ephemeral low-latency data; needs a durability/restore design for state.
+- **Columnar storage:** Good for analytical scans/compression, not point-update OLTP.
+- **Hybrid engine:** Some systems use B-trees for metadata and LSM-like structures for payloads; verify each path rather than applying one label.
+
+## When to Use
+
+Use B-tree-like organization when point/range reads and predictable foreground latency dominate. Consider LSM when write throughput, sequential ingestion, compression, and partition-local scale dominate and compaction can be measured/operated.
+
+## When Not to Use
+
+Do not select LSM solely for “high writes” without compaction/disk capacity, and do not select B-tree solely for “SQL” without checking write amplification and hot-page behavior. Do not claim a data structure determines transaction or replication guarantees by itself.
+
+## Common Misconceptions
+
+- **LSM means no read amplification.** Reads may check memtables and multiple SSTables.
+- **Compaction is background and irrelevant to p99.** It competes for real I/O/CPU and can create stalls.
+- **B-trees write in place with no log.** Durable engines commonly use WAL and MVCC/maintenance.
+- **Bloom filters prove a key is absent.** They can say “definitely absent” or “maybe present,” not the reverse.
+- **More nodes fix compaction or a hot shard.** Local limits and partition ownership still apply.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> A B-tree keeps ordered pages for tree lookup and range scans, paying random/page/index updates on writes. An LSM appends to a log/memtable, flushes sorted immutable files, and compacts them later, improving batched write behavior but adding read amplification, write/space amplification, and compaction-tail risk. I choose based on read/write shape, range needs, disk bandwidth, and p99 budget, then monitor amplification and compaction debt.
+
+### When to Introduce It
+
+Introduce this comparison when a storage choice is dominated by write throughput, range reads, tail latency, or compaction/I/O behavior—not as an implementation trivia detour.
+
+### Common Follow-Ups
+
+- What happens during a compaction burst?
+- How are deletes represented and cleaned safely?
+- Which amplification metric limits capacity?
+- Why can a range scan affect point reads?
+- How do replicas and shards change the local trade-off?
+
+### Common Candidate Mistakes
+
+- Treating LSM as universally better for writes.
+- Describing SSTables without memtables, tombstones, or compaction cost.
+- Ignoring disk headroom and p99 during reorganization.
+- Assuming a product's default compaction strategy fits every workload.
+- Confusing storage-engine layout with transaction/replication semantics.
+
+## Summary
+
+- B-trees spend work organizing mutable pages; LSMs defer work into sorted files and compaction.
+- Compare read, write, and space amplification plus tail behavior—not average throughput alone.
+- Compaction, tombstones, cache behavior, and disk headroom are production concerns.
+- The engine layout does not by itself define transaction, replication, or durability guarantees.
+
+## Quiz Seeds
+
+1. Trace an LSM write from WAL to memtable to SSTable to compaction.
+2. Why can a B-tree be preferable for point reads with strict p99 even if an LSM has higher write throughput?
+3. What does a Bloom filter allow an LSM reader to conclude?
+4. Why can tombstones not always be removed immediately?
+5. Which three amplification metrics should capacity planning track?
+6. What workload pattern can make an LSM compaction debt grow without an obvious CPU saturation?
+7. How can a range scan evict point-read data in either engine?
+8. Why does adding a replica multiply more than logical data bytes?
+
+## Related Topics
+
+- [Database indexes](database-indexes.mdx)
+- [Replication](replication.mdx)
+- [Partitioning and sharding](partitioning-and-sharding.mdx)
+
+## References
+
+### Documentation / Articles
+
+- [RocksDB overview](https://github.com/facebook/rocksdb/wiki/RocksDB-Overview) — describes the log, memtable, SSTable, compaction, and tuning concepts of a production LSM engine.
+- [LevelDB implementation notes](https://github.com/google/leveldb/blob/main/doc/impl.md) — provides an implementation-level walkthrough of log, memtable, immutable tables, and compaction.
+- [Bigtable: A Distributed Storage System for Structured Data](https://research.google/pubs/bigtable-a-distributed-storage-system-for-structured-data/) — the original paper grounding sorted tables, tablet locality, and distributed storage design.
+- [PostgreSQL: B-tree indexes](https://www.postgresql.org/docs/current/btree.html) — documents the behavior and ordering properties of a mature B-tree index implementation.
+- [Apache Cassandra storage engine](https://cassandra.apache.org/doc/stable/cassandra/architecture/storage-engine.html) — connects a distributed wide-column database to its local LSM-style storage and compaction behavior.

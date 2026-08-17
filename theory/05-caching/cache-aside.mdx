@@ -1,0 +1,161 @@
+---
+type: lesson
+id: 05-03-cache-aside
+slug: cache-aside
+title: Cache-Aside
+description: Keep the application responsible for filling and invalidating a cache while the primary store remains authoritative.
+module: caching
+order: 3
+difficulty: core
+estimatedMinutes: 30
+prerequisites:
+  - 05-01-why-cache
+  - 05-02-local-and-distributed-cache
+  - 01-10-consistency-models
+tags:
+  - cache-aside
+  - lazy-loading
+  - invalidation
+  - ttl
+  - consistency
+objectives:
+  - Trace cache-aside hit, miss, fill, write, and invalidation paths.
+  - Explain why the primary store remains authoritative when the cache is disposable.
+  - Identify race conditions between writes, fills, deletes, and concurrent misses.
+  - Choose negative caching, versioning, and bounded loader behavior for a concrete workload.
+relatedLessons:
+  - 05-04-write-through-behind-refresh-ahead
+  - 05-06-cache-invalidation
+  - 05-07-cache-stampede
+  - 01-10-consistency-models
+---
+
+# Cache-Aside
+
+> In cache-aside, the application reads the cache first, loads misses from the source, and decides when to invalidate; the source of truth does not depend on the cache being present.
+
+## Why This Exists
+
+The naive “cache everything on every write” design fills entries that nobody reads and couples every write to cache availability. Cache-aside starts from the opposite observation: only requested keys deserve memory, and the primary database should remain recoverable if the cache is deleted. The improvement is economical and explicit, but the application now owns a small consistency protocol.
+
+## Mental Model
+
+```text
+read:  cache GET → hit → return
+                  └ miss → source GET → cache SET(TTL) → return
+
+write: source transaction → invalidate/delete cache key → acknowledge
+```
+
+The cache is a materialized hint. A miss is normal, not an error. A delete after a committed write is often safer than trying to reconstruct every cache representation, especially when several query shapes map to one source record.
+
+## How It Works
+
+For a read, use a namespaced key such as `catalog:v3:product:123`. If the value is present and usable, return it. Otherwise read the source, optionally cache a positive result with a TTL, and return it. For a missing source record, a short-lived negative sentinel can stop repeated probes, but its TTL must be short enough for a newly created record to appear.
+
+For a write, commit the source transaction first, then delete or version-bump affected cache keys. If deletion fails, the TTL bounds the stale window; if the product cannot tolerate that window, synchronously update the cache or read through the source after a write. Do not acknowledge a write merely because a cache write succeeded.
+
+Races matter. A miss can read old data while a concurrent writer commits new data, then fill the cache after the writer deletes it. Versioned values or compare-and-set invalidation prevent the old fill from winning. A loader timeout should not populate a partial or error value unless that behavior is deliberate.
+
+## Example
+
+For `GET /products/123`, the service checks `product:v7:123`. On a miss it reads the committed product row, serializes the browse projection, and sets a 60-second TTL. `PATCH /products/123` updates the row in a transaction and publishes an invalidation for the product projection. Checkout does not trust that cache entry for stock; it checks the inventory transaction directly.
+
+If 100 requests miss simultaneously, all 100 can query the database. The naive fix is a global lock, which serializes unrelated keys. A per-key single-flight mechanism (covered in [cache stampede](cache-stampede.mdx)) collapses only duplicate work and has its own timeout and holder-failure trade-offs.
+
+## Visualization We Eventually Want
+
+Build a **Cache-Aside Timeline** showing concurrent readers and writers as draggable events. Controls should include source latency, cache TTL, invalidation delay/loss, reader concurrency, negative-cache TTL, and version comparison on/off. Animate hit, miss, source commit, cache fill, delete, and stale-fill races. Metrics should include source reads, stale responses, duplicate loads, cache occupancy, and the time until a committed write is visible to each reader.
+
+## Scaling Behavior
+
+Cache-aside scales with the working set and source miss rate, but misses remain correlated with deploys, TTL boundaries, and key popularity. More application instances can multiply local fills; a distributed cache centralizes them but can become a bottleneck. Invalidation fan-out grows with the number of local caches and derived keys. Track miss rate by endpoint, loader concurrency by key, fill latency, invalidation lag, stale-read age, and source connection usage.
+
+## Failure Modes
+
+- Cache read timeout: fail open to the source only with bounded concurrency.
+- Source read failure: return an error or stale value according to the data contract; do not cache the failure indefinitely.
+- Cache write failure: serve the source result and record a warm-up/miss signal.
+- Delete-before-source-commit: a reader can refill old data, so commit first or use a version/transactional protocol.
+- Old fill after new write: compare versions before setting or invalidate again.
+- Negative sentinel hides a newly created record: keep negative TTL short and invalidate on create.
+
+## Trade-offs
+
+Cache-aside minimizes cache memory and preserves source independence, but application code must understand keys, TTLs, serialization, invalidation, and races. It usually tolerates cache loss better than write-behind, but a cold cache can overload the source. Explicit invalidation lowers stale windows but adds event delivery and ordering work.
+
+## Alternatives
+
+- **Read-through cache:** the cache owns the miss loader; useful when many callers need one standardized policy.
+- **Write-through:** update cache and source on writes; useful for hot data that must be warm, at the cost of write latency.
+- **Refresh-ahead:** proactively reload likely-expiring keys; useful for predictable hot keys, but can waste work.
+- **Precomputed read model:** useful when the projection is expensive and asynchronous freshness is acceptable.
+
+## When to Use
+
+Use cache-aside for read-heavy data with a clear source of truth, bounded staleness, and an application that can implement invalidation and fallback safely. It is a strong default for browse/catalog/profile reads.
+
+## When Not to Use
+
+Avoid it when every write must synchronously update a small, always-hot working set and the added miss path is more complex than write-through. Do not use a cache-aside value as the authority for money movement, inventory reservation, or authorization without a stronger validation path.
+
+## Common Misconceptions
+
+- **Cache-aside means no invalidation.** TTL alone may be too stale; writes often delete or version keys.
+- **Delete after a write is atomic with the database.** It is a second system and can fail or race.
+- **A cache miss is exceptional.** Misses are expected; unbounded miss fan-out is the problem.
+- **Negative caching is always safe.** It can mask a newly created resource.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> In cache-aside, reads check the cache and load misses from the authoritative store, while writes commit the store and then invalidate or version the relevant cache keys. This caches only requested data and survives cache loss, but leaves stale windows, fill races, and cold-cache load to design. I add per-key coalescing, bounded TTLs, and source fallback according to freshness and overload requirements.
+
+### When to Introduce It
+
+Introduce cache-aside when reads repeat a bounded projection and the source must remain authoritative. State the write ordering and miss behavior before drawing the cache.
+
+### Common Follow-Ups
+
+- What if the invalidation fails?
+- What if a stale fill races a new write?
+- How do you cache “not found”?
+- How do you prevent a stampede?
+
+### Common Candidate Mistakes
+
+They write the cache before the source, omit cache-key versioning, and assume a TTL eliminates every consistency race.
+
+## Summary
+
+- Read miss → source load → cache fill; source remains authoritative.
+- Write source first, then invalidate or version cache entries unless a different contract is explicit.
+- Negative caching, TTL, and invalidation need data-specific bounds.
+- Concurrent misses and stale fills require per-key coordination or version checks.
+
+## Quiz Seeds
+
+1. Why is source-first then invalidate generally safer than cache-first then source?
+2. A reader loads version 41 while a writer commits version 42 and deletes the key. How can version checks prevent version 41 from being cached?
+3. When is a negative cache sentinel useful, and what can it hide?
+4. What is the first-order source rate with 5,000 reads/s and 92% hits? Why might the observed rate be higher?
+5. Should checkout trust a cached product price or inventory value? Explain the boundary.
+6. What should happen when a cache write fails after a successful source read?
+7. Why is a global miss lock usually worse than a per-key single-flight lock?
+
+## Related Topics
+
+- [Write-through, write-behind, and refresh-ahead](write-through-behind-refresh-ahead.mdx) compares alternative update timing.
+- [Cache invalidation](cache-invalidation.mdx) expands the source/cache ordering problem.
+- [Cache stampede](cache-stampede.mdx) handles concurrent misses and expiry.
+- [Consistency models](../01-foundations/consistency-models.mdx) motivates source commit and visibility boundaries.
+
+## References
+
+### Documentation / Articles
+
+- [Redis cache-aside](https://redis.io/docs/latest/develop/use-cases/cache-aside/) — describes lazy loading, TTL-bounded staleness, and invalidation around an authoritative source.
+- [Redis cache-aside with Node.js](https://redis.io/docs/latest/develop/use-cases/cache-aside/nodejs/) — demonstrates misses, invalidation, negative paths, and per-key stampede protection.
+- [Caching strategies for Memcached](https://docs.aws.amazon.com/AmazonElastiCache/latest/dg/Strategies.html) — compares cache-aside and write-through mechanics with application pseudocode.
+- [Database caching strategies using Redis](https://docs.aws.amazon.com/whitepapers/latest/database-caching-strategies-using-redis/caching-patterns.html) — explains cache validity, lazy loading, and expiration as workload decisions.
