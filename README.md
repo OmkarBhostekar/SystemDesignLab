@@ -8,9 +8,9 @@ The project is intentionally being built in increments. The theory curriculum is
 
 ## Current status
 
-The project has completed **M1 — deterministic content pipeline and production-quality theory reader**. The repository contains 29 completed theory lessons across Modules 00–03, a validated deterministic lesson index, and a server-rendered Next.js reader at `/learn`.
+The project has completed **M2 — the full theory curriculum for Modules 00–13**. The repository contains 135 completed theory lessons across all 14 modules, including 20 Markdown-first design labs, a validated deterministic lesson index, and a server-rendered Next.js reader at `/learn`.
 
-The current reader includes module and lesson routes, curriculum navigation, breadcrumbs, metadata, previous/next links, GFM tables, highlighted code, Mermaid diagrams, references, responsive light/dark reading styles, and explicit theory-only states. Progress persistence, structured quizzes, simulations, search, knowledge maps, design labs, and interview mode remain deliberately deferred.
+The current reader includes routes for all modules and lessons, curriculum navigation, breadcrumbs, metadata, previous/next links, GFM tables, highlighted code, Mermaid diagrams, references, responsive light/dark reading styles, and explicit theory-only states. Progress persistence, structured quizzes, simulations, search, knowledge maps, the interactive design-lab workspace, and interview mode remain deliberately deferred.
 
 Read the [product requirements](docs/PRD.md) for the learning goals, the [curriculum map](docs/curriculum-map.md) for stable lesson IDs and dependencies, the [content guidelines](docs/content-guidelines.md) for authoring conventions, the [architecture plan](docs/architecture.md) for technical boundaries, and the [testing strategy](docs/testing-strategy.md) for risk-based verification.
 

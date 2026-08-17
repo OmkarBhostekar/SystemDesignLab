@@ -1080,247 +1080,247 @@ Status: **Complete**
 ## 04 — Data and Databases
 
 - [x] Module structure
-- [ ] Data Modeling from Access Patterns
-- [ ] SQL vs NoSQL
-- [ ] Relational Databases
-- [ ] Key-Value Stores
-- [ ] Document Databases
-- [ ] Wide-Column Databases
-- [ ] Graph Databases
-- [ ] ACID
-- [ ] Transactions
-- [ ] Isolation Levels
-- [ ] Dirty Reads
-- [ ] Non-Repeatable Reads
-- [ ] Phantom Reads
-- [ ] Write Skew
-- [ ] Database Indexes
-- [ ] B-Tree Intuition
-- [ ] Composite Indexes
-- [ ] Covering Indexes
-- [ ] Index Trade-offs
-- [ ] LSM Trees
-- [ ] B-Tree vs LSM
-- [ ] Replication
-- [ ] Synchronous vs Asynchronous Replication
-- [ ] Replication Lag
-- [ ] Read Replicas
-- [ ] Leader Failover
-- [ ] Partitioning / Sharding
-- [ ] Range Sharding
-- [ ] Hash Sharding
-- [ ] Directory-Based Sharding
-- [ ] Rebalancing
-- [ ] Hot Partitions
-- [ ] Consistent Hashing
-- [ ] Virtual Nodes
-- [ ] Read / Write Quorums
-- [ ] Denormalization
-- [ ] Connection Pools
-- [ ] Optimistic Concurrency Control
-- [ ] Pessimistic Locking
-- [ ] Module review / cross-links
+- [x] Data Modeling from Access Patterns
+- [x] SQL vs NoSQL
+- [x] Relational Databases
+- [x] Key-Value Stores
+- [x] Document Databases
+- [x] Wide-Column Databases
+- [x] Graph Databases
+- [x] ACID
+- [x] Transactions
+- [x] Isolation Levels
+- [x] Dirty Reads
+- [x] Non-Repeatable Reads
+- [x] Phantom Reads
+- [x] Write Skew
+- [x] Database Indexes
+- [x] B-Tree Intuition
+- [x] Composite Indexes
+- [x] Covering Indexes
+- [x] Index Trade-offs
+- [x] LSM Trees
+- [x] B-Tree vs LSM
+- [x] Replication
+- [x] Synchronous vs Asynchronous Replication
+- [x] Replication Lag
+- [x] Read Replicas
+- [x] Leader Failover
+- [x] Partitioning / Sharding
+- [x] Range Sharding
+- [x] Hash Sharding
+- [x] Directory-Based Sharding
+- [x] Rebalancing
+- [x] Hot Partitions
+- [x] Consistent Hashing
+- [x] Virtual Nodes
+- [x] Read / Write Quorums
+- [x] Denormalization
+- [x] Connection Pools
+- [x] Optimistic Concurrency Control
+- [x] Pessimistic Locking
+- [x] Module review / cross-links
 
-Status: **Structure complete; lesson authoring not started**
+Status: **Complete**
 
 ---
 
 ## 05 — Caching
 
 - [x] Module structure
-- [ ] Why Cache
-- [ ] Local vs Distributed Cache
-- [ ] Cache Aside
-- [ ] Write Through
-- [ ] Write Behind
-- [ ] Refresh Ahead
-- [ ] TTL
-- [ ] LRU
-- [ ] LFU
-- [ ] Cache Invalidation
-- [ ] Cache Stampede
-- [ ] TTL Jitter
-- [ ] Request Coalescing
-- [ ] Hot Keys
-- [ ] Multi-Layer Caching
-- [ ] CDN as Cache
-- [ ] Module review / cross-links
+- [x] Why Cache
+- [x] Local vs Distributed Cache
+- [x] Cache Aside
+- [x] Write Through
+- [x] Write Behind
+- [x] Refresh Ahead
+- [x] TTL
+- [x] LRU
+- [x] LFU
+- [x] Cache Invalidation
+- [x] Cache Stampede
+- [x] TTL Jitter
+- [x] Request Coalescing
+- [x] Hot Keys
+- [x] Multi-Layer Caching
+- [x] CDN as Cache
+- [x] Module review / cross-links
 
-Status: **Structure complete; lesson authoring not started**
+Status: **Complete**
 
 ---
 
 ## 06 — Asynchronous Systems and Messaging
 
 - [x] Module structure
-- [ ] Sync vs Async Processing
-- [ ] Message Queue Fundamentals
-- [ ] Pub/Sub
-- [ ] Topics
-- [ ] Partitions
-- [ ] Consumer Groups
-- [ ] Ordering
-- [ ] At-Most-Once
-- [ ] At-Least-Once
-- [ ] Exactly-Once Semantics
-- [ ] Idempotent Consumers
-- [ ] Dead Letter Queues
-- [ ] Backpressure
-- [ ] Batching
-- [ ] Stream Processing
-- [ ] Batch Processing
-- [ ] Event Time / Windows overview
-- [ ] Module review / cross-links
+- [x] Sync vs Async Processing
+- [x] Message Queue Fundamentals
+- [x] Pub/Sub
+- [x] Topics
+- [x] Partitions
+- [x] Consumer Groups
+- [x] Ordering
+- [x] At-Most-Once
+- [x] At-Least-Once
+- [x] Exactly-Once Semantics
+- [x] Idempotent Consumers
+- [x] Dead Letter Queues
+- [x] Backpressure
+- [x] Batching
+- [x] Stream Processing
+- [x] Batch Processing
+- [x] Event Time / Windows overview
+- [x] Module review / cross-links
 
-Status: **Structure complete; lesson authoring not started**
+Status: **Complete**
 
 ---
 
 ## 07 — Distributed Coordination and Consistency
 
 - [x] Module structure
-- [ ] Distributed Clocks
-- [ ] Logical Clocks
-- [ ] Vector Clocks overview
-- [ ] Leader Election
-- [ ] Consensus Intuition
-- [ ] Raft Intuition
-- [ ] Distributed Locks
-- [ ] Leases
-- [ ] Fencing Tokens
-- [ ] Distributed Transactions
-- [ ] Two-Phase Commit overview
-- [ ] Saga Pattern
-- [ ] Orchestration vs Choreography
-- [ ] Transactional Outbox
-- [ ] Change Data Capture
-- [ ] Event Sourcing
-- [ ] CQRS
-- [ ] Module review / cross-links
+- [x] Distributed Clocks
+- [x] Logical Clocks
+- [x] Vector Clocks overview
+- [x] Leader Election
+- [x] Consensus Intuition
+- [x] Raft Intuition
+- [x] Distributed Locks
+- [x] Leases
+- [x] Fencing Tokens
+- [x] Distributed Transactions
+- [x] Two-Phase Commit overview
+- [x] Saga Pattern
+- [x] Orchestration vs Choreography
+- [x] Transactional Outbox
+- [x] Change Data Capture
+- [x] Event Sourcing
+- [x] CQRS
+- [x] Module review / cross-links
 
-Status: **Structure complete; lesson authoring not started**
+Status: **Complete**
 
 ---
 
 ## 08 — Reliability and Failure Engineering
 
 - [x] Module structure
-- [ ] Timeouts
-- [ ] Retries
-- [ ] Retryable vs Permanent Errors
-- [ ] Exponential Backoff
-- [ ] Jitter
-- [ ] Retry Storms
-- [ ] Circuit Breaker
-- [ ] Bulkhead
-- [ ] Load Shedding
-- [ ] Graceful Degradation
-- [ ] Cascading Failures
-- [ ] Disaster Recovery
-- [ ] Backups
-- [ ] RPO
-- [ ] RTO
-- [ ] Multi-Region Active/Passive
-- [ ] Multi-Region Active/Active
-- [ ] Region Failover
-- [ ] Module review / cross-links
+- [x] Timeouts
+- [x] Retries
+- [x] Retryable vs Permanent Errors
+- [x] Exponential Backoff
+- [x] Jitter
+- [x] Retry Storms
+- [x] Circuit Breaker
+- [x] Bulkhead
+- [x] Load Shedding
+- [x] Graceful Degradation
+- [x] Cascading Failures
+- [x] Disaster Recovery
+- [x] Backups
+- [x] RPO
+- [x] RTO
+- [x] Multi-Region Active/Passive
+- [x] Multi-Region Active/Active
+- [x] Region Failover
+- [x] Module review / cross-links
 
-Status: **Structure complete; lesson authoring not started**
+Status: **Complete**
 
 ---
 
 ## 09 — Observability
 
 - [x] Module structure
-- [ ] Logs
-- [ ] Metrics
-- [ ] Traces
-- [ ] Distributed Tracing
-- [ ] Trace / Span IDs
-- [ ] Golden Signals
-- [ ] SLI
-- [ ] SLO
-- [ ] SLA
-- [ ] Error Budgets
-- [ ] Alerting
-- [ ] Health Checks
-- [ ] Liveness
-- [ ] Readiness
-- [ ] Module review / cross-links
+- [x] Logs
+- [x] Metrics
+- [x] Traces
+- [x] Distributed Tracing
+- [x] Trace / Span IDs
+- [x] Golden Signals
+- [x] SLI
+- [x] SLO
+- [x] SLA
+- [x] Error Budgets
+- [x] Alerting
+- [x] Health Checks
+- [x] Liveness
+- [x] Readiness
+- [x] Module review / cross-links
 
-Status: **Structure complete; lesson authoring not started**
+Status: **Complete**
 
 ---
 
 ## 10 — Security for System Design
 
 - [x] Module structure
-- [ ] Authentication vs Authorization
-- [ ] Sessions
-- [ ] Tokens
-- [ ] JWT Trade-offs
-- [ ] OAuth overview
-- [ ] OIDC overview
-- [ ] RBAC
-- [ ] ABAC
-- [ ] TLS
-- [ ] Encryption at Rest
-- [ ] Secrets Management
-- [ ] API Abuse Prevention
-- [ ] Rate Limiting Security Context
-- [ ] Multi-Tenancy
-- [ ] Tenant Isolation
-- [ ] Noisy Neighbor
-- [ ] Module review / cross-links
+- [x] Authentication vs Authorization
+- [x] Sessions
+- [x] Tokens
+- [x] JWT Trade-offs
+- [x] OAuth overview
+- [x] OIDC overview
+- [x] RBAC
+- [x] ABAC
+- [x] TLS
+- [x] Encryption at Rest
+- [x] Secrets Management
+- [x] API Abuse Prevention
+- [x] Rate Limiting Security Context
+- [x] Multi-Tenancy
+- [x] Tenant Isolation
+- [x] Noisy Neighbor
+- [x] Module review / cross-links
 
-Status: **Structure complete; lesson authoring not started**
+Status: **Complete**
 
 ---
 
 ## 11 — Reusable Interview Building Blocks
 
 - [x] Module structure
-- [ ] Rate Limiter
-- [ ] Fixed Window
-- [ ] Sliding Window Log
-- [ ] Sliding Window Counter
-- [ ] Token Bucket
-- [ ] Leaky Bucket
-- [ ] Distributed Unique ID Generator
-- [ ] Snowflake-Style IDs
-- [ ] Distributed Scheduler
-- [ ] Search Autocomplete
-- [ ] Trie Intuition
-- [ ] Full-Text Search
-- [ ] Inverted Index
-- [ ] Bloom Filter
-- [ ] Object / Blob Storage
-- [ ] Multipart Upload
-- [ ] Signed URLs
-- [ ] Notification System
-- [ ] Real-Time Presence
-- [ ] Geospatial Indexing
-- [ ] Geohash
-- [ ] Quadtree overview
-- [ ] Module review / cross-links
+- [x] Rate Limiter
+- [x] Fixed Window
+- [x] Sliding Window Log
+- [x] Sliding Window Counter
+- [x] Token Bucket
+- [x] Leaky Bucket
+- [x] Distributed Unique ID Generator
+- [x] Snowflake-Style IDs
+- [x] Distributed Scheduler
+- [x] Search Autocomplete
+- [x] Trie Intuition
+- [x] Full-Text Search
+- [x] Inverted Index
+- [x] Bloom Filter
+- [x] Object / Blob Storage
+- [x] Multipart Upload
+- [x] Signed URLs
+- [x] Notification System
+- [x] Real-Time Presence
+- [x] Geospatial Indexing
+- [x] Geohash
+- [x] Quadtree overview
+- [x] Module review / cross-links
 
-Status: **Structure complete; lesson authoring not started**
+Status: **Complete**
 
 ---
 
 ## 12 — Architecture Archetypes
 
 - [x] Module structure
-- [ ] Read-Heavy Systems
-- [ ] Write-Heavy Systems
-- [ ] Fanout Systems
-- [ ] Real-Time Systems
-- [ ] Transactional Workflow Systems
-- [ ] Search / Discovery Systems
-- [ ] Streaming / Media Systems
-- [ ] Module review / cross-links
+- [x] Read-Heavy Systems
+- [x] Write-Heavy Systems
+- [x] Fanout Systems
+- [x] Real-Time Systems
+- [x] Transactional Workflow Systems
+- [x] Search / Discovery Systems
+- [x] Streaming / Media Systems
+- [x] Module review / cross-links
 
-Status: **Structure complete; lesson authoring not started**
+Status: **Complete**
 
 ---
 
@@ -1330,34 +1330,34 @@ Theory/reference material first; interactive lab UI later.
 
 ### Beginner
 
-- [ ] URL Shortener
-- [ ] Rate Limiter
-- [ ] Unique ID Generator
-- [ ] Pastebin
+- [x] URL Shortener
+- [x] Rate Limiter
+- [x] Unique ID Generator
+- [x] Pastebin
 
 ### Intermediate
 
-- [ ] Notification System
-- [ ] Chat / Messaging
-- [ ] News Feed
-- [ ] Search Autocomplete
-- [ ] Web Crawler
-- [ ] File Sync / Drive
-- [ ] Metrics / Monitoring Platform
-- [ ] Distributed Message Queue
+- [x] Notification System
+- [x] Chat / Messaging
+- [x] News Feed
+- [x] Search Autocomplete
+- [x] Web Crawler
+- [x] File Sync / Drive
+- [x] Metrics / Monitoring Platform
+- [x] Distributed Message Queue
 
 ### Advanced Backend
 
-- [ ] Ticket / Hotel Booking
-- [ ] E-Commerce Inventory and Ordering
-- [ ] Payment System
-- [ ] Digital Wallet
-- [ ] Distributed Key-Value Store
-- [ ] Object Storage / S3-Like System
-- [ ] Ride-Hailing / Nearby Drivers
-- [ ] Video Streaming Platform
+- [x] Ticket / Hotel Booking
+- [x] E-Commerce Inventory and Ordering
+- [x] Payment System
+- [x] Digital Wallet
+- [x] Distributed Key-Value Store
+- [x] Object Storage / S3-Like System
+- [x] Ride-Hailing / Nearby Drivers
+- [x] Video Streaming Platform
 
-Status: **Structure complete; lab authoring not started**
+Status: **Complete — theory/reference labs; interactive workspace deferred**
 
 ---
 
@@ -1539,11 +1539,11 @@ Status: **Not started**
 
 Current milestone:
 
-> **M1 — Deterministic content pipeline + production-quality theory reader — Complete**
+> **M2 — Complete theory curriculum for Modules 04–13 — Complete**
 
 Primary goal:
 
-Prove the content contract and reading experience against the 29 completed lessons in Modules 00–03. Build only the server-first theory reader, deterministic validation/indexing, and accessible reading shell described in ADR-002.
+Complete the dependency-ordered theory curriculum through all 135 lessons in Modules 00–13, including 20 Markdown-first design labs, while preserving the deterministic content contract and production theory reader.
 
 Do not add simulations, structured quizzes, progress persistence, knowledge maps, design labs, interview mode, authentication, a backend, or remote content storage during this milestone.
 
@@ -1559,17 +1559,21 @@ Update this section whenever Codex finishes a meaningful task.
 
 ## Active Milestone
 
-`M1 — Deterministic content pipeline + production-quality theory reader — Complete`
+`M2 — Complete theory curriculum for Modules 04–13 — Complete`
 
 ## Currently Working On
 
 - [x] Next.js application and theory-reader implementation
 - [x] Documentation setup
 - [x] Curriculum directory setup
-- [~] Theory authoring — Modules 00–03 complete; later modules remain planned
+- [x] Theory authoring — all 135 lessons across Modules 00–13 complete
 
 ## Recently Completed
 
+- Completed all 106 planned lessons in Modules 04–13, bringing the curriculum to 135 indexed lessons across all 14 modules.
+- Completed all 20 Markdown-first design labs with requirements, checked estimates, APIs, data models, progressive architectures, failure/security/observability analysis, and reference rationale.
+- Expanded production-index coverage to all modules and routes and added automated local-link/heading validation for Markdown documentation and module READMEs.
+- Verified authoritative references during authoring and reconciled all prerequisite, related-lesson, path, order, cycle, and local-link relationships through the deterministic pipeline.
 - Accepted ADR-002 to begin the narrowly scoped theory-reader milestone after Modules 00–03 rather than waiting for the full curriculum.
 - Initialized Next.js 16 with React 19, strict TypeScript, Tailwind CSS, ESLint, and Vitest.
 - Implemented deterministic schema, relationship, dependency-cycle, path, and local-link validation for all 29 completed lessons.
@@ -1590,10 +1594,10 @@ None known.
 
 ## Next Recommended Tasks
 
-1. Begin **M2 — Module 04 database theory authoring through the validated content pipeline**.
-2. Use the reader during authoring to catch metadata, relationship, rendering, and readability regressions early.
-3. Consider search only after more curriculum exists; keep progress, structured quizzes, and simulations in their later planned stages.
-4. Do not begin a simulation framework until a real interactive lesson is selected and its model can drive the abstraction.
+1. Begin **M3 — Local progress model and `ProgressRepository` abstraction** from Stage C.
+2. Add in-memory and IndexedDB adapters, explicit idempotent transitions, export/import/reset, and repository contract tests before wiring broad UI state.
+3. Keep structured quizzes and simulations in their later stages; when visualization work begins, start with one simple and one stateful flagship lesson so real models drive shared controls.
+4. Consider search after progress or alongside a focused reader improvement, now that the complete 135-lesson corpus exists.
 
 ---
 

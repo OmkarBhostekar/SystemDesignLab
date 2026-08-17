@@ -1,8 +1,8 @@
 # System Design Curriculum Map
 
-**Status:** canonical dependency map and curriculum scaffold
+**Status:** complete canonical dependency map for 135 indexed lessons across Modules 00–13
 
-This document is the dependency-oriented index for the theory curriculum described by [`docs/PRD.md`](./PRD.md) and organized according to [`CODEX.md`](../CODEX.md). It defines module order, lesson IDs, depth, prerequisites, and downstream connections. Modules 00–03 now have complete theory lesson files; Modules 04–13 remain module-level scaffolds. No module README alone claims that lesson prose, visualizations, quizzes, or interview lenses are complete.
+This document is the dependency-oriented index for the theory curriculum described by [`docs/PRD.md`](./PRD.md) and organized according to [`CODEX.md`](../CODEX.md). It defines module order, lesson IDs, depth, prerequisites, and downstream connections. All 135 canonical theory lessons across Modules 00–13 now have indexed `.mdx` sources, including 20 Markdown-first design labs. Interactive visualizations, structured quizzes, progress, and the design-lab workspace remain separate application milestones.
 
 ## How to read this map
 
@@ -59,7 +59,7 @@ This spine is intentionally cumulative: requirements and estimates frame the des
 
 ## Ordered lesson registry
 
-The following IDs are stable curriculum identifiers. A listed ID represents a lesson unit or bounded lesson grouping, but does not claim that a lesson file exists unless a corresponding `.mdx` source has been authored. The bracket after each ID is its intended depth.
+The following IDs are stable curriculum identifiers and each now resolves to an indexed `.mdx` lesson. The bracket after each ID is its intended depth.
 
 ### 00 — Interview Method
 
@@ -167,8 +167,8 @@ Not Started → Theory Complete → Visualization Complete → Quiz Passed → M
 
 At the current theory-authoring stage:
 
-- all module directories and READMEs exist, but Modules 04–13 remain **structure only**;
-- Modules 00–03 theory is complete in 29 indexed `.mdx` lessons with interview lenses, quiz seeds, cross-links, and verified references;
-- interactive visualizations and structured quizzes remain future work for Modules 00–03;
-- no other lesson is marked complete merely because its ID appears in this map;
-- a module may be called complete only after every intended lesson in its README satisfies the theory definition of done.
+- all 14 module directories and READMEs describe completed theory contents;
+- Modules 00–13 contain 135 indexed `.mdx` lessons with interview lenses, quiz seeds, cross-links, annotated authoritative references, and future visualization specifications;
+- Module 13 contributes 20 theory/reference labs; their interactive workspace remains future work;
+- interactive visualizations and structured quizzes remain future application work and are not implied by theory completion;
+- each completed module has passed the theory definition of done in `CODEX.md` and deterministic schema, relationship, cycle, path, and local-link validation.
