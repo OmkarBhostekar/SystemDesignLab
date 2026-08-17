@@ -1,0 +1,210 @@
+---
+type: lesson
+id: 01-02-horizontal-vs-vertical-scaling
+slug: horizontal-vs-vertical-scaling
+title: Horizontal vs. Vertical Scaling
+description: Compare scaling up a machine with scaling out across machines, including state, bottlenecks, and failure domains.
+module: foundations
+order: 2
+difficulty: core
+estimatedMinutes: 30
+prerequisites:
+  - 01-01-performance-vs-scalability
+  - 00-03-estimation
+tags:
+  - horizontal-scaling
+  - vertical-scaling
+  - stateless-services
+  - load-balancing
+  - capacity
+objectives:
+  - Explain the operational and capacity differences between scaling up and scaling out.
+  - Identify which state, coordination, and dependency changes are required before adding replicas.
+  - Choose a scaling direction from workload shape, bottleneck, failure domain, and cost constraints.
+  - Describe why horizontal capacity is rarely perfectly linear and how to preserve headroom.
+  - Compare active-passive and active-active placement at an interview-useful level.
+relatedLessons:
+  - 01-01-performance-vs-scalability
+  - 01-03-latency-vs-throughput
+---
+
+# Horizontal vs. Vertical Scaling
+
+> Vertical scaling makes one failure domain bigger; horizontal scaling spreads work across multiple failure domains and coordination boundaries.
+
+## Why This Exists
+
+The first application server often grows by moving to a larger machine: more cores, memory, network, or local storage. That can be a simple and effective improvement. Eventually the largest available host is still smaller than the workload, an upgrade requires a disruptive move, or one host becomes an unacceptable failure domain.
+
+The naive “scale up forever” design is a single checkout process and one database host. It is easy to reason about, but one hardware, kernel, process, or maintenance failure can take out all capacity. The naive “just add servers” design has the opposite problem: if requests depend on local sessions, local files, or a single database connection limit, replicas do not provide independent capacity.
+
+## Mental Model
+
+| Choice | What changes | Strength | New question |
+| --- | --- | --- | --- |
+| Vertical / scale up | More resources in one node | Simple coordination and often low network overhead | What is the maximum host and how disruptive is replacement? |
+| Horizontal / scale out | More nodes sharing work | Incremental capacity and failure isolation | How is work routed and how is state owned or replicated? |
+| Scale down | Fewer or smaller nodes | Lower idle cost | Is there enough headroom for peaks and failures? |
+
+Horizontal scaling is not the same as “more CPU.” It requires a work distribution strategy and a state strategy. A stateless HTTP tier can usually route any request to any healthy replica. A database, in-memory session store, or partition owner may require a leader, shard, replica set, or sticky routing.
+
+## How It Works
+
+### Scale up
+
+Replace or resize a node. The workload sees one logical endpoint, and in-process memory, locks, and local transactions remain simple. The practical ceiling includes available machine sizes, cost, power, upgrade time, and the blast radius of one failure.
+
+### Scale out
+
+Add nodes behind a load balancer, partition keys among owners, or replicate read-only state. The service must address:
+
+- **Routing:** round robin, least-loaded, key-based, or a partition map.
+- **State:** externalize sessions, replicate files, or make ownership explicit.
+- **Coordination:** define who commits changes and what concurrent writes mean.
+- **Lifecycle:** discover, health-check, drain, replace, and rebalance nodes.
+- **Capacity:** leave room for uneven keys, retries, and a node or zone loss.
+
+Autoscaling is a control loop, not magic. It observes signals such as queue depth or CPU, changes capacity, and waits for the new nodes to warm up. If scaling reacts too slowly, traffic can exhaust the current fleet; if it reacts to noisy metrics, it can oscillate.
+
+## Example
+
+Imagine a product-catalog API at 2,000 QPS. One 4-core host handles 1,500 QPS at the p95 target, so the naive design has no headroom.
+
+### Naive → failure → improvement
+
+1. **Naive scale-up:** move to a 16-core host. It now handles 5,000 QPS, and no session or routing changes are needed.
+2. **Failure:** a host upgrade requires a migration window, and the larger node is still a single failure domain. A flash sale at 8,000 QPS exceeds the host ceiling.
+3. **Improvement:** run four stateless application replicas behind a load balancer, with sessions in a shared store and catalog images in object storage or a CDN. Keep one replica's worth of headroom for a planned loss.
+4. **New trade-off:** every request now crosses a network hop; the session store and catalog database become shared dependencies, and uneven product popularity can overload one cache key or shard.
+
+If each replica sustains 1,500 QPS at target SLO, four replicas suggest 6,000 QPS of nominal capacity, not 8,000. To survive one replica loss and retain 20% headroom, plan against three available replicas: 3 × 1,500 × 0.8 = 3,600 QPS. The exact margin is a testable operating policy, not a universal constant.
+
+## Visualization We Eventually Want
+
+Create a paired scaling simulation:
+
+- a scale-up control that changes cores, memory, and replacement time;
+- a scale-out control that adds replicas, load-balancing policy, and warm-up delay;
+- toggles for local sessions, shared sessions, a shared database, and a hot key;
+- charts for capacity, utilization, p95, queue depth, and capacity after one node failure;
+- scenario presets for a small internal tool, a stateless API, and a write-heavy stateful service.
+
+The explanation should show why one more application replica stops helping when a database or session store is saturated.
+
+## Scaling Behavior
+
+Vertical capacity often has step changes: a larger host can remove a memory or I/O bottleneck, but the next step may be expensive. Horizontal capacity is usually sublinear because coordination, load imbalance, shared dependencies, replication, and network overhead consume part of each node.
+
+Scale-out can improve availability when nodes span independent failure domains, but placing all replicas in one rack or zone does not provide that benefit. Stateful scale-out often needs partitioning or a leader; adding replicas may improve read capacity while leaving write capacity unchanged.
+
+At high scale, control-plane limits matter too: routing tables, connection pools, deployment fan-out, and autoscaler reaction time can become bottlenecks. Measure both steady state and transitions.
+
+## Failure Modes
+
+- **Sticky state:** requests routed to a new replica lose an in-memory session.
+- **Single shared dependency:** stateless replicas all fail together when the database or session store fails.
+- **Uneven work:** hashing or hot keys send most traffic to one node.
+- **Autoscaling lag:** new nodes arrive after queues and timeouts have already amplified load.
+- **Split ownership:** two nodes believe they own the same key or job.
+- **Correlated placement:** replicas share a rack, zone, power domain, or deployment bug.
+- **Connection multiplication:** adding clients multiplies database connections and exhausts a finite pool.
+
+Mitigate with externalized or replicated state, bounded pools, failure-domain-aware placement, graceful draining, prewarming, and load tests that include node loss and rebalancing.
+
+## Trade-offs
+
+Scale up buys simplicity, cache locality, and often lower coordination cost, but has a larger blast radius and a finite ceiling. Scale out buys incremental growth and failure isolation, but introduces network calls, load distribution, state management, operational cost, and partial failures.
+
+Horizontal replicas can lower per-node utilization while increasing total cost. A larger host can be cheaper than a fleet for a low-volume service; a fleet can be cheaper than a very large host once utilization, availability, and maintenance are considered. Compare total cost at the required SLO and failure tolerance rather than counting machines.
+
+## Alternatives
+
+- **Vertical first, horizontal later:** a good default for a small service while preserving stateless boundaries and externalized state.
+- **Read replicas:** use when reads dominate and stale or lagged reads are acceptable; they do not automatically scale writes.
+- **Partitioning/sharding:** use when one state owner cannot handle data or write volume; budget for routing and rebalancing.
+- **Serverless or managed autoscaling:** use when demand is bursty and platform limits fit; verify cold starts, quotas, and state boundaries.
+- **Dedicated hardware:** use for predictable high throughput or specialized storage where operational control is worth the cost.
+
+## When to Use
+
+Discuss the choice after estimating peak load and identifying the binding resource. Scale up when the workload fits one host and simple coordination has high value. Scale out when capacity, failure isolation, geography, or independent deployment requires multiple nodes.
+
+## When Not to Use
+
+Do not add replicas to hide an unbounded queue, hot key, or expensive query. Do not scale out a stateful component without defining ownership and conflict behavior. Do not promise active-active writes when a single writer or partition owner meets the requirements more simply.
+
+## Common Misconceptions
+
+- **“Horizontal scaling is always more reliable.”** It helps only when replicas are independent and failover is tested.
+- **“Vertical scaling cannot scale.”** Larger machines can be the simplest and most effective choice for a wide operating range.
+- **“Four replicas provide four times capacity.”** Shared dependencies, overhead, and uneven load make capacity sublinear.
+- **“Stateless means no state exists.”** It means request-serving nodes do not own irreplaceable client state.
+- **“Autoscaling prevents overload.”** Control loops have lag, quotas, and warm-up time; admission control still matters.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I would scale up while the workload fits a host and simplicity is valuable. I would scale out when one host, one failure domain, or one deployment boundary is insufficient. Before adding replicas I would externalize sessions and files, define routing and ownership, check shared dependencies, and reserve enough headroom to survive a node or zone loss.
+
+### When to Introduce It
+
+Introduce the choice after estimates and a measured bottleneck. State whether the service is stateless, what state is shared, and which failure domain the target must survive.
+
+### Common Follow-Ups
+
+- Which dependency becomes the bottleneck after adding application replicas?
+- How do sessions and uploads work after scale-out?
+- What happens when one zone or shard fails?
+- How does the autoscaler know it should add capacity?
+- Why might read replicas help while writes remain constrained?
+
+### Common Candidate Mistakes
+
+- Drawing a fleet without explaining request routing.
+- Treating a large machine as an availability strategy.
+- Ignoring the connection and cost impact of multiplying replicas.
+- Forgetting warm-up, draining, or rebalancing behavior.
+- Calling a cluster fault tolerant when replicas share one failure domain.
+
+## Summary
+
+- Scale up changes one node; scale out changes ownership, routing, and failure boundaries.
+- Horizontal capacity requires a state and coordination plan.
+- Shared dependencies and hot partitions often become the next bottleneck.
+- Use measured capacity and failure-domain headroom, not a replica-count slogan.
+- A simple scale-up design can be better than a distributed design until requirements justify the extra boundaries.
+
+## Quiz Seeds
+
+1. When is scaling up a better interview answer than immediately adding replicas?
+2. Why does a stateless application tier still depend on state-management decisions?
+3. Four replicas each handle 1,500 QPS, but one database handles only 3,000 QPS. What capacity does the application tier actually provide?
+4. What happens to in-memory sessions when a load balancer sends the next request to another replica?
+5. Why can adding nodes reduce capacity during an autoscaling event?
+6. Which failure domains must replicas span to provide meaningful redundancy?
+7. Why do read replicas not necessarily increase write throughput?
+8. Name two signals that are better than CPU alone for scaling a queue-backed worker.
+
+## Related Topics
+
+- [Performance vs. Scalability](./performance-vs-scalability.mdx) — identify the bottleneck before choosing a scaling direction.
+- [Back-of-the-Envelope Estimation](../00-interview-method/estimation.mdx) — estimate peak demand and headroom.
+- [Latency vs. Throughput](./latency-vs-throughput.mdx) — connect capacity to response time and work rate.
+
+## References
+
+### Documentation / Articles
+
+- [Amazon EC2 Auto Scaling User Guide](https://docs.aws.amazon.com/autoscaling/ec2/userguide/what-is-amazon-ec2-auto-scaling.html) — official description of dynamic capacity, health replacement, and maintaining a desired instance group.
+- [Autoscaling Guidance — Azure Architecture Center](https://learn.microsoft.com/en-us/azure/architecture/best-practices/auto-scaling) — explains reactive and predictive scaling, metrics, warm-up, and the risks of oscillation.
+- [Horizontal Pod Autoscaling — Kubernetes Documentation](https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/) — a concrete implementation of a scale-out control loop and its metric/lag considerations.
+- [Handling Overload — Google SRE](https://sre.google/sre-book/handling-overload/) — grounds headroom, utilization thresholds, rejection, and overload behavior for a growing fleet.
+
+### Papers
+
+No paper is required for the scale-up versus scale-out decision; the cited operational guidance covers the relevant mechanisms and limits.
+
+### Videos
+
+No video is included because the official autoscaling documentation gives more precise, implementation-relevant guidance than a generic explainer.

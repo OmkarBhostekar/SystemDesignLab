@@ -1,6 +1,6 @@
 # Module 01 — Foundations
 
-**Status:** Scaffold only. The lesson units below are planned but not complete.
+**Status:** Theory complete. Interactive visualizations and structured quizzes remain future work; each lesson includes a visualization specification and quiz seeds.
 
 ## Purpose
 
@@ -17,16 +17,18 @@ The module is predominantly **Core**. Consistency models contain a **Core / Adva
 
 ## Intended lesson order
 
-1. `01-01-performance-vs-scalability` — Distinguish making one request faster from handling more work.
-2. `01-02-horizontal-vs-vertical-scaling` — Compare scale-up and scale-out, including bottlenecks and coordination cost.
-3. `01-03-latency-vs-throughput` — Separate per-request response time from completed work per unit time.
-4. `01-04-percentiles-tail-latency` — Use p50/p95/p99 and service-time distributions instead of averages alone.
-5. `01-05-availability` — Reason about uptime, serial dependencies, redundancy, and “nines.”
-6. `01-06-reliability` — Define correct operation over time and distinguish it from availability.
-7. `01-07-durability` — Explain whether acknowledged data survives process, node, or region failure.
-8. `01-08-redundancy-and-fault-tolerance` — Show how replicas and failover change failure behavior and cost.
-9. `01-09-cap` — Introduce consistency, availability, and partition tolerance specifically under network partitions.
-10. `01-10-consistency-models` — Compare strong, eventual, weak, read-after-write, monotonic-read, and causal guarantees at an interview-useful level.
+The lessons are authored in this dependency order:
+
+1. [01-01-performance-vs-scalability](./performance-vs-scalability.mdx) — Distinguish making one request faster from handling more work.
+2. [01-02-horizontal-vs-vertical-scaling](./horizontal-vs-vertical-scaling.mdx) — Compare scale-up and scale-out, including bottlenecks, state, and failure domains.
+3. [01-03-latency-vs-throughput](./latency-vs-throughput.mdx) — Separate per-request response time from completed work per unit time.
+4. [01-04-percentiles-tail-latency](./percentiles-tail-latency.mdx) — Use p50/p95/p99 and service-time distributions instead of averages alone.
+5. [01-05-availability](./availability.mdx) — Reason about usable service, serial dependencies, redundancy, and nines.
+6. [01-06-reliability](./reliability.mdx) — Define correct operation over time and distinguish it from availability.
+7. [01-07-durability](./durability.mdx) — Explain whether acknowledged data survives process, node, zone, or region failure.
+8. [01-08-redundancy-and-fault-tolerance](./redundancy-and-fault-tolerance.mdx) — Show how independent copies and failover change failure behavior and cost.
+9. [01-09-cap](./cap.mdx) — Introduce consistency, availability, and partition tolerance specifically under network partitions.
+10. [01-10-consistency-models](./consistency-models.mdx) — Compare strong, eventual, weak, read-after-write, monotonic-read, and causal guarantees at an interview-useful level.
 
 ## Downstream connections
 
@@ -38,5 +40,4 @@ The module is predominantly **Core**. Consistency models contain a **Core / Adva
 
 ## Authoring boundary
 
-The module README establishes order and dependencies only. It does not claim that availability math, CAP, or consistency lessons—and especially their visualizations—are implemented.
-
+All ten theory lessons are complete in Markdown-first .mdx files with indexed metadata, progressive naive-to-failure-to-improvement explanations, backend examples, interview lenses, quiz seeds, local cross-links, and checked references. Interactive work remains future scope and must preserve the requirement-first progression rather than presenting a finished architecture before its constraints are established.

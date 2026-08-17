@@ -1,0 +1,205 @@
+---
+type: lesson
+id: 03-06-api-gateway
+slug: api-gateway
+title: API Gateways
+description: Give clients a deliberate edge contract for routing and cross-cutting policy while keeping business ownership in services.
+module: traffic-and-services
+order: 6
+difficulty: core
+estimatedMinutes: 30
+prerequisites:
+  - 03-03-l4-vs-l7
+  - 03-05-service-discovery
+  - 02-01-request-lifecycle
+  - 02-05-rest-rpc-grpc-graphql
+tags:
+  - api-gateway
+  - edge-routing
+  - authentication
+  - rate-limiting
+  - aggregation
+  - backend-for-frontend
+objectives:
+  - Separate API-gateway routing and edge policy from service-owned business authorization and invariants.
+  - Decide when routing, TLS, authentication, quotas, aggregation, or protocol translation justify a gateway.
+  - Design deadlines, partial failure, fan-out, and scaling behavior for an aggregated client request.
+  - Explain when a simple reverse proxy, direct service endpoint, or backend-for-frontend is preferable.
+relatedLessons:
+  - 03-01-reverse-proxy-and-load-balancer
+  - 03-03-l4-vs-l7
+  - 03-05-service-discovery
+  - 03-07-monolith-to-microservices
+---
+
+# API Gateways
+
+> An API gateway is a public-facing application-aware entry point that can route and shape requests; it is useful when the edge has a real problem to solve, not a mandatory badge of microservices.
+
+## Why This Exists
+
+With one backend, a client can call one stable API. With several independently deployed services, a mobile app that calls identity, catalog, recommendations, and orders directly must know every hostname, auth flow, version, retry rule, and response shape. Each client duplicates cross-cutting code, creates chatty network paths, and becomes coupled to internal topology.
+
+The naive improvement is to expose all services behind a single reverse proxy and add every possible feature there. That can simplify endpoint discovery, but an overloaded gateway becomes a central bottleneck and a convenient place to hide business logic, unbounded fan-out, and unsafe retries. A useful gateway has a narrow contract: it routes and protects the edge, adapts client protocols deliberately, and composes only where a client-facing use case needs it. Domain services still own authorization, invariants, and data.
+
+If one simple service has no topology or policy problem, a gateway may add an unnecessary hop and operational cost. A reverse proxy or managed ingress can be sufficient.
+
+## Mental Model
+
+Think of the gateway as a **policy and shape boundary**, not as the owner of every decision:
+
+| Responsibility | Gateway can do | Service must still do |
+| --- | --- | --- |
+| Routing | Map public paths/versions to service endpoints. | Enforce the domain operation and resource ownership. |
+| Transport/security edge | TLS termination, request-size limits, CORS, token verification, mTLS to upstream. | Authorize the caller for this object/action and protect trusted boundaries. |
+| Traffic policy | Per-client quotas, coarse rate limiting, deadlines, admission. | Apply domain-specific limits and correctness semantics. |
+| Adaptation | Protocol translation, version compatibility, client-specific response shape. | Preserve business meaning and stable service contracts. |
+| Aggregation | Compose a bounded read view or backend-for-frontend response. | Own each source of truth and define freshness/partial-result behavior. |
+| Operations | Request IDs, access metrics, coarse tracing, policy logs. | Emit domain metrics, audit decisions, and dependency outcomes. |
+
+The gateway is a reverse proxy with a deliberately defined public API. A **backend for frontend (BFF)** is a specialized gateway or composition service for one client shape, such as mobile or web. Naming it BFF is useful when the aggregation and adaptation code has a client-specific owner; it is not a reason to create one for every screen.
+
+## How It Works
+
+A request usually follows:
+
+```text
+client ──TLS──> gateway
+                  ├─ authenticate / quota / validate
+                  ├─ route or aggregate
+                  ├─ deadline + bounded fan-out
+                  └──> service(s) ──> owned data
+```
+
+For routing, the gateway checks method/path/version, selects a discovered service endpoint, forwards a request ID and authenticated principal, and maps upstream errors to a stable public error contract. It should preserve a deadline so a slow dependency cannot consume the entire client timeout. Retry only operations with a safe idempotency contract, and avoid retrying at every hop.
+
+For aggregation, the gateway makes several downstream calls in parallel when safe, applies per-call deadlines, and chooses whether to return a partial response, a cached/stale section, or an error. Fan-out changes the capacity equation: one client request can become `N` downstream requests plus serialization and connection work. A gateway should not hide an unbounded graph behind one endpoint.
+
+Authentication at the gateway answers “who is this caller and is the credential valid?” Authorization in a domain service answers “may this caller perform this action on this resource under current business rules?” Gateway claims must be integrity-protected and propagated over a trusted channel; services should not blindly trust client-supplied headers.
+
+## Example
+
+A shopping app's home screen needs profile, catalog, recommendations, and an order summary. A mobile client calling four services directly would need four base URLs, four timeout policies, and four response parsers. A mobile BFF at `/mobile/home` can authenticate once and aggregate the read calls in parallel.
+
+Set a 300 ms client deadline. Give profile and order summary 180 ms each, recommendations 100 ms, and leave budget for gateway overhead. If recommendations time out, return the home screen with a clearly marked empty recommendation section; if order summary is unavailable, return a response that tells the client whether to show cached state or a retry affordance. Record per-dependency latency and partial-result counts. Do not place “discount eligibility” logic in the gateway if the order or pricing service owns that invariant.
+
+At peak, 2,000 home requests/s can produce roughly 8,000 downstream reads/s before retries. Size the gateway's connections, CPU, serialization, and downstream quotas for the fan-out, not just 2,000 incoming requests/s. If the screen's data needs grow to 20 calls, split the use case or create a purpose-built read model rather than making the gateway a distributed monolith.
+
+## Visualization We Eventually Want
+
+Build a gateway topology simulator with direct-client, simple-proxy, shared gateway, and BFF scenarios. Controls should include:
+
+- client count, request rate, payload size, and API version;
+- route table, authentication mode, per-client quota, rate limit, request/response validation, and protocol translation;
+- fan-out count, sequential versus parallel aggregation, per-dependency deadline, partial response policy, and retry count;
+- dependency latency/errors, gateway replica count, connection-pool size, and config rollout; and
+- a toggle that moves business authorization from the service into the gateway to show the resulting trust/correctness risk.
+
+Show incoming versus downstream QPS, per-hop p50/p95/p99 latency, gateway CPU/memory, queue depth, errors by dependency, partial responses, and retry amplification. A preset **“mobile home fan-out”** should make one request becoming four visible. Another **“single service”** preset should show that the gateway's extra hop buys little when no edge problem exists.
+
+## Scaling Behavior
+
+Scale gateway replicas horizontally and keep routing/configuration stateless where possible. Capacity depends on TLS handshakes, open connections, request parsing, policy evaluation, serialization, logging, and aggregation—not only incoming QPS. Use separate pools or BFFs for very different clients and traffic shapes; a large upload, WebSocket, and tiny JSON request should not compete blindly.
+
+Aggregation can multiply load and tail latency. If each of four dependencies succeeds in 99% of requests independently, an all-or-nothing aggregate has an approximate success probability of `0.99^4 ≈ 96%` before shared failures. Parallel calls reduce added latency but increase concurrent downstream load. Caches or read models can reduce fan-out when freshness permits.
+
+Gateway configuration and policy rollout need canaries, versioning, and rollback. A stateless data plane can still have a stateful control-plane failure if a route or auth policy update is wrong.
+
+## Failure Modes
+
+- **Gateway single point of failure:** One gateway or config store can take every public API down. Use redundant replicas, safe defaults, and tested failover.
+- **Central blast radius:** A bad route, auth rule, certificate, or parser rejects otherwise healthy services. Canary changes and per-route isolation reduce impact.
+- **Fan-out tail:** One slow dependency holds the aggregate response. Use per-call deadlines, parallelism, partial results, and bounded concurrency.
+- **Retry amplification:** Client, gateway, and service retries multiply a dependency incident. Assign retry ownership and propagate a total deadline.
+- **Authorization gap:** Gateway authentication is mistaken for resource authorization. Keep domain checks at the owning service.
+- **Gateway business monolith:** Cross-service orchestration and domain rules accumulate in one gateway, coupling teams and releases.
+- **Configuration/control-plane outage:** New routes or policies cannot deploy, or stale routes point at retired services. Keep last-known-good configuration with explicit expiry and audit.
+- **Protocol mismatch:** A gateway translation silently loses streaming, error, or idempotency semantics. Treat adaptation as a contract with tests.
+
+## Trade-offs
+
+A gateway hides internal topology, centralizes edge policy, reduces client chattiness, and can tailor APIs. It adds a hop, latency, capacity cost, configuration blast radius, and a tempting place for business logic. Aggregation can improve client latency and compatibility but multiplies backend work and partial-failure states. Centralized auth and rate limits improve consistency but create a high-value operational and security boundary.
+
+## Alternatives
+
+- **Direct client-to-service APIs:** Suitable for a small system, trusted internal clients, or when each client truly needs different services and can manage versioning.
+- **Managed reverse proxy / ingress:** Suitable when routing, TLS, and basic limits solve the problem without aggregation or rich policy.
+- **BFF per client class:** Useful when mobile, web, partner, and internal clients have different payload, caching, or release needs.
+- **Service mesh:** Useful for service-to-service mTLS, routing, and telemetry; it does not replace a public client contract or domain authorization.
+- **Read model / edge cache:** Better than runtime fan-out when a stable, slightly stale projection can serve a read-heavy screen.
+
+## When to Use
+
+Use a gateway when multiple client types need a stable public contract, centralized edge authentication/quota/TLS policy, path/version routing, or a bounded client-facing aggregation. State the exact responsibility and ownership boundary. Prefer a managed gateway or reverse proxy when its capabilities cover the requirement.
+
+## When Not to Use
+
+Do not add a gateway to a small single-service application solely because a microservice diagram usually contains one. Do not use it as a shared database abstraction or put business-critical authorization only at the edge. Do not aggregate an unbounded set of services synchronously; use a read model or asynchronous workflow when the shape demands it.
+
+## Common Misconceptions
+
+- **An API gateway is just a load balancer.** It may route, but its public API adaptation, policy, and aggregation create additional semantics and risks.
+- **Gateway authentication is authorization.** Resource ownership and business rules belong to the service that owns the data.
+- **One client request equals one backend request.** Aggregation can create fan-out and a larger failure/capacity surface.
+- **Gateways make microservices necessary.** A modular monolith can use a public edge adapter, and a simple service may need only ingress.
+- **Putting all cross-cutting logic in one gateway reduces complexity.** It can concentrate blast radius and turn the gateway into a distributed monolith.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I introduce an API gateway when clients need a stable contract across services or the edge needs centralized routing, TLS, authentication, quotas, or bounded aggregation. The gateway authenticates and shapes traffic, but each owning service still authorizes domain actions and protects invariants. I size it for fan-out and connection/policy work, assign one retry/deadline budget, define partial-failure behavior, and mention that a reverse proxy or direct endpoint may be simpler for a small system.
+
+### When to Introduce It
+
+Introduce it after identifying multiple client types, public topology coupling, repeated edge policy, or a client request that needs a bounded composition. Name the edge responsibility before drawing a central box.
+
+### Common Follow-Ups
+
+- Which checks occur at the gateway versus the service?
+- How does an aggregate response behave when one dependency is slow or down?
+- What is the downstream QPS after fan-out and retries?
+- How do route and auth policy changes roll out safely?
+- Why is a BFF different from a generic gateway, and when would direct calls be better?
+
+### Common Candidate Mistakes
+
+- Treating the gateway as a default microservices component rather than a requirement-driven edge.
+- Putting business authorization and data ownership in the gateway.
+- Forgetting that aggregation multiplies downstream work and tail latency.
+- Giving the client, gateway, and service independent unlimited retries.
+- Ignoring gateway redundancy, connection limits, config rollback, and blast radius.
+
+## Summary
+
+- A gateway is an application-aware public boundary, not a compulsory microservices ornament.
+- Keep routing, edge policy, and client adaptation distinct from service-owned authorization and invariants.
+- Aggregation requires deadlines, bounded fan-out, partial-failure semantics, and capacity estimates based on downstream work.
+- A managed proxy, direct API, BFF, or read model can be a better fit depending on the requirement.
+- Centralization buys consistency and a stable client contract while adding latency, cost, and blast radius.
+
+## Quiz Seeds
+
+1. When does a reverse proxy satisfy the requirement without an API gateway?
+2. Why must an order service still authorize an order action when a gateway validates the user's token?
+3. A home-screen gateway fans out to four services. What happens to downstream QPS and all-or-nothing success probability?
+4. Which controls should be per dependency in an aggregate request rather than one global timeout?
+5. Name one scenario where a BFF is preferable to one shared gateway API.
+6. What failure can occur if client, gateway, and service each retry a timed-out write?
+7. Why can a gateway become a distributed monolith, and which ownership rule helps prevent it?
+
+## Related Topics
+
+- [L4 versus L7 routing](l4-vs-l7.mdx)
+- [Service discovery](service-discovery.mdx)
+- [Monolith to microservices](monolith-to-microservices.mdx)
+- [REST, RPC, gRPC, and GraphQL](../02-networking/rest-rpc-grpc-graphql.mdx)
+
+## References
+
+### Documentation / Articles
+
+- [Use API gateways in microservices](https://learn.microsoft.com/en-us/azure/architecture/microservices/design/gateway) — explains gateway routing, aggregation, offloading, and the concerns that remain at services.
+- [Design patterns for microservices](https://learn.microsoft.com/en-us/azure/architecture/microservices/design/patterns) — compares gateway routing, aggregation, offloading, and backend-for-frontend patterns.
+- [Amazon API Gateway concepts](https://docs.aws.amazon.com/apigateway/latest/developerguide/api-gateway-basic-concept.html) — documents a managed gateway's resources, stages, integrations, and public API boundary.
+- [Envoy architecture overview](https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/arch_overview) — provides a concrete proxy model for listeners, filters, routing, and upstream clusters.

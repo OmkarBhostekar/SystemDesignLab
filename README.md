@@ -8,7 +8,7 @@ The project is intentionally being built in increments. The theory curriculum is
 
 ## Current status
 
-The project is at **M0 — repository setup and theory curriculum authoring**. The repository contains the product and technical foundation, the complete dependency scaffold, and the four completed Module 00 theory lessons. The application and test harness will be introduced in later stages.
+The project is at **M0 — repository setup and theory curriculum authoring**. The repository contains the product and technical foundation, the complete dependency scaffold, and 29 completed theory lessons across Modules 00–03. The application and test harness will be introduced in later stages.
 
 Read the [product requirements](docs/PRD.md) for the learning goals, the [curriculum map](docs/curriculum-map.md) for stable lesson IDs and dependencies, the [content guidelines](docs/content-guidelines.md) for authoring conventions, the [architecture plan](docs/architecture.md) for technical boundaries, and the [testing strategy](docs/testing-strategy.md) for risk-based verification.
 

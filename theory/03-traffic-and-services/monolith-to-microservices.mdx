@@ -1,0 +1,200 @@
+---
+type: lesson
+id: 03-07-monolith-to-microservices
+slug: monolith-to-microservices
+title: From Monolith to Modular Monolith to Microservices
+description: Evolve deployment and ownership boundaries in response to real bottlenecks instead of treating a microservice split as a default.
+module: traffic-and-services
+order: 7
+difficulty: core
+estimatedMinutes: 35
+prerequisites:
+  - 03-06-api-gateway
+  - 03-01-reverse-proxy-and-load-balancer
+  - 01-02-horizontal-vs-vertical-scaling
+  - 02-05-rest-rpc-grpc-graphql
+tags:
+  - monolith
+  - modular-monolith
+  - microservices
+  - decomposition
+  - deployment-boundaries
+  - organizational-scale
+objectives:
+  - Distinguish a deployable monolith, a modular monolith, and independently deployable microservices.
+  - Explain which product, team, release, scaling, and failure pressures can justify extracting a service.
+  - Describe a safe incremental extraction path with contracts, data ownership, migration, and rollback.
+  - Evaluate the latency, consistency, observability, operations, and organizational costs of a service split.
+relatedLessons:
+  - 03-06-api-gateway
+  - 03-08-service-boundaries
+  - 00-04-interview-framework
+  - 03-04-health-checks-and-failover
+---
+
+# From Monolith to Modular Monolith to Microservices
+
+> A monolith is a deployment shape, a modular monolith is a disciplined code and ownership shape inside one deployment, and microservices trade process independence for distributed-system cost.
+
+## Why This Exists
+
+A small marketplace can start as one application and one database. One deployable unit gives a team a short local feedback loop, in-process calls, simple transactions, and one place to debug. The naive critique—“monoliths do not scale”—is too broad: a well-structured monolith can scale horizontally behind a load balancer, and many systems never need more deployment units.
+
+Pressure appears when the deployment unit couples unrelated release cadences, one workload needs much more capacity than another, a team boundary causes coordination queues, or a change in one area threatens the whole release. Splitting every table into a service is not the only response. First make boundaries explicit inside a **modular monolith**: modules have clear APIs, own their data access, and cannot reach into one another's internals. Then extract only a module whose independent scaling, isolation, compliance, or team ownership justifies a network boundary.
+
+The split buys independent deployability and fault/capacity isolation. It also creates network latency, partial failure, distributed tracing, data consistency work, versioned contracts, CI/CD and runtime overhead, and a larger on-call surface. The correct question is not “monolith or microservices?” but “which boundary removes a demonstrated bottleneck at a cost the organization can operate?”
+
+## Mental Model
+
+Compare the shapes along the boundary that matters:
+
+| Shape | Deployment | Calls | Data ownership | Failure surface | Best default signal |
+| --- | --- | --- | --- | --- | --- |
+| Monolith | One unit | In-process | Often one database, ideally with module ownership | Process/DB failure affects broad scope | Small team, low complexity, cohesive domain. |
+| Modular monolith | One unit | In-process module APIs | Explicit module ownership in shared deployment | Process/DB failure still broad, code coupling lower | Need domain clarity before operational separation. |
+| Microservices | Multiple independently deployable units | Network RPC/events | Each service owns its data and contract | Partial network/dependency failures | Independent scaling, release, isolation, or team boundaries are valuable and operable. |
+
+“Microservice” is not synonymous with a container, a repository, a REST endpoint, or a small class. The meaningful boundary is an independently operated process with an explicit contract and ownership. A distributed system with ten processes and one shared database may have deployment units but still have a shared bottleneck and coupling.
+
+## How It Works
+
+An incremental path avoids making the split a single irreversible migration:
+
+1. Clarify the use case, scale, release, reliability, compliance, and team pressures.
+2. Map domain capabilities and transactions; identify a candidate module with high cohesion and a narrow interface.
+3. Enforce a modular boundary in the existing application: public commands/queries, owned tables, no cross-module writes, and contract tests.
+4. Measure traffic, latency, change frequency, failure impact, and operational readiness.
+5. Extract behind a stable API or event boundary using a strangler route, branch-by-abstraction, or dual-read/dual-write migration only with a reconciliation plan.
+6. Give the new service ownership of its data; migrate writes and reads in phases, observe discrepancies, and define rollback.
+7. Remove the old path and make the boundary real in deployment, access control, telemetry, and on-call ownership.
+
+The source process and new service should not both become permanent writers without an explicit conflict/reconciliation design. A synchronous call across the boundary has a timeout and partial-failure story. An event path has delivery, ordering, duplicate, and freshness semantics. Neither is “just a function call” once it crosses a network.
+
+## Example
+
+An online marketplace begins with a modular monolith containing catalog, cart, order, payment-adapter, and notification modules. Initially, one team deploys weekly and a single relational transaction comfortably handles order creation. The monolith scales horizontally, so more instances are not yet a reason to split.
+
+After growth, the payment adapter needs stricter secrets and a separate release cadence; catalog reads are 20 times larger than order writes and require independent caching; a notifications team wants to deploy without waiting for checkout changes. Extract payment first only if the team can own the API, idempotency, retries, audit, and incident response. Put a gateway or routing adapter in front if clients need a stable endpoint, but keep order invariants out of the gateway.
+
+For catalog, a read-heavy projection or cache may solve the bottleneck without a new service. For notifications, an asynchronous queue may isolate slow delivery while keeping the domain module in the monolith. The architecture can therefore be a modular monolith plus one payment service and an asynchronous notification worker, not an all-or-nothing rewrite.
+
+The team estimates the extracted payment path adds 5–15 ms for a normal RPC, but must tolerate timeouts and processor errors. It preserves a durable idempotency record and returns a status the order module can reconcile. The new service's failure should prevent or delay a payment, not make catalog browsing unavailable. That failure isolation is the reason for the boundary.
+
+## Visualization We Eventually Want
+
+Build an evolution simulator with three architecture states: monolith, modular monolith, and selected microservice extraction. Controls should include:
+
+- team count, deploy frequency, module change coupling, traffic per capability, and instance capacity;
+- a boundary editor that chooses in-process versus network calls and shared versus owned data;
+- failure injection for a process, database, network link, payment dependency, or notification worker;
+- extraction migration phase (shadow read, dual write, cutover, rollback), contract/version state, and queue lag; and
+- cost sliders for operations, observability, CI/CD, and extra replicas.
+
+Show request hops, p50/p99 latency, deploy blast radius, independent scaling, error propagation, data divergence, queue lag, on-call ownership, and monthly operational units. A preset **“catalog bottleneck”** should demonstrate that a cache/read model can be cheaper than a service split. A **“payment release isolation”** preset should show the justification and new distributed failure edge.
+
+## Scaling Behavior
+
+A monolith can scale horizontally as long as shared state, deployment coupling, and resource contention remain acceptable. A modular monolith preserves in-process latency and one transaction boundary while improving code ownership and testability. Microservices let one capability scale or deploy independently, but every call adds connection pools, timeouts, retries, traces, and capacity planning.
+
+As service count grows, operational work grows faster than process count in some dimensions: dashboards, alerts, certificates, discovery, compatibility, local environments, incident coordination, and dependency graphs. Independent scaling only helps if the bottleneck is inside the extracted capability rather than in a shared database, cache, gateway, or external provider.
+
+## Failure Modes
+
+- **Distributed monolith:** Services are separate deploys but require synchronized releases, share a database, or call one another synchronously in a long chain.
+- **Chatty boundary:** One user request makes dozens of serial RPCs, increasing p99 latency and failure probability.
+- **Shared database coupling:** Independent services write each other's tables, so schema changes and transactions remain coupled.
+- **Partial migration divergence:** Dual writes lose, reorder, or duplicate data; the old and new paths disagree without reconciliation.
+- **Cascading failure:** A slow service fills caller pools; retries and fan-out exhaust the rest of the fleet.
+- **Operational overload:** A small team cannot provide observability, deployment safety, and on-call coverage for many services.
+- **Wrong extraction:** A highly coupled transaction is split, forcing cross-service coordination that is slower and less reliable than a local transaction.
+
+Mitigate with modular contracts first, owned data, bounded calls, asynchronous work where appropriate, idempotency, deadlines, bulkheads, contract testing, tracing, and a measured extraction/rollback plan.
+
+## Trade-offs
+
+Monoliths maximize simplicity and local consistency but can enlarge deployment and failure scope. Modular monoliths improve conceptual and team boundaries without paying network costs, but they still share a process and release. Microservices can isolate changes, scale hot capabilities, and align teams, but pay for network hops, eventual consistency, deployment orchestration, observability, security, and an on-call surface. There is no free “independent scaling” if state and dependencies remain shared.
+
+## Alternatives
+
+- **Keep a well-structured monolith:** Best when team/domain/scale do not justify separation.
+- **Modular monolith:** Best when boundaries are unclear, a team is small, or local transactions and fast development matter.
+- **Service-oriented architecture:** Larger coarser services can provide organizational or platform boundaries with fewer processes than fine-grained microservices.
+- **Asynchronous worker or queue:** Isolates a slow or bursty capability without exposing a synchronous network dependency to the user path.
+- **Read model/cache:** Solves read scaling or view composition when independent ownership is not required.
+- **Strangler migration:** Reduces cutover risk by routing one capability at a time while the old system remains available during validation.
+
+## When to Use
+
+Keep the monolith when it is within its measured capacity and the team can change it safely. Invest in modular boundaries when complexity or ownership is rising. Extract a microservice when independent scaling, release cadence, security/compliance, fault isolation, or team ownership is a high-value requirement and the team can operate the resulting distributed path.
+
+## When Not to Use
+
+Do not split solely because a job description or architecture diagram says “microservices.” Do not create a service for every database table, CRUD noun, or small team. Do not extract a transaction whose invariants require tight local atomicity unless the resulting workflow and consistency semantics are explicit and acceptable.
+
+## Common Misconceptions
+
+- **A monolith cannot scale.** A stateless monolith can scale horizontally; shared state and bottlenecks determine the limit.
+- **A modular monolith is a failed microservice architecture.** It can be an intentional, lower-cost boundary and a useful staging point.
+- **Microservices remove coupling.** They replace some code coupling with network, data, release, and operational coupling.
+- **A separate repository means independent ownership.** Data access, on-call, deployment, and contract authority matter more than repository count.
+- **The migration is complete at the first cutover.** Old writes, schemas, dashboards, runbooks, and rollback paths must be removed or made explicit.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I would start with a monolith or modular monolith unless independent scaling, release cadence, security, fault isolation, or team ownership creates a measured need for a network boundary. A modular monolith makes data and APIs explicit without distributed failure. If we extract a capability, I would migrate behind a contract, give the service data ownership, define timeout/idempotency and rollback behavior, and accept the extra observability and operational cost. Microservices are an option, not a default.
+
+### When to Introduce It
+
+Introduce the evolution choice after requirements and team/operational context are known. Name the pressure that the current shape cannot handle and compare a modular or asynchronous solution before proposing extraction.
+
+### Common Follow-Ups
+
+- What evidence says this capability needs independent scaling or deployment?
+- Who owns its data and schema after extraction?
+- How does a timeout or partial migration affect the user-visible operation?
+- Which service failure should remain isolated, and what does the caller do?
+- Can a modular monolith or queue solve the same pressure more simply?
+
+### Common Candidate Mistakes
+
+- Starting with a microservices diagram before requirements or team constraints.
+- Splitting by technical layer or table instead of a cohesive capability and invariant.
+- Ignoring shared database coupling and distributed transactions.
+- Calling an in-process module a microservice without a deployment/failure boundary.
+- Describing extraction without data migration, reconciliation, rollback, or on-call ownership.
+
+## Summary
+
+- Monolith, modular monolith, and microservices are useful shapes for different pressures.
+- Modular boundaries can capture much of the design value without network failure and operational cost.
+- Extract only when independent scaling, release, isolation, compliance, or team ownership is worth the distributed-system cost.
+- Make contracts, data ownership, migration, failure, observability, and rollback explicit.
+- A successful service split removes a bottleneck; it does not merely multiply processes.
+
+## Quiz Seeds
+
+1. Why can a stateless monolith scale horizontally even though it is one deployment unit?
+2. What is the key difference between a modular monolith and a microservice boundary?
+3. Which evidence would justify extracting a payment capability from a marketplace monolith?
+4. Why does sharing one database across independently deployed services preserve coupling?
+5. Name two failure behaviors that must be designed when an in-process call becomes an RPC.
+6. Why might a read model or queue solve a bottleneck more simply than a new service?
+7. What migration steps protect against divergence during a strangler extraction?
+
+## Related Topics
+
+- [API gateways](api-gateway.mdx)
+- [Service boundaries](service-boundaries.mdx)
+- [Health checks and failover](health-checks-and-failover.mdx)
+- [The interview design framework](../00-interview-method/interview-framework.mdx)
+
+## References
+
+### Documentation / Articles
+
+- [Microservices](https://martinfowler.com/articles/microservices.html) — Martin Fowler's engineering discussion of independently deployable services, trade-offs, and evolutionary design.
+- [Monolith First](https://martinfowler.com/bliki/MonolithFirst.html) — explains why discovering useful boundaries in a working domain can precede a service split.
+- [Decomposing monoliths into microservices](https://docs.aws.amazon.com/prescriptive-guidance/latest/modernization-decomposing-monoliths/) — describes business-capability, transaction, strangler, and branch-by-abstraction migration strategies.
+- [Microservices architecture style](https://learn.microsoft.com/en-us/azure/architecture/guide/architecture-styles/microservices) — summarizes independent deployment/data ownership benefits and the added complexity of service discovery and consistency.

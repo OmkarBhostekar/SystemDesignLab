@@ -1,0 +1,261 @@
+---
+type: lesson
+id: 02-03-tcp-vs-udp
+slug: tcp-vs-udp
+title: TCP, UDP, and QUIC in System Design
+description: Choose transport semantics by asking whether the workload needs reliable ordered bytes, timely datagrams, or multiplexed secure streams.
+module: networking
+order: 3
+difficulty: core
+estimatedMinutes: 35
+prerequisites:
+  - 02-01-request-lifecycle
+  - 02-02-dns
+  - 01-03-latency-vs-throughput
+  - 01-04-percentiles-tail-latency
+tags:
+  - tcp
+  - udp
+  - quic
+  - transport
+  - packet-loss
+  - flow-control
+objectives:
+  - Compare TCP's reliable ordered byte stream with UDP's minimal datagram service and state what each does not guarantee.
+  - Explain how connection setup, retransmission, flow control, congestion control, and head-of-line blocking affect a system's latency and capacity.
+  - Recognize QUIC as a secure, multiplexed transport built over UDP rather than as “UDP with no reliability.”
+  - Choose transport semantics for APIs, telemetry, media, gaming, and internal services without using latency claims as a substitute for requirements.
+  - Design loss, reordering, overload, and reconnect behavior at the application boundary.
+relatedLessons:
+  - 02-02-dns
+  - 02-04-http-evolution
+  - 02-06-realtime-transports
+  - 02-07-api-design-interviews
+---
+
+# TCP, UDP, and QUIC in System Design
+
+> TCP gives applications a reliable ordered byte stream, UDP gives them lightweight datagrams with few promises, and QUIC builds reliable multiplexed streams and security over UDP; the right choice follows from the workload's semantics.
+
+## Why This Exists
+
+The naive answer to “which transport should we use?” is “TCP for reliability, UDP for speed.” That slogan hides the real decision. A payment request needs a clear delivery and duplicate-handling story; a live audio frame may be useless after its playback deadline; a telemetry sample may be safely dropped; and a browser API may constrain what a client can open.
+
+TCP's guarantees simplify application code, but a lost segment can delay later bytes in the same stream while retransmission and congestion control react. UDP avoids connection setup and preserves individual datagram boundaries, but it does not provide delivery, ordering, duplicate protection, congestion control, or flow control. An application that sends important data over UDP must rebuild the guarantees it needs—and operate them correctly.
+
+QUIC is the important modern context: it uses UDP datagrams so it can evolve in user space and traverse existing networks, then supplies encrypted, flow-controlled streams, loss recovery, congestion control, and connection migration. It is not “raw UDP made reliable,” and it is not automatically lower latency for every workload.
+
+```text
+naive:       every workload → TCP stream
+failure:     stale real-time data waits behind lost bytes; handshakes and sockets cost capacity
+improved:    choose TCP / UDP+application semantics / QUIC by deadline and delivery needs
+new cost:    more protocol and operational complexity when choosing datagrams or QUIC
+```
+
+## Mental Model
+
+Transport is the contract between an application and the network. Ask what the application can do when a message is late, missing, duplicated, or out of order:
+
+| Need | TCP | UDP | QUIC |
+| --- | --- | --- | --- |
+| Connection state | Stateful byte-stream connection | No transport connection state | Stateful encrypted connection with IDs |
+| Message boundaries | No; application frames bytes | Yes; datagrams | Streams are byte streams; optional datagrams in QUIC extensions |
+| Delivery/order | Reliable, in-order stream | Not guaranteed | Reliable, in-order per stream |
+| Flow/congestion control | Built in | Application/protocol must supply it | Built in by QUIC |
+| Loss impact | Lost bytes can hold later stream bytes | Application chooses drop/retry behavior | Loss on one stream need not block independent streams |
+| Security | Separate TLS commonly used | Separate security needed (or a protocol above it) | TLS handshake integrated into QUIC |
+| Typical fit | APIs, databases, files | DNS, metrics, media/game datagrams with app semantics | HTTP/3, mobile/global multiplexed traffic |
+
+This table is a starting point, not a benchmark. A high-throughput UDP design that ignores congestion or receiver capacity can harm the network and itself. A TCP design with connection reuse, HTTP/2, and tuned queues may meet the same latency target with much less application code.
+
+## How It Works
+
+### TCP: a reliable ordered byte stream
+
+An application opens a connection to an endpoint. TCP establishes state with a handshake, assigns sequence numbers to bytes, acknowledges received data, retransmits missing data, and applies flow control so a fast sender does not overrun a receiver. Congestion control responds to network conditions rather than treating the path as infinitely fast. The application reads a stream; it must define its own message framing (length prefix, delimiter, or a higher-level protocol such as HTTP).
+
+Reliability means the stack keeps trying within its timers and connection state. It does not mean a server processed a request exactly once, a response reached the caller, or a connection will remain available through a path change. Those are application and system-design concerns. If a client times out after a TCP connection drops, it must still decide whether a write may have committed and whether retrying is safe.
+
+TCP's in-order contract creates head-of-line blocking within a stream: if segment 4 is lost, an application reading the stream cannot consume bytes after it as a complete ordered stream until the gap is repaired. HTTP/2 multiplexes logical streams but still rides one TCP connection, so a lost TCP segment can affect multiple HTTP/2 streams. [HTTP evolution](./http-evolution.mdx) develops the consequence.
+
+### UDP: minimal datagrams
+
+UDP sends independent datagrams with source/destination ports, length, and checksum. It preserves datagram boundaries but does not establish a reliable connection or guarantee delivery, ordering, duplicate suppression, flow control, or congestion control. A datagram can be lost, duplicated, delayed, or delivered out of order; an oversized datagram may be fragmented or discarded depending on the path.
+
+An application can add sequence numbers, timestamps, selective retransmission, authentication, rate control, and a jitter buffer. That can be correct for a specialized workload, but it is now a protocol to design and test. A UDP service must also implement a fair congestion strategy and protect itself from spoofing, amplification, and unbounded input.
+
+### QUIC: secure streams over UDP
+
+QUIC uses UDP packets as its deployable substrate while maintaining connection state in endpoints. Its handshake combines transport negotiation with TLS, and it offers flow-controlled streams, loss detection, congestion control, and connection migration. A connection ID can survive a client changing networks, such as moving from Wi-Fi to cellular. Reliable delivery is per stream, so a loss on one stream need not hold unrelated streams as a single TCP byte stream would.
+
+QUIC's benefits have costs: implementations are more complex, middleboxes may treat UDP differently from TCP, packet processing can consume CPU, and application behavior still needs deadlines, idempotency, and backpressure. QUIC 0-RTT can reduce setup latency for some repeat connections but permits replay concerns for non-idempotent requests; an application must not treat “early data” as proof that a mutation is safe.
+
+### Transport does not define application correctness
+
+All three choices still need an application contract:
+
+- frame messages and authenticate them;
+- define deadlines and cancellation;
+- classify operations as retryable or non-retryable;
+- bound queues, buffers, and concurrent streams;
+- expose sequence, duplicate, and gap behavior when data can be missing;
+- observe connection setup, retransmission/loss, RTT, congestion, and application latency separately.
+
+## Example
+
+### A collaborative whiteboard with two traffic classes
+
+Suppose a whiteboard has durable operations (“move shape,” “rename board”) and ephemeral cursor positions. A naive design sends both over one TCP connection. It is easy to implement, but a lost packet can delay cursor updates behind an operation that is being retransmitted; stale cursor motion feels laggy even though durable edits are safe.
+
+An improved design keeps durable operations on an authenticated HTTPS or WebSocket/TCP channel with sequence numbers and an idempotency key. The server persists accepted edits and broadcasts them in an order the collaboration model defines. Cursor positions use a separate real-time channel where the newest position supersedes older positions; the receiver can drop stale updates and interpolate between timestamps. QUIC streams or a datagram-capable protocol may be considered if supported by the client, but browser and network constraints may make one WebSocket plus application-level message classes the simpler choice.
+
+```text
+browser
+  ├─ reliable edit stream ──▶ collaboration service ──▶ durable log/store
+  └─ ephemeral cursor updates ──▶ presence/room fan-out (drop stale frames)
+```
+
+The new trade-off is that the client now handles two reliability models and must reconcile a cursor update arriving before or after a durable edit. It needs an authoritative revision/operation ID for edits, a TTL for presence, and a reconnect snapshot so it does not rely on an unbounded stream history.
+
+### A metric ingestion path
+
+For high-volume host metrics, a naive TCP connection per sample creates handshake, socket, and head-of-line overhead. A batched TCP or QUIC stream is often enough: send timestamped batches, compress, apply backpressure, and retry at the batch/sequence level. UDP can be appropriate for disposable sampling where a small loss is cheaper than queueing, but only if the service can tolerate loss and the sender implements an appropriate rate limit. “UDP is faster” is not a requirement; “a sample past its 5-second freshness window has no value” is.
+
+## Visualization We Eventually Want
+
+Build a transport simulator that sends numbered messages over TCP-like stream, UDP datagrams, and QUIC-like independent streams.
+
+### Controls
+
+- loss probability, reordering, duplication, RTT, jitter, bandwidth, and receiver capacity;
+- message size and frame boundaries;
+- TCP congestion/receive windows and retransmission timeout;
+- UDP application policy: drop late, retry selected messages, or add a jitter buffer;
+- QUIC stream count, per-stream loss, connection migration, and 0-RTT toggle;
+- workload deadline: durable, retryable, or stale-after-deadline.
+
+### Behavior and outputs
+
+Show packet/message traces and a text explanation. For TCP, make later bytes wait after a loss in the same stream; for multiple HTTP/2-like streams, show that one TCP loss can delay several logical streams. For UDP, show gaps, duplicates, and late drops until the learner adds sequence numbers and rate control. For QUIC, show independent stream progress and a network-interface change that keeps the connection ID. Report goodput, delivered-on-time fraction, retransmissions, queue depth, open connections, CPU, and user-visible freshness—not only raw packet rate.
+
+## Scaling Behavior
+
+- **More clients:** connection count, file descriptors, per-connection memory, handshake CPU, and NAT/load-balancer state become limits. Reuse connections and use event-driven I/O where appropriate.
+- **More throughput:** congestion control and link capacity matter; batch and compress before increasing packet rate. UDP senders must not overwhelm receivers or the network.
+- **More loss/long-distance RTT:** TCP/QUIC retransmission increases completion time; tune deadlines and decide whether stale data should be dropped. QUIC's stream independence helps multiplexed traffic but does not remove congestion.
+- **More streams:** HTTP/2/QUIC flow-control windows and scheduler fairness matter. A single connection can be efficient, but one connection failure can trigger a reconnect burst.
+- **More regions/mobile movement:** QUIC connection migration can preserve a connection across path changes; any transport still needs authentication, replay handling, and regional routing semantics.
+- **More messages:** frame and bound messages, use backpressure, and expose sequence/checkpoint state so replay/reconnect does not require guessing.
+
+## Failure Modes
+
+| Failure | TCP behavior | UDP behavior | QUIC/application response |
+| --- | --- | --- | --- |
+| Packet loss | Retransmit; in-order readers wait | Datagram may disappear; application decides | Retransmit stream data; unrelated streams can progress |
+| Reordering | Hidden by sequence/reassembly | Delivered out of order or discarded | Reassembled per stream |
+| Sender faster than receiver | Receive-window backpressure | No built-in flow control; buffers can overflow | Per-stream/connection flow control |
+| Congestion | Congestion control reduces sending | Raw UDP can create unfair overload unless app controls rate | QUIC congestion control applies |
+| Connection/path failure | Connection breaks; reconnect may duplicate writes | Datagrams simply stop; app has to detect | Connection IDs/migration may survive some path changes; still can fail |
+| Client timeout after write | Server may have committed despite missing response | Same ambiguity, plus delivery uncertainty | Same application ambiguity; use idempotency/reconciliation |
+| Middlebox blocks transport | TCP usually passes common paths | UDP can be filtered or rate-limited | May need fallback/alternate path; HTTP/3 can fall back to TCP HTTP |
+
+Never equate a transport acknowledgment with a business acknowledgment. TCP ACK says bytes arrived at the peer's transport stack; it does not say a database transaction committed. QUIC acknowledgment has the same boundary.
+
+## Trade-offs
+
+- TCP gives a mature, general-purpose reliability and congestion-control contract at the cost of ordered-stream head-of-line behavior and connection state.
+- UDP gives message boundaries and minimal overhead, but moves reliability, security, rate control, and fairness into the application or a higher protocol.
+- QUIC adds secure multiplexed streams and migration without waiting for kernel TCP evolution, but costs implementation/CPU complexity and may face UDP path issues.
+- One long-lived connection amortizes handshakes and can improve efficiency, but its failure causes a reconnect burst and its state may be concentrated on one route.
+- Multiple connections can isolate streams and increase parallelism, but consume more congestion windows, sockets, and load-balancer state.
+
+## Alternatives
+
+- **TCP + TLS + HTTP:** default for ordinary request/response APIs, databases, and durable transfers.
+- **HTTP/2 over TCP:** useful for multiplexed browser/service traffic when HTTP semantics and broad compatibility matter; TCP head-of-line behavior remains.
+- **HTTP/3 over QUIC:** useful for mobile/high-latency paths and multiplexing where clients and infrastructure support UDP/QUIC.
+- **UDP with a domain protocol:** useful for time-sensitive, lossy media or specialized telemetry; only when the team can specify and operate reliability/fairness/security behavior.
+- **Message broker over TCP:** useful for durable asynchronous delivery and consumer backpressure; it adds broker state and is not a replacement for a user-facing transport.
+
+## When to Use
+
+Use TCP when the application needs an ordered reliable stream and can tolerate retransmission latency. Consider UDP when individual messages have deadlines, can be dropped or independently repaired, and preserving datagram boundaries matters. Consider QUIC when multiplexed secure streams, connection migration, or reduced handshake coupling justify the deployment and client support. In an interview, state the message semantics and loss policy before naming the protocol.
+
+## When Not to Use
+
+Do not choose UDP solely because a blog says it is faster, and do not send financial mutations over an unacknowledged datagram without a complete application protocol. Do not switch to QUIC to hide an overloaded database or an unbounded queue. Avoid implementing TCP-like reliability from scratch unless the workload truly needs a different message/deadline model and the team can own the protocol.
+
+## Common Misconceptions
+
+- **“TCP is a message protocol.”** It is a byte stream; message framing belongs to HTTP or the application.
+- **“UDP is unreliable and therefore useless.”** Its minimal datagrams can be ideal when timeliness beats retransmission, but the application must own the omitted semantics.
+- **“UDP has no congestion control.”** The UDP layer does not supply it; responsible protocols layered above UDP do.
+- **“QUIC is just UDP.”** QUIC is a stateful secure transport with streams, flow control, loss recovery, congestion control, and connection IDs carried in UDP datagrams.
+- **“TCP guarantees exactly once.”** It delivers bytes reliably to the peer or reports connection failure; it does not guarantee one business operation or one database commit.
+- **“QUIC eliminates head-of-line blocking everywhere.”** It removes cross-stream TCP ordering blockage, but loss still delays data on the affected stream and congestion still affects the connection.
+- **“0-RTT makes every write safe.”** Early data can be replayed; only replay-safe operations should use it.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+“TCP is a reliable ordered byte stream with flow and congestion control, so it is a strong default for APIs and durable data; it has handshake/state cost and stream-level head-of-line blocking. UDP preserves datagram boundaries but offers no delivery, ordering, flow, or congestion guarantees, so I use it only when the application can drop or repair messages and I define those rules. QUIC uses UDP as a substrate but adds TLS, reliable per-stream delivery, flow control, congestion control, and path migration, which is useful for HTTP/3 and some mobile/multiplexed traffic.”
+
+### When to Introduce It
+
+Introduce transport choice when the prompt mentions mobile networks, streaming, real-time updates, high connection counts, packet loss, custom protocols, or HTTP/3. Start with the semantic requirement and then discuss the default transport and exception.
+
+### Common Follow-Ups
+
+- What does the application do when a message is lost, duplicated, or late?
+- Does an acknowledgment mean bytes arrived or the operation committed?
+- How do you bound connection count, buffers, retries, and reconnect storms?
+- How does HTTP/2 over TCP differ from HTTP/3 over QUIC under packet loss?
+- What happens when a client moves from Wi-Fi to cellular?
+- What security and congestion-control responsibilities exist if you use UDP directly?
+
+### Common Candidate Mistakes
+
+- Choosing UDP before defining deadlines and delivery semantics.
+- Calling TCP “slow” without separating handshake, RTT, queueing, congestion, and application work.
+- Forgetting TCP message framing or treating one connection as infinite capacity.
+- Treating QUIC as raw UDP or claiming it eliminates all head-of-line blocking.
+- Using 0-RTT for non-idempotent writes without replay protection.
+
+## Summary
+
+1. Choose a transport contract based on late, missing, duplicate, and out-of-order message behavior.
+2. TCP simplifies reliable ordered streams but does not guarantee business-level exactly-once effects.
+3. UDP is lightweight and message-preserving, not magically reliable or congestion-safe.
+4. QUIC carries secure, flow-controlled, congestion-controlled streams over UDP and isolates loss between streams.
+5. Deadlines, framing, authentication, backpressure, idempotency, and observability remain application responsibilities.
+
+## Quiz Seeds
+
+1. Why must an application frame messages over TCP, and what happens when a frame is split across reads?
+2. A cursor update is already 500 ms old. Which transport behavior should the application prefer: retransmit, drop, or buffer? Explain the requirement.
+3. Why can a TCP loss delay multiple HTTP/2 requests on one connection?
+4. Which guarantees does raw UDP omit, and which would you add for a telemetry protocol?
+5. What does QUIC add above UDP, and why does that make HTTP/3 different from “HTTP over UDP”?
+6. Why is a TCP ACK not proof that a payment was committed?
+7. When can QUIC 0-RTT be unsafe?
+8. How would increasing the number of TCP connections affect congestion, sockets, and load-balancer state?
+
+## Related Topics
+
+- [DNS](./dns.mdx) explains the resolution step and why existing connections can outlive an address change.
+- [HTTP evolution](./http-evolution.mdx) maps HTTP/1.1, HTTP/2, and HTTP/3 onto these transport properties.
+- [Real-time transports](./realtime-transports.mdx) applies transport semantics to polling, SSE, and WebSockets.
+- [API design for interviews](./api-design-interviews.mdx) connects delivery ambiguity to idempotency and request contracts.
+- [Latency versus throughput](../01-foundations/latency-vs-throughput.mdx) frames handshake, retransmission, and queueing trade-offs.
+
+## References
+
+### Documentation / Articles
+
+- [Transmission Control Protocol (RFC 9293)](https://www.rfc-editor.org/rfc/rfc9293.html) — current IETF TCP specification covering sequence numbers, acknowledgments, connection state, retransmission, and flow/congestion behavior.
+- [User Datagram Protocol (RFC 768)](https://www.rfc-editor.org/rfc/rfc768.html) — the minimal UDP datagram contract and its explicit absence of delivery and duplicate protection.
+- [Services Provided by IETF Transport Protocols (RFC 8095)](https://www.rfc-editor.org/rfc/rfc8095.html) — a comparative description of transport services, including UDP message boundaries and omitted control mechanisms.
+- [QUIC Transport Protocol (RFC 9000)](https://www.rfc-editor.org/rfc/rfc9000.html) — QUIC’s secure, stream-oriented transport, connection migration, flow control, and UDP deployment model.
+- [Using TLS to Secure QUIC (RFC 9001)](https://www.rfc-editor.org/rfc/rfc9001.html) — how QUIC integrates TLS for handshake, confidentiality, and peer authentication.
+- [HTTP/2 (RFC 9113)](https://www.rfc-editor.org/rfc/rfc9113.html) — the IETF explanation that HTTP/2 multiplexes streams over a connection while TCP head-of-line blocking remains.

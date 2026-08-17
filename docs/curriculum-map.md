@@ -2,7 +2,7 @@
 
 **Status:** canonical dependency map and curriculum scaffold
 
-This document is the dependency-oriented index for the theory curriculum described by [`docs/PRD.md`](./PRD.md) and organized according to [`CODEX.md`](../CODEX.md). It defines module order, lesson IDs, depth, prerequisites, and downstream connections. Module 00 now has complete theory lesson files; Modules 01–13 remain module-level scaffolds. No module README alone claims that lesson prose, visualizations, quizzes, or interview lenses are complete.
+This document is the dependency-oriented index for the theory curriculum described by [`docs/PRD.md`](./PRD.md) and organized according to [`CODEX.md`](../CODEX.md). It defines module order, lesson IDs, depth, prerequisites, and downstream connections. Modules 00–03 now have complete theory lesson files; Modules 04–13 remain module-level scaffolds. No module README alone claims that lesson prose, visualizations, quizzes, or interview lenses are complete.
 
 ## How to read this map
 
@@ -167,8 +167,8 @@ Not Started → Theory Complete → Visualization Complete → Quiz Passed → M
 
 At the current theory-authoring stage:
 
-- all module directories and READMEs exist, but Modules 01–13 remain **structure only**;
-- Module 00 theory is complete in four indexed `.mdx` lessons with interview lenses, quiz seeds, cross-links, and verified references;
-- interactive visualizations and structured quizzes remain future work for Module 00;
+- all module directories and READMEs exist, but Modules 04–13 remain **structure only**;
+- Modules 00–03 theory is complete in 29 indexed `.mdx` lessons with interview lenses, quiz seeds, cross-links, and verified references;
+- interactive visualizations and structured quizzes remain future work for Modules 00–03;
 - no other lesson is marked complete merely because its ID appears in this map;
 - a module may be called complete only after every intended lesson in its README satisfies the theory definition of done.

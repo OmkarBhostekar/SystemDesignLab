@@ -1,0 +1,286 @@
+---
+type: lesson
+id: 02-06-realtime-transports
+slug: realtime-transports
+title: Polling, SSE, and WebSockets
+description: Choose a real-time delivery pattern by comparing freshness, directionality, connection cost, replay, proxy behavior, and scale.
+module: networking
+order: 6
+difficulty: core
+estimatedMinutes: 38
+prerequisites:
+  - 02-04-http-evolution
+  - 02-03-tcp-vs-udp
+  - 02-01-request-lifecycle
+  - 01-03-latency-vs-throughput
+relatedLessons:
+  - 02-05-rest-rpc-grpc-graphql
+  - 02-07-api-design-interviews
+  - 01-04-percentiles-tail-latency
+tags:
+  - realtime
+  - polling
+  - long-polling
+  - server-sent-events
+  - websockets
+  - connections
+  - fanout
+objectives:
+  - Compare short polling, long polling, server-sent events, and WebSockets by freshness, directionality, overhead, browser fit, and operational complexity.
+  - Design reconnect, heartbeat, event-ID, replay, duplicate, ordering, authorization, and backpressure behavior for a connected client population.
+  - Estimate connection, memory, file-descriptor, bandwidth, and reconnect-storm pressure as users and fan-out grow.
+  - Select a transport for notifications, chat, presence, dashboards, or job progress without conflating transport delivery with durable business state.
+  - Explain how a multi-instance service shares subscriptions and events without requiring a client to stay on one process forever.
+---
+
+# Polling, SSE, and WebSockets
+
+> Real-time UX is a freshness and delivery contract; choose the simplest transport that meets its directionality and deadline, then design reconnect and replay as carefully as the first connection.
+
+## Why This Exists
+
+An ordinary request/response API tells the server when the client wants an update. A dashboard, chat room, job-progress page, or alerting screen may need new information within seconds or milliseconds after a server-side event. The naive solution is short polling: ask `/updates` every five seconds. It is easy to deploy, but most requests find nothing, updates wait for the next interval, and a synchronized client population creates request spikes.
+
+The improvement is to keep a request pending (long polling), stream server-to-client events over HTTP (SSE), or open a bidirectional message channel (WebSocket). Each reduces one kind of waste while introducing connection state, intermediary timeouts, fan-out, reconnect, authentication-refresh, and backpressure work.
+
+```text
+naive:       client ──GET updates──▶ server every N seconds
+failure:     stale data + empty-request load + synchronized polling spikes
+improved:    pending HTTP / SSE stream / WebSocket session
+new cost:    many long-lived connections, reconnect storms, replay and flow-control design
+```
+
+## Mental Model
+
+First define the event contract:
+
+- **Freshness/deadline:** how old can an update be before it is useless?
+- **Direction:** server-to-client only, client-to-server only, or both?
+- **Durability:** can an event be dropped, or must a reconnect catch it up?
+- **Ordering:** global, per room/user/entity, or no order?
+- **Population:** how many connected users, events per second, and recipients per event?
+- **Client constraints:** browser/mobile APIs, proxies, NATs, battery, and network changes.
+
+| Transport | Direction | Connection pattern | Strength | Main cost/limit |
+| --- | --- | --- | --- | --- |
+| Short polling | Client asks; server responds | Repeated finite HTTP requests | Simplest, broadly compatible, easy horizontal scaling | Empty requests, interval latency, synchronized bursts, battery/bandwidth |
+| Long polling | Server holds response until event/timeout | Repeated pending HTTP requests | Lower idle request overhead; HTTP-friendly fallback | One pending request per client, timeout/reconnect churn, proxy limits |
+| SSE/EventSource | Server → client | Long-lived `text/event-stream` HTTP response | Simple one-way events, event IDs/reconnect conventions, HTTP auth/proxies | One-way, text-oriented, buffering/idle timeout, browser backpressure limits |
+| WebSocket | Bidirectional | HTTP-compatible handshake then framed session | Low-latency two-way messages and custom subprotocols | Stateful connections, backpressure/replay/auth design, intermediary and scaling complexity |
+
+No transport makes an event durable. A connection may fail after the server sends bytes; if the event matters, persist it or provide a snapshot/cursor and replay protocol.
+
+## How It Works
+
+### Short polling
+
+The client calls an endpoint at a fixed interval, such as `GET /notifications?since=cursor`. The server returns new events or an empty result. A five-second interval bounds freshness near five seconds in the ideal case but creates up to `clients / interval` request rate even when nothing changes. A jittered interval reduces synchronization, and adaptive polling can slow when idle or speed when activity is likely.
+
+Short polling is often the right baseline for low-frequency job status or a small internal dashboard. Use an explicit cursor/time boundary so a delayed response does not cause the client to skip or duplicate updates; do not use wall-clock time alone when events can share timestamps.
+
+### Long polling
+
+The client sends a request with its current cursor. If no event is ready, the server holds the response for a bounded duration, such as 20–60 seconds, then returns an empty/timeout response so the client reconnects. If an event becomes available, the server responds immediately; the client starts the next request.
+
+This removes most empty requests while retaining HTTP semantics, but each waiting client occupies server/proxy state. Timeouts are intentional: they allow load balancers and intermediaries to recycle stale sockets and give clients a heartbeat/reconnect opportunity. The client must add backoff and jitter so a shared timeout does not become a reconnect storm.
+
+### Server-sent events (SSE)
+
+The client opens an HTTP request using `EventSource`; the server responds with `Content-Type: text/event-stream` and sends a stream of UTF-8 events separated by blank lines. Fields can include `event`, `data`, `id`, and `retry`. The browser API reconnects after a failure, and an event ID can let the server resume from the client's last acknowledged position when the application supports it. A comment/heartbeat can keep an intermediary from treating the stream as idle.
+
+SSE is one-way: client commands still use ordinary HTTP requests or another channel. This makes it a good fit for notifications, job progress, dashboards, and market/read-only updates. It is not a free durability layer: an event sent while a client is disconnected is lost unless the server stores it and implements replay. Intermediaries may buffer data unless configured for streaming, and every proxy/load balancer timeout must exceed the heartbeat interval.
+
+### WebSockets
+
+The client begins with an HTTP-compatible Upgrade handshake. After acceptance, the WebSocket connection carries framed messages in both directions over TCP. The application chooses a subprotocol and message schema (for example, `join`, `message`, `ack`, `presence`, `resume`). It must specify authentication, authorization per room, heartbeats, maximum message size, rate limits, ordering, acknowledgments, reconnect, and replay.
+
+WebSockets are useful when the client sends frequent commands while the server pushes updates, such as chat, collaborative editing, or multiplayer control. The browser WebSocket API does not provide automatic backpressure; if messages arrive faster than the client can process them, memory or CPU can grow. The application should bound queues, drop superseded ephemeral updates, pause subscriptions, or close a slow consumer.
+
+### Reconnect and catch-up are part of the design
+
+A robust connected client usually does this:
+
+```text
+connect(auth, subscription, last cursor)
+  ├─ receive snapshot or replay from cursor
+  ├─ receive live events with sequence IDs
+  ├─ ack/checkpoint durable progress where needed
+  ├─ heartbeat and detect dead path
+  └─ on disconnect: exponential backoff + jitter → reconnect/resume
+```
+
+On reconnect, the server can provide a bounded replay, a fresh snapshot plus cursor, or a “gap” response that tells the client to refetch. Event IDs should be scoped to a stream/tenant and have a retention window. Exactly-once UI behavior usually comes from deduplicating by event ID and applying state transitions idempotently, not from trusting the transport.
+
+## Example
+
+### Notifications, chat, and presence in one product
+
+Suppose a collaboration product has 2 million daily users:
+
+- account alerts need delivery within 30 seconds and may be read later;
+- a chat room needs bidirectional messages with durable history;
+- a cursor/presence indicator is useful only while fresh and may be dropped.
+
+The naive design polls all three from `/events` every five seconds. At 200,000 simultaneously active clients, that is roughly 40,000 requests/s even with no events, and all clients may poll at the same second. A single generic endpoint also mixes durability and freshness semantics.
+
+An improved design uses:
+
+```text
+alerts:   SSE or long polling → durable notification stream, replay by cursor
+chat:     WebSocket → room gateway → durable message store + fan-out bus
+presence: WebSocket messages or SSE → TTL-based ephemeral state, drop stale updates
+commands: ordinary HTTPS POST/REST with idempotency key and request ID
+```
+
+Each connection gateway owns socket I/O but not the only copy of state. A pub/sub or message bus distributes room events to gateways; a durable log/store allows a reconnecting chat client to request messages after its last sequence. If one gateway dies, the client reconnects to another and resumes. Presence is recomputed from heartbeats and expires; it is not treated as durable chat history.
+
+The new trade-off is a connection fleet, fan-out bus, subscription registry, and reconnect load. A small internal dashboard may choose short polling instead; a 2-million-user chat cannot justify polling merely because it is easier to write.
+
+### Job progress
+
+For a 90-second video transcode, a client can `POST /jobs` and receive a job ID. It then polls `GET /jobs/{id}` every five seconds, uses long polling, or subscribes to an SSE stream. The durable source of truth is the job record; the stream is an optimization for freshness. If the SSE connection fails, the client resumes from the job's current status rather than assuming it missed no events.
+
+## Visualization We Eventually Want
+
+Create a connected-client simulation where learners replace short polling with long polling, SSE, and WebSockets for the same event workload.
+
+### Controls
+
+- client count, active/idle ratio, event rate, recipients per event, and freshness deadline;
+- polling interval/jitter, long-poll timeout, SSE heartbeat, WebSocket ping, and proxy idle timeout;
+- message size, consumer processing rate, connection memory, and per-instance socket limit;
+- gateway instance count, pub/sub fan-out latency, reconnect backoff/jitter, and failure injection;
+- event retention, replay cursor, duplicate delivery, and stale presence expiration.
+
+### Behavior and outputs
+
+Show request/connection timelines plus text counters. Under short polling, show empty requests and synchronized spikes; under long polling, show pending requests and timeout churn; under SSE, show one-way stream and replay by event ID; under WebSockets, show bidirectional commands and a slow-consumer queue. Kill a gateway, partition a pub/sub link, or expire auth and show reconnect/catch-up behavior. Report freshness lag, request rate, open connections, per-instance memory/file descriptors, messages delivered/dropped/duplicated, replay size, reconnect rate, fan-out latency, and CPU.
+
+## Scaling Behavior
+
+- **More connected users:** use Little's Law for connection state: open connections ≈ connection arrival rate × average lifetime. Budget file descriptors, TLS state, socket buffers, heartbeats, per-subscription memory, and load-balancer limits.
+- **More events:** batch/coalesce updates, partition subscriptions by room/tenant, and bound per-client queues. Do not broadcast every event to every gateway.
+- **More recipients per event:** fan-out may be push-on-write (write to recipient queues) or push-on-read (store once, clients read), depending on recipient count and latency. A hybrid often fits celebrity/large-room cases.
+- **More gateways:** route new connections across instances and use a shared subscription/event bus; do not require the same instance after reconnect. Ensure a bus partition produces a known gap/replay behavior.
+- **More mobile churn:** expect background suspension, network changes, and reconnect bursts. Add exponential backoff with jitter and resynchronize from a cursor/snapshot.
+- **More durability:** persist event IDs and retention, expose bounded replay, and make consumer application idempotent. For ephemeral data, TTL and drop policies save capacity.
+- **More regions:** terminate near users, choose room/home-region ownership, and state cross-region ordering and consistency. A single global WebSocket cluster does not make writes globally ordered.
+
+## Failure Modes
+
+| Failure | Visible symptom | Mitigation |
+| --- | --- | --- |
+| Client/network disconnect | Stale UI, missing events, reconnect storm | Heartbeats, exponential backoff+jitter, cursor/ID resume, snapshot fallback, reconnect rate limits. |
+| Proxy/load-balancer idle timeout | Long poll/SSE/WebSocket closes at a repeatable interval | Heartbeat below the shortest idle timeout, explicit timeout/close handling, configure streaming/buffering. |
+| Gateway process loss | All its connections disappear | Stateless reconnect target, shared event bus/registry, replay/snapshot, graceful drain. |
+| Slow consumer | Memory/CPU grows or event lag rises | Per-client queue cap, backpressure/pause, coalesce/drop stale events, disconnect and resume. |
+| Pub/sub lag or partition | Connected clients diverge or see gaps | Sequence IDs, lag metrics, bounded replay, gap detection and resync. |
+| Auth/session expiry | Stream is rejected or silently receives too much/little | Expiry event/close code, token refresh, reauthorize subscriptions, least-privilege topics. |
+| Duplicate/reordered delivery | UI applies a state change twice or regresses | Event IDs/revisions, idempotent application, per-stream ordering contract. |
+| Hot room/tenant | One partition or gateway saturates | Partition/shard hot topics, isolate tenants, coalesce presence, backpressure and admission limits. |
+| Browser/API limitation | No backpressure, connection cap, or blocked upgrade | Choose SSE/long polling/HTTP fallback, cap message sizes, instrument client capability and version. |
+
+An acknowledgement from a WebSocket or SSE client is an application message, not a guarantee that the user read or persisted the event. Define whether “delivered,” “accepted,” “displayed,” and “durably stored” are distinct states.
+
+## Trade-offs
+
+- Short polling is simple and stateless at the service boundary but spends requests and freshness on empty intervals.
+- Long polling lowers idle request volume while keeping HTTP compatibility, but pending requests consume resources and reconnect timeouts must be coordinated.
+- SSE is a simple one-way stream with browser reconnect conventions, but client-to-server commands need another API and buffering/backpressure require care.
+- WebSockets support low-latency bidirectional messages, but connection/session state, auth refresh, replay, and slow consumers become application responsibilities.
+- Persistent connections lower per-event request overhead but make per-connection memory, file descriptors, heartbeats, and reconnect storms first-class capacity inputs.
+- Durable replay improves correctness and recovery but costs storage, retention, sequence management, and catch-up bandwidth.
+
+## Alternatives
+
+- **Short polling:** choose for low-frequency updates, simple clients, small populations, or when a status endpoint is already the source of truth.
+- **Adaptive polling:** choose when activity varies widely and a client can trade freshness for battery/network use.
+- **Long polling:** choose as an HTTP-friendly fallback when SSE/WebSocket upgrades are unavailable or server push is one-way but streaming infrastructure is limited.
+- **SSE:** choose for server-to-browser notifications, dashboards, and progress where ordinary HTTP auth/proxies and text events fit.
+- **WebSockets:** choose for chat, collaborative editing, presence commands, and bidirectional low-latency sessions.
+- **WebTransport/QUIC streams/datagrams:** consider for specialized modern clients needing richer transport semantics; support and operations must justify the extra complexity.
+- **Push notification service:** choose for mobile background notifications; it wakes the app but is not a substitute for durable synchronization and catch-up.
+
+## When to Use
+
+Use short polling when the update interval and cost are acceptable. Use long polling or SSE for one-way event freshness with HTTP-friendly infrastructure. Use WebSockets when both directions are active and low latency matters. In every case, define what happens after disconnect, whether events can be dropped, and how a client resynchronizes.
+
+## When Not to Use
+
+Do not use WebSockets for a rare status change merely to avoid one HTTP request, or SSE for client-to-server streaming that needs full duplex. Do not use an open connection as the durable source of truth, and do not keep unlimited messages buffered for a client that cannot consume them. Avoid global broadcasts without a fan-out and tenant-isolation plan.
+
+## Common Misconceptions
+
+- **“Real-time means zero latency.”** Every transport has network, queueing, scheduling, and client rendering delay; define a freshness SLO.
+- **“WebSockets guarantee message delivery.”** They provide a TCP-based session; disconnects, client processing, and application replay remain.
+- **“SSE is two-way.”** SSE/EventSource is server-to-client; use ordinary HTTP or another channel for commands.
+- **“Long polling is a free persistent connection.”** It repeatedly tears down/creates requests and consumes pending request/proxy state.
+- **“A heartbeat proves the user received the event.”** It only proves a path responded; business acknowledgments need explicit semantics.
+- **“More WebSocket servers solve scale.”** Without shared fan-out/subscriptions and reconnect handling, more gateways can make clients miss events or overload a broker.
+- **“Presence belongs in the durable message log.”** Presence is often ephemeral and TTL-based; chat history and commands have different guarantees.
+- **“Browser WebSocket APIs apply backpressure.”** The standard API can buffer faster-than-consumed messages; bound queues in the application.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+“I choose the transport from freshness, direction, durability, and client population. Polling is simplest but wastes requests and adds interval latency; long polling holds an HTTP request until an event or timeout; SSE is a one-way `text/event-stream` with browser reconnect/event-ID conventions; WebSockets provide bidirectional framed messages after an HTTP-compatible handshake. Persistent connections still need heartbeats, auth refresh, bounded queues, reconnect backoff, event IDs, replay or snapshot recovery, and a shared fan-out layer when gateways scale horizontally.”
+
+### When to Introduce It
+
+Introduce this comparison when the prompt includes chat, presence, notifications, dashboards, job progress, collaborative editing, or a large connected population. Clarify freshness and missed-event behavior before drawing a WebSocket box.
+
+### Common Follow-Ups
+
+- How many connections and events per second are expected, and what is the reconnect burst?
+- What is durable versus ephemeral, and how does a client resume after a gap?
+- How do proxy idle timeouts, heartbeats, token expiry, and mobile sleep affect the channel?
+- How do multiple gateway instances receive and fan out the same room/topic?
+- What happens when one client is slow or one hot room has millions of subscribers?
+- When is polling simpler and sufficient?
+
+### Common Candidate Mistakes
+
+- Choosing WebSockets without a freshness/durability requirement.
+- Forgetting reconnect, replay, event IDs, and duplicate handling.
+- Assuming a long-lived connection survives load-balancer, NAT, proxy, or mobile changes.
+- Ignoring per-connection memory, file descriptors, heartbeat traffic, and reconnect storms.
+- Making the gateway the only state store instead of using a durable source or shared event path.
+
+## Summary
+
+1. Real-time is a contract about freshness, direction, durability, ordering, and population—not a single protocol.
+2. Polling is easy; long polling and SSE reduce idle request waste; WebSockets enable bidirectional sessions.
+3. Persistent connections shift cost from request rate to connection state, heartbeats, fan-out, and reconnect behavior.
+4. Event IDs, cursors, replay/snapshot, idempotent application, and bounded queues make disconnects survivable.
+5. Scale gateways horizontally with shared event/subscription infrastructure and explicit hot-topic isolation.
+
+## Quiz Seeds
+
+1. For a job that changes once every 30 seconds, which transport is likely simplest and why?
+2. How does long polling reduce empty requests, and why does it still need a timeout?
+3. Why does SSE require a separate client-to-server command path?
+4. What state must a WebSocket client send on reconnect to avoid missing durable chat messages?
+5. A client processes 100 messages/s but receives 1,000/s. What backpressure/drop policy would you choose for durable versus ephemeral events?
+6. How do heartbeat interval and proxy idle timeout interact?
+7. Why does adding gateway instances require a pub/sub or shared replay design?
+8. Estimate open connections and heartbeat traffic for 500,000 clients with a 30-second heartbeat.
+
+## Related Topics
+
+- [HTTP evolution](./http-evolution.mdx) explains persistent connections, streams, and protocol fallback beneath these transports.
+- [TCP, UDP, and QUIC](./tcp-vs-udp.mdx) defines the delivery and loss behavior of a WebSocket and other channels.
+- [REST, RPC, gRPC, and GraphQL](./rest-rpc-grpc-graphql.mdx) compares API command/query surfaces that accompany a real-time channel.
+- [API design for interviews](./api-design-interviews.mdx) covers cursors, idempotency, request IDs, and error contracts for reconnecting clients.
+- [Back-of-the-envelope estimation](../00-interview-method/estimation.mdx) provides Little’s Law and connection/bandwidth estimation patterns.
+
+## References
+
+### Documentation / Articles
+
+- [Bidirectional HTTP (RFC 6202)](https://www.rfc-editor.org/rfc/rfc6202.html) — IETF analysis of long polling, streaming, pending requests, and intermediary/resource issues.
+- [The WebSocket Protocol (RFC 6455)](https://www.rfc-editor.org/rfc/rfc6455.html) — handshake, framing, TCP relationship, origin model, and bidirectional session contract.
+- [Using server-sent events](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events/Using_server-sent_events) — MDN’s practical SSE/EventSource behavior, event-stream format, reconnect, and heartbeat guidance.
+- [WebSocket](https://developer.mozilla.org/en-US/docs/Web/API/WebSocket) — MDN’s browser API reference, including the important lack of automatic backpressure in the standard API.
+- [Server-sent events](https://html.spec.whatwg.org/multipage/server-sent-events.html) — WHATWG HTML standard for EventSource, event-stream parsing, reconnection, and `Last-Event-ID` behavior.
+- [HTTP Semantics (RFC 9110)](https://www.rfc-editor.org/rfc/rfc9110.html) — request/response, method, status, and intermediary semantics that polling/streaming endpoints still use.

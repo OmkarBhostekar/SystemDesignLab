@@ -1,0 +1,228 @@
+---
+type: lesson
+id: 03-01-reverse-proxy-and-load-balancer
+slug: reverse-proxy-and-load-balancer
+title: Reverse Proxies and Load Balancers
+description: Put a controlled front door in front of a changing server fleet and distribute work without confusing mediation with selection.
+module: traffic-and-services
+order: 1
+difficulty: core
+estimatedMinutes: 25
+prerequisites:
+  - 00-02-requirements
+  - 00-03-estimation
+  - 01-02-horizontal-vs-vertical-scaling
+  - 02-01-request-lifecycle
+tags:
+  - reverse-proxy
+  - load-balancing
+  - traffic-distribution
+  - tls-termination
+  - request-routing
+objectives:
+  - Distinguish the mediation role of a reverse proxy from the server-selection role of a load balancer.
+  - Trace a request through a redundant front door and an upstream pool, including connection and request boundaries.
+  - Choose where to terminate TLS, preserve client identity, and add routing policy without creating a single point of failure.
+  - Explain the capacity, failure, and operational costs introduced by a proxy or load-balancer tier.
+relatedLessons:
+  - 00-03-estimation
+  - 00-04-interview-framework
+  - 03-02-load-balancing-algorithms
+  - 03-03-l4-vs-l7
+  - 03-04-health-checks-and-failover
+---
+
+# Reverse Proxies and Load Balancers
+
+> A reverse proxy is the controlled intermediary in front of servers; a load balancer is the policy that chooses an upstream, and one product can perform both jobs.
+
+## Why This Exists
+
+A first version of a photo API can publish one application host directly:
+
+```text
+mobile clients ──HTTP──> app-1 ──> database
+```
+
+That is easy to understand, but it makes the host name part of the client contract. When `app-1` is deployed, overloaded, or in a failed availability zone, clients need a new address or keep sending work to a dead instance. Every application process also has to repeat TLS policy, request-size limits, access logging, and connection handling.
+
+A single front door gives clients a stable destination and gives operators a place to apply shared policy. The front door can then select one healthy application from a pool:
+
+```text
+clients ──> stable endpoint ──> front door ──> app-1
+                                             ├─> app-2
+                                             └─> app-3
+```
+
+The front door is not automatically a load balancer. A reverse proxy can forward every request to one upstream, rewrite paths, terminate TLS, or serve static content. A load balancer answers the narrower question, “which member of this upstream set receives this work?” If the front door is one machine, it simply moves the single point of failure rather than removing it. The improvement is a redundant, capacity-tested tier with a known failure and recovery story.
+
+## Mental Model
+
+Use two questions to classify a component:
+
+| Question | Reverse-proxy concern | Load-balancer concern |
+| --- | --- | --- |
+| Where is the boundary? | Accept a client connection and mediate an upstream connection. | Usually the same boundary, or a lower network boundary. |
+| What policy is applied? | TLS, headers, auth hooks, buffering, compression, routing, limits. | Select an eligible endpoint and distribute work. |
+| What does it know? | It may understand HTTP, a stream, or only bytes. | It may use connection, request, health, weight, or key state. |
+| What can it change? | The visible endpoint, protocol, headers, and connection lifetime. | The destination and sometimes the connection's affinity. |
+
+“Reverse” means the proxy represents the servers to the client; a forward proxy represents clients to the outside world. At an HTTP-aware layer, the proxy receives a request and makes a separate upstream request. At a transport layer, it may relay bytes without seeing a path or application payload. Product names overlap, so describe the behavior and layer in an interview instead of relying on the label.
+
+## How It Works
+
+For an HTTP request, a typical sequence is:
+
+1. DNS or an anycast/VIP mechanism directs the client to a front-door address.
+2. The proxy accepts TCP/TLS, enforces a protocol and request policy, and records a request ID.
+3. A load-balancing policy chooses an eligible upstream instance from the current pool.
+4. The proxy opens or reuses an upstream connection, forwards the request, and applies an upstream timeout.
+5. The response returns through the proxy, which emits access and timing metadata before closing or reusing connections.
+
+The client sees one endpoint, but there may be two connection pools: client-to-proxy and proxy-to-server. HTTP/2 or HTTP/3 multiplexing can carry many logical requests over one client connection while the proxy uses a different protocol or pool upstream. This is why “one connection” does not necessarily mean “one request” or “one server.”
+
+If the proxy terminates TLS, the hop from proxy to application needs its own trust decision. Use encryption or a private authenticated network when that hop crosses an untrusted boundary. Forwarded client IP headers are input, not proof: only trust headers inserted by a known proxy chain, otherwise a client can spoof an address used for rate limits or audit.
+
+Load balancing also has a scope. A connection-level L4 balancer chooses a target when a connection is established. An HTTP-aware L7 proxy may choose per request, which matters when a long-lived connection carries many requests. A later lesson compares those choices; this lesson's invariant is that the selection policy must match the state and failure boundary of the workload.
+
+## Example
+
+Consider a feed API receiving 6,000 requests/s at peak. A deployment has twelve stateless application instances across three zones, and load testing shows one instance can sustain 750 requests/s at the target p99 latency. Put two or more front-door replicas behind a provider-managed virtual IP or equivalent redundant entry point.
+
+The front door can:
+
+- terminate public TLS and re-encrypt to the application tier;
+- route `/v1/feed` to the feed pool and `/v1/profile` to the profile pool;
+- cap request bodies and reject obviously invalid requests early;
+- attach a trace/request ID and preserve the authenticated user identity safely;
+- reuse upstream connections so the applications do not perform a new handshake for every request; and
+- remove instances only after a health signal says they should not receive new work.
+
+At 750 requests/s per instance, eight healthy instances cover 6,000 requests/s with no headroom. A reasonable interview design provisions more capacity—for example, ten healthy instances for a 25% headroom target and a stated zone-failure allowance—then validates the number with load tests. The proxy tier needs its own CPU, memory, connection, TLS, and bandwidth capacity calculation. It is not free just because it is “in front.”
+
+If a client retries a timed-out `POST /posts`, the proxy must not blindly retry a non-idempotent request to another instance. A timeout can mean the first instance committed the write but the response was lost. Retry policy belongs to an explicit idempotency contract, not to the existence of a load balancer.
+
+## Visualization We Eventually Want
+
+Build a request-flow simulator with a stable front-door node and a configurable upstream pool. The learner should be able to:
+
+- set request rate, request mix, payload size, client connection count, and upstream capacity;
+- toggle proxy-only forwarding versus load-balancer selection;
+- choose connection-level or request-level selection and a simple algorithm;
+- add or remove instances and zones while requests are in flight;
+- inject a front-door replica failure, a slow upstream, a full connection pool, or a lost zone;
+- toggle TLS termination and upstream connection reuse; and
+- observe per-instance requests, queue depth, p50/p99 latency, errors, active connections, and proxy CPU.
+
+The visualization should animate a request that succeeds, one rejected at the proxy, and one that times out after reaching an upstream. A side panel should identify which component caused each outcome; otherwise a moving diagram teaches only that boxes exist.
+
+## Scaling Behavior
+
+As traffic grows, the front door can hit limits before applications do:
+
+- TLS handshakes consume CPU; session reuse and connection reuse change the cost.
+- Open client connections consume file descriptors and memory even when request QPS is low.
+- Large uploads and downloads consume network bandwidth and buffering memory.
+- Per-request rules, access logging, compression, and aggregation add CPU and tail latency.
+- A single proxy configuration or virtual IP can become a change-management bottleneck.
+
+Scale the tier horizontally, partition traffic by region or function when justified, and test failover capacity rather than only steady-state throughput. Avoid putting all application state in the proxy. If affinity is required, make its key and failure behavior explicit; a stateless application pool is easier to rebalance.
+
+## Failure Modes
+
+- **Front-door outage:** A lone proxy is a single point of failure. Use redundant replicas and a failover mechanism, then test the control path that moves traffic.
+- **Stale upstream membership:** The proxy can send requests to an instance that has exited or is still starting. Health checks and draining address this, but they have detection delay.
+- **Proxy overload:** Queues grow and p99 latency rises before the application looks busy. Bound queues and reject or shed work deliberately.
+- **Retry amplification:** Automatic retries can multiply load during an upstream incident and turn a partial failure into a fleet-wide failure.
+- **Incorrect identity forwarding:** Trusting arbitrary `X-Forwarded-For` or auth headers lets clients forge audit and authorization inputs.
+- **Stateful connection loss:** A proxy restart can drop WebSocket, streaming, or long-upload connections even when the backend is healthy. Document reconnect and resume behavior.
+
+Health checks and failover are important enough to have their own lesson; they do not make a request already accepted by a failed process magically recover.
+
+## Trade-offs
+
+The front door provides stable addressing, centralized policy, traffic distribution, and a useful observation point. It costs another hop, another capacity tier, configuration rollout risk, and a potentially large blast radius. TLS termination can reduce application CPU but expands the trust boundary at the proxy. L7 inspection enables path and header routing but adds parsing work and can interfere with end-to-end encryption. Sticky routing may preserve local state but makes skew and failover worse.
+
+## Alternatives
+
+- **Direct client-side balancing:** Useful for trusted internal clients that can discover instances and implement safe selection. It exposes topology and spreads policy across clients.
+- **DNS-based balancing:** Simple for coarse regional or endpoint routing, but DNS caches make removal and failover slower than a per-request balancer.
+- **Service-mesh sidecars:** Useful when many internal services need uniform mTLS, retries, and telemetry. The per-workload proxy cost and debugging surface can be substantial.
+- **Provider-managed ingress or load balancer:** Often the right operational default when its layer, policy, and failure guarantees meet the requirements.
+- **No extra tier:** A small single-service application may use one managed endpoint and scale later; adding a gateway before a bottleneck exists is not automatically an improvement.
+
+## When to Use
+
+Introduce a reverse proxy when clients need a stable endpoint, shared edge policy, protocol mediation, or centralized telemetry. Introduce load-balancer selection when multiple eligible instances must share traffic or a failure must be hidden from callers. State the target latency, traffic shape, failure domain, and whether requests are safe to retry before choosing the layer and algorithm.
+
+## When Not to Use
+
+Do not add a custom proxy for a small service that a managed ingress already serves well. Do not use an L7 proxy when an encrypted opaque TCP stream must remain end-to-end and no routing decision needs payload visibility. Do not use sticky sessions merely to avoid designing a shared state store unless the affinity requirement is measured and its failure behavior is acceptable.
+
+## Common Misconceptions
+
+- **“Reverse proxy” and “load balancer” are synonyms.** A reverse proxy describes a boundary and mediation role; load balancing describes selection among endpoints.
+- **A load balancer makes a service highly available.** It can stop sending new work to a failed member, but the pool, front door, dependencies, and data path still need redundancy.
+- **The proxy sees the original client connection end to end.** It often terminates one connection and opens another; timeout and protocol settings apply at both hops.
+- **A timeout means the request did not happen.** The server may have completed a write while the response was lost, so retries need idempotency.
+- **More instances always reduce latency.** A saturated proxy, database, hot key, or network link can remain the bottleneck.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I put a redundant reverse-proxy or load-balancer tier at a stable endpoint when clients should not track application instances. The reverse proxy can terminate TLS, enforce edge policy, and forward requests; the load-balancing policy chooses an eligible upstream. I size and monitor that tier separately, define how client identity and retries work, and explain what happens when a proxy, instance, zone, or dependency fails.
+
+### When to Introduce It
+
+Introduce it after requirements and an order-of-magnitude load estimate show multiple instances, shared edge policy, or failure isolation is needed. Name the layer—connection-level or request-aware—and the state it must preserve before drawing it as a box.
+
+### Common Follow-Ups
+
+- Where is TLS terminated, and is the upstream hop encrypted?
+- How does the balancer know an instance is safe to receive traffic?
+- What happens to an in-flight request or WebSocket when an instance dies?
+- Can a timed-out write be retried safely?
+- Is the proxy itself redundant and capacity-tested for a zone failure?
+
+### Common Candidate Mistakes
+
+- Calling every front door a load balancer without describing its selection policy.
+- Drawing one load balancer and claiming the system has no single point of failure.
+- Assuming round robin is fair when requests have unequal cost or instances have unequal capacity.
+- Adding retries at the proxy without an idempotency and deadline budget.
+- Ignoring proxy connection limits, bandwidth, logging, and TLS CPU in the capacity estimate.
+
+## Summary
+
+- A reverse proxy mediates client-to-server traffic; a load balancer distributes work across eligible servers.
+- One implementation can do both, but explain which behavior and layer you rely on.
+- Keep the front door redundant, capacity-tested, observable, and explicit about TLS, identity, timeouts, draining, and retries.
+- Choose connection-level or request-level routing according to protocol and state, not product branding.
+- Every extra hop buys control but adds latency, cost, failure surface, and operational ownership.
+
+## Quiz Seeds
+
+1. A service has three stateless instances but clients currently hard-code one hostname. Which problem does a reverse proxy solve before any load-balancing algorithm is chosen?
+2. Why can a component be a reverse proxy without balancing across multiple upstreams?
+3. A `POST` times out at the proxy and the client retries. What fact must be known before the proxy safely retries it?
+4. Which resources should be capacity-tested for a proxy tier besides requests per second?
+5. What changes when an L4 balancer chooses once per TCP connection but an L7 proxy can choose per HTTP request?
+6. A proxy forwards a user-supplied `X-Forwarded-For` header to authorization code. What failure does that create and how should trusted forwarding work?
+7. Why does adding a second proxy replica not by itself prove that a zone failure is survivable?
+
+## Related Topics
+
+- [Back-of-the-envelope estimation](../00-interview-method/estimation.mdx)
+- [Load-balancing algorithms](load-balancing-algorithms.mdx)
+- [L4 versus L7](l4-vs-l7.mdx)
+- [Health checks and failover](health-checks-and-failover.mdx)
+
+## References
+
+### Documentation / Articles
+
+- [NGINX Reverse Proxy](https://docs.nginx.com/nginx/admin-guide/web-server/reverse-proxy/) — shows how a reverse proxy forwards requests, modifies headers, buffers responses, and can also provide load balancing.
+- [HTTP Semantics (RFC 9110)](https://www.rfc-editor.org/rfc/rfc9110.html) — grounds the roles of intermediaries and the HTTP request/response boundary.
+- [HAProxy backends](https://www.haproxy.com/documentation/haproxy-configuration-tutorials/proxying-essentials/configuration-basics/backends/) — documents upstream pools, selection policies, health checks, and operational configuration.
+- [Load Balancing Frontend](https://sre.google/sre-book/load-balancing-frontend/) — explains Google's production concerns around capacity, overload, and frontend load balancing.

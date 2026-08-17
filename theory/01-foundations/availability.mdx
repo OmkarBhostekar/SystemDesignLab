@@ -1,0 +1,237 @@
+---
+type: lesson
+id: 01-05-availability
+slug: availability
+title: Availability
+description: Measure whether a service is usable when requested, then reason about dependencies, redundancy, and nines.
+module: foundations
+order: 5
+difficulty: core
+estimatedMinutes: 30
+prerequisites:
+  - 01-04-percentiles-tail-latency
+  - 00-02-requirements
+tags:
+  - availability
+  - uptime
+  - nines
+  - dependencies
+  - slo
+objectives:
+  - Define availability for a user journey or request population rather than as a vague uptime claim.
+  - Calculate rough availability for serial dependencies and independent redundant components.
+  - Convert nines into downtime budgets and explain why more nines have nonlinear cost.
+  - Distinguish availability from reliability, durability, latency, and correctness.
+  - Identify correlated failures and partial availability that invalidate simple multiplication.
+relatedLessons:
+  - 01-04-percentiles-tail-latency
+  - 01-06-reliability
+---
+
+# Availability
+
+> Availability is the fraction of the relevant time or well-formed requests in which a service is usable within its agreed behavior and deadline.
+
+## Why This Exists
+
+A service can be fast when it responds but useless when its only server is down. Conversely, a service can be reachable while returning incorrect balances, stale critical data, or timeouts that violate the user contract. “Highly available” is not a complete requirement until the operation, measurement boundary, time window, and acceptable response are named.
+
+The naive design is one application host and one database. Any host, process, network, or maintenance failure makes the user journey unavailable. The improvement is to remove single points of failure and define a measurable SLO, but every added dependency also creates another way for the journey to fail.
+
+## Mental Model
+
+Two common measures are useful:
+
+~~~text
+time-based availability =
+  usable time / total eligible time
+
+request-based availability =
+  successful, on-time eligible requests / total eligible requests
+~~~
+
+Use time-based measurement for continuously served endpoints and request-based measurement when traffic varies or only some operations are affected. Exclude planned maintenance only if the contract says so, and define whether a degraded response counts as usable.
+
+For independent serial dependencies, a rough system availability is the product:
+
+~~~text
+A_system ≈ A_service × A_database × A_network
+~~~
+
+For independent redundant alternatives, a rough availability is:
+
+~~~text
+A_redundant ≈ 1 − (1 − A)^n
+~~~
+
+These equations are intuition, not a production SLO calculator. Shared power, software releases, routing, credentials, capacity, and correlated regional faults violate independence.
+
+## How It Works
+
+### Nines and error budgets
+
+Availability percentages become meaningful when paired with a window. Approximate annual unavailability:
+
+| Target | Allowed downtime per year |
+| --- | ---: |
+| 99% (two nines) | 3.65 days |
+| 99.9% (three nines) | 8 hours 46 minutes |
+| 99.99% (four nines) | 52 minutes 34 seconds |
+| 99.999% (five nines) | 5 minutes 15 seconds |
+
+The budget includes incidents, failed deploys, dependency outages, and recovery time according to the SLO. An availability target should not be detached from latency, correctness, freshness, or durability; a service that returns a fast error is not available for the user journey.
+
+### Dependency composition
+
+Draw the critical path and ask whether each dependency is required, optional, replicated, or replaceable. If a page requires authentication, profile, inventory, and payment status synchronously, the serial path has less availability than any one component. Make optional work asynchronous or degrade it only when the product permits.
+
+Redundancy helps only if a healthy alternative can serve the request, traffic can reach it, and it has the required state. Failover time, detection accuracy, and recovery capacity are part of availability.
+
+## Example
+
+Suppose a checkout confirmation requires an API tier, an inventory database, and a payment processor. Illustrative component availability targets are 99.95%, 99.99%, and 99.9%. Under a serial, independent approximation:
+
+~~~text
+0.9995 × 0.9999 × 0.999 ≈ 0.9984 = 99.84%
+~~~
+
+That is lower than every target because the journey is only usable when all three are usable.
+
+### Naive → failure → improvement
+
+1. **Naive:** call the payment processor synchronously for every page view and report the API host's 99.99% uptime.
+2. **Failure:** processor timeouts make the checkout journey fail even while the API process is healthy; a single-zone database maintenance event also takes out all inventory reads.
+3. **Improvement:** run application replicas across zones, use a database failover design, keep a durable local payment state, and separate confirmation from non-critical receipt delivery. Define which user actions may return a retryable status.
+4. **New trade-off:** failover introduces detection and promotion delay; a local state can be pending or stale; multi-zone replicas cost more; asynchronous receipt delivery is not immediate.
+
+The business SLO should measure successful checkout attempts at the user boundary, not just the process health endpoint.
+
+## Visualization We Eventually Want
+
+Build a dependency graph where the learner can:
+
+- toggle component availability, dependency serial/parallel placement, and redundancy;
+- choose time-based or request-based measurement;
+- inject a node, zone, dependency, or shared-release failure;
+- set failover detection and recovery time;
+- display total usable requests, downtime budget, and the assumptions behind the computed result.
+
+The visualization should explicitly mark correlated failures so that adding replicas in the same zone does not pretend to improve availability.
+
+## Scaling Behavior
+
+More dependencies on a synchronous path generally reduce composed availability. More replicas can improve a component's availability, but the fleet needs enough capacity to serve traffic after a replica loss. A large fleet also increases deployment, configuration, and monitoring surface.
+
+As traffic varies, request-based availability can be more representative than minutes down. A service that handles 99.99% of requests may still have an outage during a low-traffic period; a time-based SLO may capture that user impact. Choose the measure that matches the contract.
+
+Global regions can reduce the impact of a regional failure, but cross-region routing, data placement, consistency, and failover capacity become new dependencies and failure modes.
+
+## Failure Modes
+
+- **Single point of failure:** one host, zone, credential, route, or database owner.
+- **Correlated replicas:** all copies share the same rack, release, config, or dependency.
+- **False health checks:** a process is alive but cannot serve real traffic.
+- **Slow failure:** requests time out rather than fail fast, exhausting capacity.
+- **Under-capacity failover:** the survivor is healthy but cannot absorb the lost traffic.
+- **Partial availability:** reads work while writes fail, or one tenant/region is affected.
+- **Measurement gap:** a health endpoint is up while the user journey is broken.
+
+Use dependency-aware probes, realistic synthetic checks, capacity headroom, graceful degradation, and incident drills. Record both the outage and the time to restore usable behavior.
+
+## Trade-offs
+
+Higher availability typically costs more replicas, independent failure domains, operational automation, capacity headroom, and testing. Stronger synchronous dependencies can preserve correctness while reducing availability during their outage. Relaxing a dependency can improve availability while returning stale, pending, or partial results.
+
+Five nines is not automatically better than three nines: it may cost more than the product value warrants and leave little budget for releases or experimentation. State which operations receive which SLO.
+
+## Alternatives
+
+- **Single instance with backups:** suitable for low-risk or internal workloads where restore downtime is acceptable.
+- **Active-passive failover:** simpler state ownership; pays promotion and detection time.
+- **Active-active replicas:** can serve through a node failure; requires conflict, routing, and capacity strategy.
+- **Graceful degradation:** keeps core journeys usable while dropping optional features.
+- **Queue and later completion:** preserves accepted work when synchronous dependencies are unavailable, provided durability and user feedback are clear.
+
+## When to Use
+
+Discuss availability after identifying critical user journeys, dependency boundaries, and failure domains. Translate “highly available” into an SLO, measurement method, maintenance policy, and behavior during dependency failure.
+
+## When Not to Use
+
+Do not promise more nines than the product needs. Do not multiply availability values as if failures were independent when replicas share a failure domain. Do not classify a fast error, stale critical value, or misleading health check as success without a product definition.
+
+## Common Misconceptions
+
+- **“Availability means uptime only.”** Request success, deadline, and usable behavior can be the relevant measure.
+- **“More replicas guarantee more nines.”** Correlated failures and insufficient failover capacity can remove the benefit.
+- **“Five nines is always the goal.”** It is an expensive business and operational choice.
+- **“A dependency with 99.99% availability is harmless.”** Serial composition lowers the journey's availability.
+- **“Availability means data is safe.”** Data durability and correctness are separate guarantees.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I would define availability for a critical operation—what counts as success, at what deadline, over what window—and measure it at the user boundary. Serial dependencies multiply their failure probabilities, while independent replicas help only when traffic, state, and failure domains are independent. I would size failover capacity and discuss whether the system rejects, degrades, or queues work when a dependency fails.
+
+### When to Introduce It
+
+Introduce availability when the prompt says “always on,” when drawing dependencies, or when choosing replicas, failover, degradation, and synchronous versus asynchronous work.
+
+### Common Follow-Ups
+
+- What does success mean for this endpoint?
+- Which components are on the critical path?
+- What happens during a zone or region failure?
+- Is a partial or stale response acceptable?
+- How much capacity remains after failover?
+
+### Common Candidate Mistakes
+
+- Quoting nines without a time window or operation.
+- Calculating only process uptime.
+- Ignoring failover detection and capacity.
+- Treating same-zone copies as independent.
+- Making every feature synchronous and critical.
+
+## Summary
+
+- Availability is usable behavior over a defined time or request population.
+- Serial dependencies lower availability; independent redundancy can improve it.
+- Nines are error budgets, not magic labels.
+- Correlation, capacity, failover time, and measurement boundary determine whether redundancy helps.
+- Availability is distinct from reliability, latency, correctness, and durability.
+
+## Quiz Seeds
+
+1. What must be specified before “99.99% available” becomes an architecture requirement?
+2. Why does a serial API–database–processor path have lower availability than each component?
+3. Roughly how much annual downtime does 99.9% allow?
+4. When does adding a second replica fail to improve availability?
+5. Why should a user-journey SLO measure more than a process health endpoint?
+6. A payment processor is down. Which checkout behavior might preserve availability without claiming success?
+7. What is the difference between time-based and request-based availability?
+8. Why can five nines be the wrong target for a low-value internal tool?
+
+## Related Topics
+
+- [Percentiles and Tail Latency](./percentiles-tail-latency.mdx) — define “usable within a deadline” for latency SLOs.
+- [Reliability](./reliability.mdx) — separate correct operation over time from availability.
+- [Functional and Non-Functional Requirements](../00-interview-method/requirements.mdx) — turn an availability adjective into a scoped contract.
+
+## References
+
+### Documentation / Articles
+
+- [Availability Table — Google SRE](https://sre.google/sre-book/availability-table/) — provides downtime budgets for common nines and distinguishes time-based from aggregate availability.
+- [Service Level Objectives — Google SRE](https://sre.google/sre-book/service-level-objectives/) — defines availability as a user-relevant service indicator and connects targets to error budgets.
+- [Availability — NIST CSRC Glossary](https://csrc.nist.gov/glossary/term/availability) — authoritative definitions centered on timely, reliable access for authorized users.
+- [Reliability Pillar — AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/reliability-pillar/welcome.html) — official practices for recovery, failure management, and designing reliable workloads.
+
+### Papers
+
+No paper is required for the nines and dependency composition; the cited standards and SRE guidance provide direct operational definitions.
+
+### Videos
+
+No video is included because the availability table and SLO references are more precise than a generic “nines” explainer.

@@ -1,0 +1,456 @@
+---
+type: lesson
+id: 02-07-api-design-interviews
+slug: api-design-interviews
+title: API Design in System-Design Interviews
+description: Turn user journeys into evolvable APIs with stable resources, cursor pagination, explicit errors, idempotency, compatibility, and request correlation.
+module: networking
+order: 7
+difficulty: core
+estimatedMinutes: 45
+prerequisites:
+  - 00-02-requirements
+  - 00-03-estimation
+  - 02-05-rest-rpc-grpc-graphql
+  - 02-04-http-evolution
+  - 01-03-latency-vs-throughput
+tags:
+  - api-design
+  - pagination
+  - cursors
+  - versioning
+  - idempotency
+  - compatibility
+  - errors
+  - request-ids
+objectives:
+  - Define APIs from user journeys and access patterns, including resource names, commands, filters, ordering, consistency, and asynchronous status.
+  - Explain why cursor pagination is safer than offset pagination for changing or deep collections and design an opaque, bounded cursor contract.
+  - Choose a versioning and compatibility strategy that supports old clients, additive evolution, deprecation, and safe rollout.
+  - Design idempotency keys and outcome reconciliation for retried mutations whose first response may be lost.
+  - Return errors with stable machine-readable semantics, retry guidance, and a request ID that connects client, gateway, service, and storage evidence.
+  - Defend API choices in an interview by tracing a requirement to a contract, scale limit, failure mode, and trade-off.
+relatedLessons:
+  - 00-02-requirements
+  - 00-03-estimation
+  - 00-04-interview-framework
+  - 02-04-http-evolution
+  - 02-05-rest-rpc-grpc-graphql
+  - 02-06-realtime-transports
+---
+
+# API Design in System-Design Interviews
+
+> An API is a long-lived agreement about behavior under success, failure, change, and scale—not only a list of URLs or method signatures.
+
+## Why This Exists
+
+The naive interview API is often a happy-path sketch:
+
+```text
+POST /orders
+GET  /orders?page=2
+```
+
+It omits what happens when the response is lost after a successful write, when rows are inserted while a client paginates, when an old mobile app remains online for a year, when a request is rejected, or when an operator needs to find one slow attempt across five services. Those omissions become production incidents and interview follow-ups.
+
+The improvement is to design an API as a set of observable contracts:
+
+```text
+journey → resource/command → request/response shape
+       → consistency + pagination + errors + retries
+       → version/compatibility + request/trace IDs
+       → scale, failure, and operational evidence
+```
+
+The API should make the common path pleasant while making ambiguity explicit. “200 OK” is not enough to say whether a write is durable, “page 2” is not enough to say which ordering or snapshot it uses, and a random request ID is not enough if proxies drop or overwrite it.
+
+## Mental Model
+
+For each endpoint or RPC, write a small contract card:
+
+| Question | Example decision |
+| --- | --- |
+| Who calls it and why? | A mobile client lists the user's orders; an internal worker reserves inventory. |
+| What is the resource/command? | `orders` collection; `ReserveInventory` command. |
+| What is the read/write guarantee? | Read-your-write for the creator; reservation accepted durably before 202 response. |
+| What is the scale shape? | 20k list QPS, deep histories, 2% mutations, bursty flash sale. |
+| What can be retried? | GET safe; POST only with an idempotency key; timeout does not reveal outcome. |
+| How does it evolve? | Additive fields, tolerant readers, explicit deprecation/version window. |
+| How is failure explained? | Stable code/type, HTTP/RPC status, retryability, field details, request ID. |
+| How is it found in production? | Client request ID plus W3C trace context, logs/metrics/spans at each hop. |
+
+API design is a boundary between user semantics and implementation. It should not leak database offsets, shard IDs, internal hostnames, or secrets merely because those are easy for the first implementation.
+
+## How It Works
+
+### 1. Start from journeys and invariants
+
+Name the actor, action, response, and side effects. For an online booking system:
+
+```text
+search rooms → inspect availability → hold room → pay → confirm booking
+```
+
+Each step can have a different consistency and latency contract. Search may be eventually consistent and cacheable; holding a room must reject conflicts atomically; payment may return an accepted/pending operation while a processor completes asynchronously. Do not force every step into a single synchronous `POST /book` if that hides state transitions and makes recovery impossible.
+
+### 2. Model resources and commands deliberately
+
+Use stable nouns for resources and explicit actions when the domain operation is not a simple CRUD update:
+
+```http
+GET  /v1/events/{event_id}/seats?cursor=...
+POST /v1/events/{event_id}/holds
+GET  /v1/holds/{hold_id}
+POST /v1/holds/{hold_id}/confirm
+```
+
+The request/response should expose a stable identifier, state, timestamps/expiry, version or ETag where concurrency matters, and links or next actions when useful. An action endpoint is not a failure of REST when the domain operation is genuinely a command; the important part is making its semantics, repeatability, and outcome explicit.
+
+Separate command acceptance from side effects:
+
+```text
+POST /v1/exports → 202 Accepted
+Location: /v1/exports/exp_123
+{ "id": "exp_123", "state": "queued" }
+```
+
+The client can poll or subscribe for progress, while the server records the durable job state. See [real-time transports](./realtime-transports.mdx) when push freshness is useful.
+
+### 3. Pagination: offset versus cursor
+
+#### Why offset looks easy
+
+Offset pagination exposes `limit` and `offset` or `page`. It is easy to explain and can work for small, mostly static collections. But an offset often requires the database to scan/skip many rows, and concurrent inserts/deletes shift positions between requests:
+
+```text
+page 1: [A, B, C]
+new item X inserted at front
+page 2 offset=3: [C, D, E]  ← C duplicated; another item may be skipped
+```
+
+Large offsets can also become expensive because the storage engine still finds and discards earlier rows. An offset is a position in a changing query result, not a stable item boundary.
+
+#### Cursor/keyset pagination
+
+A cursor encodes “continue after this ordered boundary” rather than “skip N rows.” Choose a deterministic, indexed order such as `(created_at DESC, id DESC)` and use a tie-breaker ID:
+
+```http
+GET /v1/orders?limit=50&cursor=eyJjcmVhdGVkX2F0Ijoi...
+
+{
+  "items": [{"id":"ord_91", "createdAt":"2026-08-18T09:00:00Z"}],
+  "nextCursor": "opaque-token-or-null",
+  "hasMore": true
+}
+```
+
+Conceptually, the next query is:
+
+```sql
+WHERE (created_at, id) < (:cursor_created_at, :cursor_id)
+ORDER BY created_at DESC, id DESC
+LIMIT :bounded_limit_plus_one
+```
+
+The actual cursor should be opaque, URL-safe, authenticated or integrity-protected, and bound to the filter/order/tenant/query version it represents. It is a continuation hint, not authorization; recheck authorization on every request. It may expire when the underlying snapshot/retention window expires. Keep `limit` bounded and return fewer results when a page is costly. If the API promises a consistent snapshot, include a snapshot token or version and budget the storage/retention cost; many feeds instead promise stable traversal with possible new items appearing only on a fresh query.
+
+#### Pagination contract details
+
+- Define default and maximum page size; never trust an unbounded client value.
+- Define deterministic ordering and a tie-breaker for equal timestamps.
+- Keep filters/order parameters unchanged across a cursor, or reject a changed query with a clear error.
+- Return an empty/absent next cursor at end; do not require an expensive exact `totalCount` unless the product needs it.
+- State whether deletions, updates, and newly inserted records may appear, disappear, or repeat during traversal.
+- For GraphQL, use an equivalent `after` cursor/connection contract; for gRPC, `page_size`/`page_token` should preserve the same semantics.
+
+### 4. Versioning and compatibility
+
+Versioning is a strategy for evolving a contract while clients and servers overlap. Common mechanisms are:
+
+| Strategy | Example | Strength | Cost |
+| --- | --- | --- | --- |
+| URL/path | `/v1/orders` → `/v2/orders` | Visible, easy routing/docs | Duplicate surfaces and migrations; clients may pin forever |
+| Query parameter | `?api-version=2026-08` | Explicit per request | Easy to forget; cache keys/routing must include it |
+| Header/media type | `Accept: application/vnd.example.order+json;v=2` | Keeps resource URL stable | Less visible/debuggable; intermediaries/tooling must preserve it |
+| Schema evolution | Add fields/enum values, deprecate old fields | One surface, gradual adoption | Requires tolerant clients, compatibility tests, and semantic discipline |
+| Content/IDL negotiation | Protobuf field evolution, GraphQL deprecation | Strong typed tooling | Generated clients/schema governance and breaking-change detection |
+
+Prefer additive, backward-compatible changes when possible: add optional response fields, accept unknown fields where safe, do not change an existing field's meaning or units, and do not reuse removed enum/Protobuf values. A client should ignore unknown response fields but handle unknown enum values safely. A server should accept old required fields during the migration window. If a breaking change is unavoidable, version explicitly, publish a sunset/deprecation date, measure old-client traffic, and support rollback.
+
+Compatibility has several dimensions:
+
+- **Wire:** can old/new parsers read the message?
+- **Behavior:** does the same status/side effect mean the same thing?
+- **Performance:** did a response become too large or a query too expensive?
+- **Security:** does a new field expose data to an old authorization path?
+- **Operational:** can gateways, caches, SDKs, and dashboards understand both versions?
+
+### 5. Idempotency for retried mutations
+
+A network timeout does not tell the client whether a mutation committed. If `POST /payments` is retried without protection, it may charge twice. Idempotency turns a client-generated key into a durable record of one logical operation within a defined scope and retention window:
+
+```text
+request 1: Idempotency-Key: pay-7f... → execute once → store status/body/result
+request 2: same key + same parameters → return stored result
+same key + different parameters → reject conflict
+unknown/expired key → may be a new operation; document the window
+```
+
+The record needs tenant/auth scope, a hash/fingerprint of relevant request parameters, operation state (`in_progress`, `succeeded`, `failed`, `unknown`), response/status or result reference, created/expiry timestamps, and concurrency protection. A duplicate arriving while the first is executing can wait, return `202`, or return a conflict; choose and document one. Persist the idempotency record atomically with the business effect where possible (transactional outbox/ledger patterns may be needed across stores). Do not cache validation errors as successful effects unless the API deliberately defines that behavior.
+
+Idempotency is not deduplication by arbitrary request body. A client must reuse a key only for the same logical operation; servers should reject mismatched payloads and should not expose another tenant's result for a colliding key. GET/PUT/DELETE have HTTP-level idempotency semantics in the method contract, but a GET can still trigger unsafe server-side side effects if designed poorly.
+
+### 6. Errors that clients can act on
+
+Use HTTP/RPC status for broad protocol meaning and a stable machine-readable application code/type for action. A useful error body includes:
+
+```json
+{
+  "type": "https://api.example.com/problems/seat-unavailable",
+  "title": "Seat is not available",
+  "status": 409,
+  "code": "SEAT_UNAVAILABLE",
+  "detail": "Seat 21 was held by another customer.",
+  "instance": "urn:request:req_8d...",
+  "retryable": false,
+  "requestId": "req_8d..."
+}
+```
+
+Avoid one `500` for validation, authorization, conflict, throttling, dependency timeout, and unknown outcome. Distinguish at least:
+
+- malformed/invalid input (`400` or a documented validation code);
+- unauthenticated (`401`) versus authenticated but forbidden (`403`);
+- missing resource (`404`);
+- conflict/version/duplicate business state (`409`);
+- rate limit (`429`, with a documented retry strategy where appropriate);
+- timeout/unavailable dependency (`502`, `503`, or `504` according to the boundary and semantics);
+- accepted asynchronous work (`202`) versus completed success (`2xx`).
+
+The exact status is less important than consistency and retry guidance. Do not put secrets, stack traces, SQL, or authorization-sensitive existence details in `detail`. RFC 9457 Problem Details provides a standard shape for HTTP problem responses; a domain may use another documented schema.
+
+### 7. Request IDs, trace IDs, and idempotency keys
+
+Generate or validate a request correlation ID at the first trusted boundary. Return it in a response header/body and propagate it through gateway, service, queue, and storage logs. A request ID identifies one attempt/correlation; an idempotency key identifies a logical mutation across retries; a W3C `traceparent` identifies a distributed trace context with parent/child spans. They can be related but should not be conflated.
+
+```text
+client X-Request-ID: req_client_42 (validated/renamed if unsafe)
+gateway request ID:  req_8d...  + traceparent
+service A span       child of traceparent
+queue message        carries trace context + request ID + operation ID
+response             X-Request-ID: req_8d...
+```
+
+IDs should be high-entropy enough to avoid collisions, bounded in length, safe for logs/headers, and stripped of user secrets. Treat client-supplied IDs as untrusted input: validate size/characters and decide whether to preserve or replace them. Sample high-volume traces while retaining request IDs and error logs; ensure asynchronous work keeps enough context without leaking personal data.
+
+### 8. Other interview-critical edges
+
+- **Filtering/sorting:** whitelist fields/operators, cap combinations, define case/time-zone/locale semantics, and index the common access paths.
+- **Partial response/field selection:** useful for mobile bandwidth but can create authorization and cache-key complexity; document defaults.
+- **Conditional writes:** use `ETag`/version plus `If-Match` for optimistic concurrency when overwriting a resource; return conflict rather than silently losing an update.
+- **Rate limits:** identify the scope (user, token, IP, tenant, endpoint), return a stable error and useful limit/reset hints, and protect expensive queries separately.
+- **Consistency:** state whether a read is from primary/replica/cache and whether read-after-write is guaranteed. Do not promise “strongly consistent” without naming the boundary.
+- **Asynchronous work:** return an operation/job resource, status transitions, expiry, cancellation, and a result/error contract.
+- **Security:** authorize every resource/cursor/page-token request; do not treat opaque encoding as secrecy or capability.
+
+## Example
+
+### Ticket booking API under retries and changing inventory
+
+Suppose a system sells tickets for an event. The naive API is:
+
+```http
+GET  /tickets?page=2
+POST /buy {"event":"7","seat":"21"}
+```
+
+At scale, offset pages drift while seats are sold, `POST /buy` may run twice after a timeout, and a client cannot distinguish “seat unavailable” from “payment unknown.”
+
+An improved contract is:
+
+```http
+GET /v1/events/7/seats?status=available&limit=50&cursor=...
+
+POST /v1/holds
+Idempotency-Key: hold-client-123
+X-Request-ID: req-mobile-456
+{
+  "eventId": "7",
+  "seatId": "21",
+  "ttlSeconds": 600
+}
+
+→ 201 Created
+Location: /v1/holds/h_abc
+{
+  "id": "h_abc",
+  "state": "held",
+  "expiresAt": "...",
+  "requestId": "req-gateway-789"
+}
+```
+
+```http
+POST /v1/holds/h_abc/confirm
+Idempotency-Key: confirm-client-999
+
+→ 202 Accepted
+Location: /v1/orders/o_42
+{ "orderId": "o_42", "state": "payment_pending" }
+```
+
+The seat list uses a stable `(availability_changed_at, seat_id)` or inventory revision ordering and an opaque cursor. The hold write is atomically conditional on availability; its idempotency record returns the same hold for a retry. Confirming payment is a separate operation whose state can be polled or pushed; a lost response is reconciled via the order resource. `409 SEAT_UNAVAILABLE` is not retryable against the same seat, while a `503` dependency error may be retryable with the same idempotency key. Every response carries a request ID, and the trace links gateway, inventory, payment, and outbox work.
+
+The design's new costs are cursor infrastructure, idempotency storage/cleanup, explicit state machines, API documentation, and compatibility tests. Those costs buy a contract that survives concurrent inventory changes and ambiguous network outcomes.
+
+## Visualization We Eventually Want
+
+Build an API contract lab around a changing ticket inventory and a client that can disconnect at any point.
+
+### Controls
+
+- collection size, insert/delete/update rate, sort key/tie-breaker, page size, offset versus cursor, and cursor expiry;
+- concurrent clients, hold/confirm conflict rate, write timeout point, idempotency TTL, and duplicate request timing;
+- version mix (old/new clients), additive/breaking schema change, unknown fields/enums, and deprecation window;
+- error classes, retryable flag, backoff, `Retry-After`, rate limits, and dependency failure;
+- request ID/trace propagation through gateway, service, queue, and database.
+
+### Behavior and outputs
+
+Show page contents as rows change; offset pagination should visibly duplicate/skip rows while cursor/keyset traversal follows its contract. Drop the response after a successful mutation and show a retry returning the stored idempotent result rather than creating a duplicate. Send old clients a new field and then a changed/removed field; show tolerant behavior versus a breaking failure. Inject a conflict or dependency timeout and render the status, stable code, retry guidance, and request ID. Report page scan work, duplicate/skip count, idempotency hits/conflicts, request/error rates, retry amplification, version adoption, and trace completeness.
+
+## Scaling Behavior
+
+- **Large collections:** index the cursor's order/filter tuple and bound page size; avoid exact totals and deep offsets unless measured and required.
+- **Many retries:** store idempotency keys in a durable, partitionable store; hash/scope keys by tenant and expire safely. Protect in-progress keys from concurrent execution.
+- **Many client versions:** use additive schema evolution, feature flags/capability negotiation, SDK compatibility tests, and telemetry for old versions before removal.
+- **High fan-out:** make pagination and field selection explicit; batch related calls, cache safe reads, and cap GraphQL/query complexity.
+- **Many tenants:** scope IDs/cursors/idempotency records/errors and rate limits by tenant; never let an opaque token bypass authorization.
+- **Global clients:** include region/consistency expectations, clock/time-zone rules, retry budget, and multi-region idempotency ownership. A request ID can cross regions while storage consistency may not.
+- **High observability volume:** sample traces separately from errors, retain request IDs/operation IDs for support, and avoid logging sensitive payloads.
+
+## Failure Modes
+
+| Failure | Naive symptom | Contract-aware response |
+| --- | --- | --- |
+| Insert/delete while paging | Duplicate or missing rows | Cursor with deterministic order/tie-breaker; document snapshot/consistency semantics. |
+| Deep offset | Rising latency/DB scan work | Keyset cursor, indexed boundary, bounded page size, or a search/index service. |
+| Lost mutation response | Client cannot know whether it committed | Idempotency key, stored result/status, reconciliation resource. |
+| Duplicate key with changed payload | Wrong operation returned | Bind key to tenant/auth and request fingerprint; return conflict. |
+| Old client sees new field | Parser fails or ignores useful data | Tolerant readers, additive fields, versioned breaking changes, compatibility tests. |
+| Client retries 4xx conflict | More load without success | Stable non-retryable code and documentation; client changes intent rather than blindly retrying. |
+| Dependency timeout | Generic 500 and retry storm | Distinguish timeout/unavailable, propagate deadline, cap retries, return request ID. |
+| Cursor copied across tenant/filter | Data leak or invalid query | Sign/bind cursor, reauthorize every request, reject changed query parameters. |
+| Request ID collision/spoofing | Logs correlate unrelated users or expose data | Validate/replace untrusted IDs, high entropy, tenant-safe logs and trace context. |
+| Async worker fails after 202 | Client assumes success | Operation resource with state/error/expiry, retries, dead-letter/reconciliation path. |
+
+An API is part of reliability engineering. If the client cannot tell whether to retry, it will either duplicate work or give up after a recoverable failure; both outcomes should be visible in metrics.
+
+## Trade-offs
+
+- Cursor pagination is stable and index-friendly for moving collections but opaque, harder to debug, and not always suitable for arbitrary “jump to page 20.”
+- Offset pagination is familiar and useful for small/static/admin collections but can drift and become expensive at depth.
+- URL versioning is visible and easy to route but multiplies surfaces; additive evolution reduces duplication but requires disciplined client compatibility.
+- Idempotency storage improves safe retries but adds a durable record, retention/cleanup, key-scope policy, and a concurrency path.
+- Rich error details help clients and operators but can leak sensitive implementation information; stable codes should be actionable without secrets.
+- Request/trace IDs accelerate diagnosis but add propagation and privacy/logging work; an ID is not authentication.
+- Asynchronous `202` flows decouple user latency from slow work but require status, expiration, cancellation, replay, and support tooling.
+
+## Alternatives
+
+- **Offset pagination:** use for small, bounded, stable collections and admin tools where deep scans and drift do not matter.
+- **Cursor/keyset pagination:** use for feeds, logs, histories, and high-volume changing collections; require deterministic indexed order.
+- **Snapshot pagination:** use when the user needs a consistent export/report; accept snapshot storage or transaction cost.
+- **URL/header versioning:** choose based on visibility, routing, cache behavior, client tooling, and compatibility window.
+- **Idempotency record versus deterministic client-generated resource ID:** use a client ID/PUT when the resource identity is naturally known; use an idempotency key when the server allocates the resource or command outcome.
+- **Synchronous completion versus operation resource:** return synchronously for bounded fast work; use an operation/status resource when processing, payment, or external dependencies exceed the request SLO.
+- **Problem Details versus domain-specific error envelope:** use RFC 9457 for interoperable HTTP problems or a documented domain envelope when clients need richer structured fields; preserve stable status/code/retry semantics either way.
+
+## When to Use
+
+Use this API checklist whenever a system-design prompt asks for endpoints, APIs, mobile clients, pagination, retries, versioning, or failure behavior. Spend enough time to specify one read and one write end to end; a few precise contracts demonstrate more design maturity than a dozen happy-path URLs.
+
+## When Not to Use
+
+Do not over-specify every field before confirming product scope, or create a versioning scheme for a private prototype with one coordinated client. Do not add opaque cursors, idempotency storage, or asynchronous operations when the collection is tiny, writes are local and bounded, and a simpler contract has no ambiguity. Complexity should follow a demonstrated scale, compatibility, or failure requirement.
+
+## Common Misconceptions
+
+- **“Offset pagination is wrong.”** It is often fine for small/static data; the problem is using it without considering drift and deep-scan cost.
+- **“A cursor is just base64 offset.”** An opaque cursor should represent a stable continuation boundary and be protected/bound; encoding an offset does not fix drift.
+- **“Idempotency means the operation is exactly once.”** It makes repeated requests map to one logical outcome within a scope/window; external side effects still need atomicity/reconciliation.
+- **“POST cannot be retried.”** A POST may be safely retried when the API defines idempotency; method defaults do not replace a mutation contract.
+- **“Versioning is only a URL choice.”** Schema, semantics, performance, security, and operational compatibility all matter.
+- **“HTTP status is enough.”** Clients often need stable application codes, field/path details, retryability, and a request ID.
+- **“Request ID equals trace ID.”** A request/correlation ID, idempotency key, and W3C trace context serve related but different scopes.
+- **“202 means the work succeeded.”** It means the request was accepted for processing; the operation may later fail, expire, or need reconciliation.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+“I design one read and one write contract from the user journey. For changing collections I use a bounded, deterministic cursor with a tie-breaker instead of deep offsets; the cursor is opaque, scoped, and reauthorized. For mutations I define durable acceptance, idempotency keys, duplicate/concurrent behavior, and how a client reconciles after a lost response. I evolve additively with tolerant clients and explicit deprecation/versioning for breaks. Errors carry stable status/code/retry semantics and a request ID, while trace context follows the request across every hop.”
+
+### When to Introduce It
+
+Introduce API details after requirements and rough estimates, before data model/architecture. Start with the highest-value read/write journey and let its pagination, consistency, idempotency, and error needs motivate deeper components.
+
+### Common Follow-Ups
+
+- Why cursor over offset, and what ordering/snapshot does it guarantee?
+- How do you prevent a retry from double-charging or double-booking?
+- What does the client do after a timeout with unknown outcome?
+- How can old clients coexist with a new schema/version?
+- Which errors are retryable, and where does backoff/`Retry-After` come from?
+- How do request IDs and trace context appear across async queues and retries?
+- What stops a client from requesting an unbounded page or using another tenant's cursor?
+
+### Common Candidate Mistakes
+
+- Listing CRUD endpoints without states, invariants, auth scope, or failure outcomes.
+- Choosing offset pagination for a high-volume feed without discussing drift or index cost.
+- Calling a write “exactly once” because it uses HTTPS or TCP.
+- Retrying all errors, including validation/conflict/authorization failures.
+- Treating versioning as only `/v2` and ignoring old clients, caches, SDKs, and semantic changes.
+- Returning stack traces or sensitive details in errors and failing to expose a usable request ID.
+
+## Summary
+
+1. Derive API contracts from journeys, invariants, scale, consistency, and failure—not from database tables alone.
+2. Use deterministic indexed cursors for moving/deep collections; bound pages, protect cursors, and document traversal semantics.
+3. Evolve additively when possible; explicitly version and deprecate breaking changes while measuring client adoption.
+4. Use scoped idempotency keys and stored outcomes to make retryable mutations safe under lost responses and concurrency.
+5. Return stable errors with retry guidance and correlate every attempt with request/trace IDs without leaking secrets.
+
+## Quiz Seeds
+
+1. Show how an insertion between offset pages can duplicate or skip a row; how does a `(timestamp, id)` cursor change the query?
+2. What properties must an opaque cursor have, and why must authorization still run on every page request?
+3. A client times out after the server commits a payment. What idempotency record and response should a retry receive?
+4. Why can adding a response field be backward-compatible while changing its units is breaking?
+5. Which error signals a non-retryable seat conflict versus a retryable dependency outage, and what should the client do?
+6. Distinguish request ID, idempotency key, operation ID, and W3C trace context.
+7. When is `202 Accepted` preferable to waiting for a synchronous response, and what resource must accompany it?
+8. How would you protect a GraphQL/REST collection endpoint from unbounded page size, expensive filters, or cross-tenant cursors?
+
+## Related Topics
+
+- [Functional and non-functional requirements](../00-interview-method/requirements.mdx) supplies the user journeys and quality targets an API must encode.
+- [Back-of-the-envelope estimation](../00-interview-method/estimation.mdx) turns collection size, QPS, retries, and payloads into capacity limits.
+- [HTTP evolution](./http-evolution.mdx) explains the transport/version behavior beneath API semantics.
+- [REST, RPC, gRPC, and GraphQL](./rest-rpc-grpc-graphql.mdx) compares interaction models and schema trade-offs.
+- [Real-time transports](./realtime-transports.mdx) covers push/progress channels that accompany asynchronous API operations.
+- [The request lifecycle](./request-lifecycle.mdx) shows where gateways, request IDs, timeouts, and dependency contracts sit.
+
+## References
+
+### Documentation / Articles
+
+- [HTTP Semantics (RFC 9110)](https://www.rfc-editor.org/rfc/rfc9110.html) — authoritative method, status, conditional request, idempotency, and intermediary semantics.
+- [Pagination (Google AIP-158)](https://google.aip.dev/158) — official guidance on page size, opaque page tokens, expiration, stable request parameters, and compatibility.
+- [Problem Details for HTTP APIs (RFC 9457)](https://www.rfc-editor.org/rfc/rfc9457.html) — standard machine-readable error shape and guidance for status-plus-detail responses.
+- [Idempotent requests](https://docs.stripe.com/api/idempotent_requests) — a concrete production API contract for key scope, parameter matching, stored outcomes, expiry, and concurrent retries.
+- [Microsoft REST API Guidelines](https://github.com/microsoft/api-guidelines) — strong engineering guidance on resource naming, method semantics, compatibility, errors, repeatability, and long-running operations.
+- [Cloud API Design Guide](https://docs.cloud.google.com/apis/design) — official patterns for resource-oriented REST/RPC APIs, pagination, errors, versioning, and backward compatibility.
+- [Trace Context](https://www.w3.org/TR/trace-context/) — W3C standard for propagating `traceparent`/trace state across distributed request boundaries.

@@ -1,0 +1,224 @@
+---
+type: lesson
+id: 01-03-latency-vs-throughput
+slug: latency-vs-throughput
+title: Latency vs. Throughput
+description: Separate how long one operation takes from how much completed work a system sustains.
+module: foundations
+order: 3
+difficulty: core
+estimatedMinutes: 30
+prerequisites:
+  - 01-02-horizontal-vs-vertical-scaling
+  - 00-03-estimation
+tags:
+  - latency
+  - throughput
+  - qps
+  - queueing
+  - little-law
+objectives:
+  - Define latency and throughput at a stated system boundary and workload.
+  - Explain why increasing concurrency can raise throughput while worsening latency.
+  - Apply Little's Law to estimate in-flight work, connections, or queue occupancy.
+  - Distinguish average latency from a latency distribution and identify the user-visible target.
+  - Choose batching, parallelism, capacity, or admission control with its latency trade-off.
+relatedLessons:
+  - 01-02-horizontal-vs-vertical-scaling
+  - 01-04-percentiles-tail-latency
+---
+
+# Latency vs. Throughput
+
+> Latency is the time for one operation; throughput is the amount of completed work per unit time. A system can improve one while worsening the other.
+
+## Why This Exists
+
+“The service handles 10,000 requests per second” does not tell a user whether a request takes 5 ms or 5 seconds. “The endpoint is fast” does not tell an operator whether it can absorb a flash sale. A design needs both a response-time target and a work-rate target, measured at a named boundary.
+
+The naive approach is to run one request at a time and report its fast response. It misses queueing and concurrency. The opposite naive approach is to maximize worker count until throughput is high; the resulting queue can make every interactive request late.
+
+## Mental Model
+
+| Quantity | Meaning | Example |
+| --- | --- | --- |
+| Latency | Elapsed time from a defined start to a defined completion | 120 ms from API receipt to response |
+| Throughput | Completed work per unit time | 2,000 successful requests/s |
+| Concurrency | Work in progress at a point in time | 240 requests executing or waiting |
+| Utilization | Fraction of a resource busy | 70% of worker capacity |
+
+Latency includes service time plus waiting, network, serialization, retries, and downstream calls. Throughput counts completed useful work, not merely accepted requests. A queue can make accepted request rate appear high while completed throughput remains capped.
+
+At steady state, Little's Law relates average concurrency, throughput, and time:
+
+~~~text
+L = λ × W
+
+average work in system = completed rate × average time in system
+~~~
+
+The law does not say that every individual request has the average latency or that a burst is instantly stable. It is a powerful accounting identity for a well-defined boundary under steady-state conditions.
+
+## How It Works
+
+### The latency budget
+
+Break a user-visible target across unavoidable work:
+
+~~~text
+client 20 ms
+network 30 ms
+API handler 10 ms
+database 40 ms
+slack 50 ms
+total target 150 ms
+~~~
+
+The budget is a design hypothesis. If a database call takes longer than its allocation, adding more API workers does not fix the user path. Parallel calls can reduce critical-path latency, but they increase fan-out, resource use, and tail risk.
+
+### The throughput limit
+
+Throughput is bounded by the slowest serial stage or shared resource. If an image worker produces 400 thumbnails/s but receives 700/s, the queue grows by roughly 300/s until admission control, storage, or memory fails. Adding consumers, batching jobs, or using cheaper work can increase service rate; it may also increase latency per batch or stale-result time.
+
+### Concurrency and queues
+
+More concurrency can hide slow work for a while. Once all workers, connections, CPU, memory, or downstream quotas are occupied, extra requests wait. As utilization approaches 100%, small bursts produce disproportionately long queues. Protect the system with bounded pools, deadlines, backpressure, and explicit overload behavior.
+
+## Example
+
+Consider a thumbnail API with a 150 ms p95 target. One worker handles 100 requests/s, and each request spends an average 80 ms in the service. At 100 requests/s, Little's Law predicts about 8 in-flight requests at this boundary.
+
+### Naive → failure → improvement
+
+1. **Naive:** use four workers with an unbounded queue and accept 600 requests/s because the front door can receive them.
+2. **Failure:** the workers complete only 400/s. The queue grows at 200/s; after 10 seconds it holds about 2,000 requests, and the average wait alone exceeds the latency budget.
+3. **Improvement:** add two workers, cap the queue, reject or defer work beyond a deadline, and batch storage writes when the product allows asynchronous completion.
+4. **New trade-off:** six workers increase throughput and reduce queueing but consume more CPU and storage connections. A bounded queue may return an error sooner, improving system health while reducing immediate acceptance.
+
+At 600 completed requests/s with 100 ms average time in the boundary, average concurrency is 60. That does not mean 60 threads are always enough: a p99 of 900 ms, uneven work, and downstream limits require headroom and a tail-oriented SLO.
+
+## Visualization We Eventually Want
+
+Build an animated request pipeline with controls for:
+
+- arrival rate, worker count, service-time distribution, and queue capacity;
+- batch size, downstream latency, and timeout;
+- pause/resume/step and a burst scenario;
+- charts for accepted rate, completed throughput, queue depth, average latency, p50, and p99;
+- a Little's Law panel that shows measured concurrency, throughput, and time at the selected boundary.
+
+The learner should be able to increase concurrency and watch throughput flatten while latency rises, then add capacity or bound the queue and observe the new trade-off.
+
+## Scaling Behavior
+
+Scaling workers can increase throughput while the work is parallel and the downstream dependency has capacity. It does not help a serialized lock, one database writer, a fixed quota, or a network link. Batching can improve throughput by amortizing overhead while adding per-item waiting and larger failure/retry units.
+
+As traffic grows, average latency may remain stable until utilization crosses a threshold, then queueing causes a nonlinear rise. Long-lived connections use concurrency even when request throughput is low. Fan-out systems multiply downstream work and can have a higher effective throughput requirement than the edge API.
+
+## Failure Modes
+
+- **Accepted but not completed:** the ingress layer counts requests that a worker queue cannot drain.
+- **Unbounded queue:** latency and memory grow until the process or dependency fails.
+- **Retry amplification:** timed-out requests continue consuming capacity while clients send replacements.
+- **Head-of-line blocking:** one slow item delays unrelated work in a shared queue or connection.
+- **Wrong boundary:** server latency looks healthy while client or downstream latency is poor.
+- **Batch failure:** larger batches increase throughput but lose more work when one batch fails.
+
+Measure arrivals and completions separately, record queue wait and service time, set deadlines, and make overload behavior explicit.
+
+## Trade-offs
+
+Lower latency often requires more capacity, locality, caching, parallelism, or stronger coordination. Higher throughput often favors batching, asynchronous processing, compression, or larger queues. Each can raise memory, staleness, tail latency, recovery cost, or operational complexity.
+
+Keeping utilization below saturation costs money but buys burst and failure headroom. A latency target for an interactive read should not be used to size a batch pipeline whose useful objective is completed records per hour.
+
+## Alternatives
+
+- **Synchronous request/response:** use when the caller needs the result before continuing; budget every critical-path hop.
+- **Asynchronous queue:** use when work can complete later; expose status, retries, and durability semantics.
+- **Batching:** use when per-item overhead dominates and bounded delay is acceptable.
+- **Parallel fan-out:** use when subrequests are independent; cap fan-out and account for tail amplification.
+- **Admission control:** use when protecting bounded capacity matters more than accepting every request.
+
+## When to Use
+
+Use both metrics in every capacity estimate and SLO discussion. Name whether “throughput” means requests, records, bytes, or business events, and whether latency includes queueing and client network time.
+
+## When Not to Use
+
+Do not optimize a batch job for interactive p99 if its product requirement is eventual completion. Do not compare throughput numbers from different request costs or boundaries. Do not increase concurrency without a bound on memory, connections, and downstream work.
+
+## Common Misconceptions
+
+- **“High throughput means low latency.”** A saturated queue can complete many requests per second while each waits a long time.
+- **“Latency is just CPU time.”** Waiting, network, queues, retries, and downstream calls are often larger.
+- **“Throughput is accepted QPS.”** Useful throughput is completed work; rejected or duplicate retries do not count.
+- **“Little's Law predicts every burst.”** It relates averages under a defined steady-state boundary.
+- **“More workers always help.”** They can overload a shared dependency and increase queueing.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> Latency is how long one request takes at a defined boundary, while throughput is completed work per second. I would set both targets, account for queueing and downstream budgets, and use Little's Law to estimate in-flight work. Increasing concurrency can raise throughput until a shared resource saturates, after which latency and failures rise; bounded queues and admission control make that behavior explicit.
+
+### When to Introduce It
+
+Introduce the pair when estimating capacity, choosing synchronous versus asynchronous work, or discussing a queue, worker pool, batcher, or fan-out service.
+
+### Common Follow-Ups
+
+- What is the latency boundary and which percentile is the target?
+- Which stage limits throughput?
+- How many in-flight requests or connections are required?
+- What happens when arrivals exceed completions?
+- Can this work be batched or made asynchronous?
+
+### Common Candidate Mistakes
+
+- Reporting only average latency or accepted QPS.
+- Ignoring queue wait and downstream latency.
+- Applying Little's Law to mixed boundaries.
+- Increasing worker count without a downstream capacity check.
+- Calling a batch pipeline slow when its actual objective is throughput.
+
+## Summary
+
+- Latency describes one operation; throughput describes completed work rate.
+- Queueing links the two: as arrival rate approaches service capacity, latency rises sharply.
+- Little's Law is a useful average accounting identity when the boundary and conditions are explicit.
+- Measure p50 and tail behavior in addition to averages.
+- Choose synchronous, asynchronous, batching, parallelism, and admission control from the product's latency and throughput needs.
+
+## Quiz Seeds
+
+1. A service accepts 1,000 requests/s but completes 700 requests/s. What happens to an unbounded queue over time?
+2. With 2,000 requests/s and 150 ms average time in a boundary, what average concurrency does Little's Law predict?
+3. Why can adding workers increase throughput while worsening latency?
+4. Which quantities must be named before applying Little's Law?
+5. When is asynchronous processing a better choice than extending a synchronous latency budget?
+6. Why is accepted QPS not the same as useful throughput?
+7. A batch size doubles throughput but doubles wait time. Which requirement determines whether that is acceptable?
+8. What metrics would separate queue wait from downstream service time?
+
+## Related Topics
+
+- [Horizontal vs. Vertical Scaling](./horizontal-vs-vertical-scaling.mdx) — add capacity while preserving a latency target.
+- [Percentiles and Tail Latency](./percentiles-tail-latency.mdx) — summarize latency distributions beyond an average.
+- [Back-of-the-Envelope Estimation](../00-interview-method/estimation.mdx) — estimate QPS, bandwidth, and concurrency with explicit units.
+
+## References
+
+### Documentation / Articles
+
+- [Monitoring Distributed Systems — Google SRE](https://sre.google/sre-book/monitoring-distributed-systems/) — introduces latency, traffic, errors, and saturation as service signals and explains why distributions matter.
+- [Performance Efficiency Pillar — AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/performance-efficiency-pillar/welcome.html) — recommends workload-shaped benchmarking and data-driven performance decisions.
+- [Production Services Best Practices — Google SRE](https://sre.google/sre-book/service-best-practices/) — connects resource capacity, overload, graceful degradation, and the difference between useful work and raw request rate.
+
+### Papers
+
+- [A Proof for the Queuing Formula: L = λW — John D. C. Little](https://www.jstor.org/stable/167622) — the original result grounding the relationship among average work in a system, throughput, and time.
+
+### Videos
+
+No video is included because the original queueing result and SRE monitoring guidance are more precise for interview reasoning.

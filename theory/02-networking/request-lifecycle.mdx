@@ -1,0 +1,281 @@
+---
+type: lesson
+id: 02-01-request-lifecycle
+slug: request-lifecycle
+title: The Request Lifecycle
+description: Trace a request across name resolution, edges, proxies, services, caches, and storage while preserving latency and failure budgets.
+module: networking
+order: 1
+difficulty: core
+estimatedMinutes: 35
+prerequisites:
+  - 00-04-interview-framework
+  - 01-03-latency-vs-throughput
+  - 01-04-percentiles-tail-latency
+tags:
+  - request-path
+  - latency
+  - proxies
+  - cdn
+  - service-boundaries
+  - failure-analysis
+objectives:
+  - Draw a request path from a client to durable state and explain why each hop exists.
+  - Build a latency budget from serial work, parallel fan-out, and queueing instead of adding component names by habit.
+  - Distinguish client-side, edge, routing, application, cache, and database failures and choose bounded fallbacks.
+  - Identify where connection reuse, caching, batching, or asynchronous work changes the critical path.
+  - Explain a request path clearly in a system-design interview and name the trade-offs introduced by every added hop.
+relatedLessons:
+  - 00-04-interview-framework
+  - 01-03-latency-vs-throughput
+  - 01-04-percentiles-tail-latency
+  - 02-02-dns
+  - 02-04-http-evolution
+  - 03-01-reverse-proxy-and-load-balancer
+---
+
+# The Request Lifecycle
+
+> A request path is a sequence of contracts: every hop consumes part of the latency and failure budget, so add a component only when it solves a demonstrated problem.
+
+## Why This Exists
+
+The naive picture of a web system is `client → application → database`. It is a useful starting point, but it hides the work required before the application can run and the boundaries where a request can fail. A real request may resolve a name, reuse or establish a connection, cross an edge cache, pass through a load balancer and gateway, call several services, read a cache, and query durable storage.
+
+If the product is a news feed and the client waits 400 ms, saying “the service is slow” is not a diagnosis. The time may be spent in a cold DNS lookup, a new TLS connection, a cache miss, a fan-out to profile and ranking services, database queueing, or a retry that should never have been attempted on the user path. The request lifecycle gives us a map for asking which boundary owns the delay and which failure behavior the user sees.
+
+The first improvement over the naive design is not “add every standard box.” It is to draw the smallest end-to-end path, measure its hops, and introduce a component when a requirement or bottleneck justifies it:
+
+```text
+naive:       Client ──▶ Application ──▶ Database
+failure:     one process and one database absorb all traffic and failures
+improved:    Client ──▶ DNS/edge ──▶ routing ──▶ app ──▶ cache ──▶ database
+new cost:    more boundaries, connection pools, configuration, and failure modes
+```
+
+## Mental Model
+
+Treat a request as an envelope moving through a pipeline. At each hop, ask four questions:
+
+1. What contract does this hop provide (name, protection, routing, computation, freshness, or durability)?
+2. Is the work serial, parallel, or optional on this user-visible path?
+3. What timeout, retry, and cancellation rule bounds it?
+4. What evidence tells us that this hop is the bottleneck or failure source?
+
+A simple latency model is:
+
+```text
+end-to-end latency ≈ client/network + serial hop time + fan-out join time + queueing
+```
+
+For parallel calls, the join is often close to the slowest branch, not the sum of every branch. If a feed handler calls ranking (90 ms), profile (20 ms), and ads (70 ms) in parallel, the useful service time is roughly `max(90, 20, 70) = 90 ms` plus dispatch and queueing. If it calls them one after another, it pays about 180 ms before overhead. Percentiles matter: p99 fan-out latency is driven by the slowest branch's tail, and a small per-hop timeout can still create a large end-to-end tail.
+
+## How It Works
+
+### 1. Start with the client and name
+
+The client has a URL or service name, not necessarily an IP address. A resolver may answer from local or recursive cache; otherwise DNS walks the hierarchy and returns an address with a TTL. DNS is a separate distributed system with its own failure and freshness behavior; see [DNS](./dns.mdx) for the full mental model. A stale address can route to an old fleet, while a very short TTL can increase resolver traffic and does not guarantee instant client convergence.
+
+### 2. Reuse or establish transport state
+
+The client may reuse a connection or establish a new TCP/TLS or QUIC connection. Reuse avoids handshake work but consumes client, proxy, and server connection capacity. The transport provides delivery and flow-control semantics; HTTP then supplies request and response semantics. [HTTP evolution](./http-evolution.mdx) explains how HTTP/1.1, HTTP/2, and HTTP/3 change multiplexing and connection behavior.
+
+### 3. Cross the edge
+
+An edge cache or CDN can terminate TLS, reject obviously invalid requests, serve a cacheable response, or route the request toward an origin. This reduces origin distance and load for cacheable content. It cannot safely cache personalized or mutation responses without explicit cache keys and authorization rules. An edge miss is not a failure: it is a controlled transition to the origin path.
+
+### 4. Route through a load balancer or gateway
+
+A layer-4 device can choose a backend based on connections and addresses; a layer-7 reverse proxy can inspect HTTP host/path/headers, terminate TLS, enforce request limits, and select a service. Health checks and routing policy decide which instances receive traffic. A gateway may also authenticate, add request IDs, and translate an external API into internal calls, but it should not become an unbounded business-logic bottleneck.
+
+### 5. Execute application work
+
+The application validates input, authorizes the caller, reads or computes data, and invokes dependencies. A request context should carry a deadline, cancellation signal, request ID, and trace context. If the handler launches a fan-out, it should bound concurrency and define what happens when one branch is slow or unavailable. Work that does not affect the response—email, indexing, analytics—usually belongs on an asynchronous path rather than holding the request open.
+
+### 6. Use caches and durable state deliberately
+
+The application can check a local or distributed cache before the database. A cache hit saves backend work but introduces freshness, invalidation, and stampede questions. A miss reads the authoritative store, then may populate the cache. Writes must state whether the response means “accepted,” “durably committed,” or “eventually processed.” A database call consumes a connection-pool slot and its own queueing/replication budget; the application timeout must leave enough time to return a bounded error to the caller.
+
+### 7. Return through the same contracts
+
+The response travels back through proxies and connections. Headers control caching, content negotiation, and correlation; status and body communicate success or failure. A response may be compressed or served from an edge on the next request. Record timings by hop and outcome, not only one aggregate latency number.
+
+```text
+Client
+  │ DNS + connection reuse/handshake
+  ▼
+Edge/CDN ──cache hit──▶ response
+  │ miss
+  ▼
+LB / gateway ──auth, limits, request ID──▶ application
+                                      ├──local/distributed cache
+                                      ├──profile/ranking (parallel)
+                                      └──database / queue
+                                              │
+                                      response + metrics + trace
+```
+
+The diagram is intentionally a behavior map, not a mandatory topology. The cache, gateway, and fan-out are justified only when the workload or contract needs them.
+
+## Example
+
+### A personalized feed read
+
+Suppose `GET /v1/feed?cursor=...` must return the first page within 250 ms at p95. Start with `Client → Feed service → Database`. At 3,000 peak requests/s, one application fleet may saturate and a database query may repeat the same hot reads. The improved design is:
+
+```text
+mobile client
+  → api.example.com (DNS, 30 s TTL)
+  → edge (TLS + public cache policy; personalized response is not shared)
+  → regional gateway (auth, rate limit, request ID)
+  → feed service
+       ├─ feed-page cache (bounded 20 ms budget)
+       ├─ ranking service (parallel, 90 ms deadline)
+       └─ profile cache/database (parallel, 40 ms deadline)
+  → response with next cursor and trace ID
+```
+
+Naively, the service performs three serial database calls. Under a cache miss it takes 180 ms before network overhead and has no clear behavior when profile storage is slow. The improvement is to cache stable profile snippets, issue independent calls in parallel, and make ranking optional: return a chronologically ordered page if ranking misses its deadline. The new trade-off is that a degraded response may be less relevant, and parallel fan-out increases connection and tail pressure. The request contract must tell the client whether the response is complete or degraded if that distinction matters.
+
+For a post mutation, `POST /v1/posts` should keep only validation, durable write, and the minimum response on the synchronous path. Search indexing, feed fan-out, and notifications can follow through a queue. Returning success before durable acceptance would make a client retry ambiguous; returning only after every downstream side effect would make the write fragile and slow.
+
+## Visualization We Eventually Want
+
+Build an interactive hop timeline for a single request and a stream of requests. The learner should see the naive path first, then add edge caching, a gateway, a cache, and parallel dependencies one at a time.
+
+### Controls
+
+- request rate, cache hit ratio, cache miss latency, and database service time;
+- number of application instances and healthy/unhealthy instances;
+- serial versus parallel fan-out and per-dependency timeout;
+- DNS cache hit rate, connection reuse, TLS/QUIC handshake cost, and edge distance;
+- injected packet loss, slow dependency, cache outage, and database overload;
+- toggle optional ranking or asynchronous indexing.
+
+### Behavior and outputs
+
+Animate a request ID across hops, but also show a text timeline and a waterfall table. Report p50/p95/p99 latency, queue depth, in-flight requests, cache hits/misses, timeout/cancellation counts, origin load, and the fraction of degraded responses. When a dependency is slowed, show whether the deadline cancels it, whether a retry creates extra load, and which fallback response reaches the user. A reset should compare the naive and improved designs under the same workload.
+
+## Scaling Behavior
+
+- **More requests:** add stateless application capacity behind routing, but check the shared gateway, connection pools, cache, and database before assuming horizontal scaling fixes the limit.
+- **More geographic distance:** place edge termination and regional origins closer to users; choose whether data reads can be served regionally and what consistency delay that permits.
+- **More fan-out:** bound parallelism, batch requests, precompute views, or move noncritical branches asynchronously. `N` downstream calls can multiply connection, CPU, and tail pressure.
+- **More data:** partition or index the authoritative store and size caches for the working set, not total history. Large payloads often move to object storage/CDN.
+- **More tenants:** isolate noisy tenants with quotas, pools, cache namespaces, and per-tenant metrics; otherwise one tenant can exhaust a shared hop.
+- **More connections:** use connection reuse and event-driven servers where appropriate, but budget file descriptors, memory, heartbeats, proxy limits, and reconnect bursts.
+
+## Failure Modes
+
+| Failure | What the user may see | Useful response |
+| --- | --- | --- |
+| DNS or resolver outage | New connections cannot find the service; cached clients may continue briefly | Multiple resolvers/authoritative servers, sensible TTLs, and tested failover; do not treat DNS as an instant switch. |
+| Edge or gateway outage | Regional or global request loss | Redundant edges, health-based routing, bounded fail-open behavior only for safe checks. |
+| Stale or poisoned cache entry | Old or wrong response | Explicit keys, authorization-aware caching, TTL/invalidation, and purge controls. |
+| One dependency slow | Tail latency, timeout, or partial response | Deadlines, cancellation, bounded concurrency, fallback, and separate dependency SLOs. |
+| Database overload | Queueing, errors, cascading timeouts | Admission control, cache, read/write separation where justified, backpressure, and load shedding. |
+| Retry storm | More work precisely while the dependency is unhealthy | Retry only safe operations, cap attempts, exponential backoff with jitter, and honor deadlines. |
+| Client disconnect | Server continues wasted work | Propagate cancellation; make side effects idempotent before retrying. |
+| Region or network partition | Some users see errors or stale data | Route only to known-healthy regions and state consistency/degradation behavior explicitly. |
+
+Timeouts are not a repair for a slow dependency by themselves. A timeout that is longer than the caller's deadline wastes capacity; a timeout without cancellation lets work continue after the client has gone away.
+
+## Trade-offs
+
+- More hops can reduce origin work, centralize policy, and improve isolation, but add latency, configuration, certificates, queues, and failure boundaries.
+- Parallel fan-out lowers median latency compared with serial calls, but its tail approaches the slowest branch and it consumes more concurrent resources.
+- Caching improves latency and capacity at the cost of freshness, invalidation complexity, memory, and a cold-start or stampede failure mode.
+- Synchronous work gives the caller a stronger completion signal but couples availability and latency to every dependency. Asynchronous work improves resilience and throughput but needs status tracking, retries, and duplicate-safe consumers.
+- Regional routing can lower user latency and contain faults, but it may make writes, identity, and cache invalidation globally harder.
+- A gateway centralizes authentication and observability, but a poorly bounded gateway becomes a single bottleneck or a place where business logic is duplicated.
+
+## Alternatives
+
+- **Direct client-to-service:** appropriate for a small trusted internal tool with few services; avoid when public policy, TLS termination, or routing needs central control.
+- **Server-side aggregation/BFF:** useful when a mobile/web client would otherwise make many calls or needs a view-specific contract; avoid copying every domain operation into a permanent orchestration layer.
+- **Precomputed materialized view:** preferable for read-heavy feeds with expensive fan-out; accept write amplification and freshness lag.
+- **Asynchronous command plus polling/status:** preferable when work takes seconds or more; avoid pretending a long-running job is a normal request.
+- **Service mesh sidecars:** useful for consistent internal transport policy and telemetry at many services; avoid adding mesh complexity to a small deployment where a library or proxy is enough.
+
+## When to Use
+
+Use a request-lifecycle analysis whenever the prompt includes a user-facing request, multiple services, a latency SLO, a global audience, or a failure question. In an interview, draw the end-to-end path before naming infrastructure. Mark the synchronous critical path and state which calls are optional or asynchronous.
+
+## When Not to Use
+
+Do not invent a CDN, service mesh, gateway, or cache for a single-process prototype or a small internal tool whose measured bottleneck is elsewhere. Do not turn a simple local function call into a network hop merely to make the diagram look distributed. If there is no user-visible request—only a batch or event flow—start with the producer/consumer lifecycle instead and connect it to this model only at the boundary.
+
+## Common Misconceptions
+
+- **“The load balancer makes the system highly available.”** It can route around known unhealthy instances, but its own control plane, health checks, dependencies, and stale decisions can fail.
+- **“A cache hit means the response is correct.”** It means a value was found; correctness depends on keying, authorization, freshness, and invalidation.
+- **“Parallel calls add their latencies.”** The join waits for the slowest required branch, plus scheduling and queueing; the tail still matters.
+- **“A timeout stops the work.”** It only stops waiting unless cancellation reaches the dependency and the dependency honors it.
+- **“More replicas always reduce latency.”** Replicas can reduce queueing or increase read capacity, but coordination, routing, cache misses, and hot partitions can dominate.
+- **“DNS TTL is a guaranteed failover time.”** Caches may retain data under resolver policies, clients may cache addresses independently, and existing connections bypass new resolution.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+“I start with the smallest path from client to authoritative state, then add a hop only for a requirement: DNS maps the service name, an edge can terminate and cache safe content, routing spreads traffic, the application owns the request contract, caches reduce repeated work, and the database is the source of truth. I put a deadline and failure behavior around every dependency, keep noncritical work asynchronous, and measure each hop so the latency and availability budget is explainable.”
+
+### When to Introduce It
+
+Introduce the lifecycle immediately after clarifying the user journey and latency/availability target. Revisit it when the interviewer asks about scale, regional traffic, tail latency, partial failure, caching, or observability.
+
+### Common Follow-Ups
+
+- Which hops are serial, and which can run in parallel?
+- What is the p95/p99 budget for each dependency and for the whole request?
+- What happens when the cache, database, gateway, or one region is unavailable?
+- How do retries interact with deadlines and idempotency?
+- Which data is safe to cache, and how is it invalidated?
+- Where is the request ID and trace context generated and propagated?
+
+### Common Candidate Mistakes
+
+- Drawing boxes without identifying the problem or signal that motivates them.
+- Adding all dependency latencies while ignoring parallelism, then ignoring fan-out tail latency.
+- Treating a health check as proof that a dependency can serve real traffic.
+- Hiding retries, cache misses, database queueing, or TLS handshakes from the budget.
+- Returning success before durable acceptance or synchronously waiting for side effects that do not affect the user response.
+- Saying “the load balancer retries” without specifying safe methods, attempt limits, backoff, and request IDs.
+
+## Summary
+
+1. Draw the end-to-end request before selecting technologies.
+2. Every hop consumes latency, capacity, and failure budget; make its contract explicit.
+3. Keep the critical path short, parallelize independent work carefully, and move noncritical side effects asynchronous.
+4. Bound every dependency with deadlines, cancellation, and a defined fallback or error.
+5. Measure per-hop behavior and tails; aggregate request latency alone cannot explain the system.
+
+## Quiz Seeds
+
+1. A request fans out to three dependencies in parallel. Which latency best approximates the required join time, and what additional tail risk remains?
+2. Given a 250 ms p95 target and four serial hops, how would you allocate a first-pass budget and validate it?
+3. Why does a cache miss change both latency and backend capacity, while a cache hit can still be incorrect?
+4. Which work belongs on an asynchronous path after a post is durably accepted, and what does the client need to observe progress?
+5. A client disconnects after the application writes to the database but before the response arrives. How should a retry avoid a duplicate side effect?
+6. Why can adding a gateway improve policy consistency yet reduce availability if it has an unbounded bottleneck?
+7. What metrics distinguish DNS delay, connection setup, queueing, dependency latency, and serialization time?
+8. If ranking times out but profile data is available, what degraded response would you return and how would you label or measure it?
+
+## Related Topics
+
+- [Back-of-the-envelope estimation](../00-interview-method/estimation.mdx) turns request volume, latency, and connections into capacity assumptions.
+- [Latency versus throughput](../01-foundations/latency-vs-throughput.mdx) supplies the rate and service-time vocabulary for hop budgets.
+- [Percentiles and tail latency](../01-foundations/percentiles-tail-latency.mdx) explains why a p99 fan-out branch can dominate the user experience.
+- [DNS](./dns.mdx) expands name resolution, TTL, recursive caching, and routing behavior.
+- [HTTP evolution](./http-evolution.mdx) connects transport and protocol choices to connection reuse and multiplexing.
+- [Reverse proxies and load balancers](../03-traffic-and-services/reverse-proxy-and-load-balancer.mdx) develops the routing boundary in more depth.
+
+## References
+
+### Documentation / Articles
+
+- [How browsers work](https://developer.mozilla.org/en-US/docs/Web/Performance/How_browsers_work) — MDN’s lifecycle overview grounds the client-side sequence from navigation and DNS through connection, response, and rendering.
+- [HTTP overview](https://developer.mozilla.org/en-US/docs/Web/HTTP/Overview) — MDN’s reference explains the client/server request-response model, intermediaries, caching, and connection reuse.
+- [HTTP Semantics (RFC 9110)](https://www.rfc-editor.org/rfc/rfc9110.html) — the IETF specification defines methods, status codes, fields, caching-related semantics, and intermediary behavior used at request boundaries.
+- [Service Best Practices](https://sre.google/sre-book/service-best-practices/) — Google SRE guidance connects capacity, load testing, redundancy, graceful degradation, and overload behavior to an end-to-end service.
+- [The pillars of the Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/the-pillars-of-the-framework.html) — an official architecture checklist for reliability, performance, security, cost, and operations at each boundary.

@@ -1,0 +1,215 @@
+---
+type: lesson
+id: 01-07-durability
+slug: durability
+title: Durability
+description: Reason about whether acknowledged data survives process, node, zone, or region failure.
+module: foundations
+order: 7
+difficulty: core
+estimatedMinutes: 30
+prerequisites:
+  - 01-06-reliability
+  - 00-02-requirements
+tags:
+  - durability
+  - data-loss
+  - wal
+  - replication
+  - backups
+  - rpo
+objectives:
+  - Define durability relative to an acknowledgement point and a stated failure scope.
+  - Explain why a successful response does not prove that data is on durable storage.
+  - Compare write-ahead logging, synchronous replication, asynchronous replication, and backups.
+  - Relate replication lag and recovery point objective to possible data loss.
+  - Identify correlated storage, operator, and recovery failures that replicas alone do not solve.
+relatedLessons:
+  - 01-06-reliability
+  - 01-08-redundancy-and-fault-tolerance
+---
+
+# Durability
+
+> Durability asks whether a write that the system acknowledged remains recoverable after the failures named in its contract.
+
+## Why This Exists
+
+An order API can return success after placing an order in process memory. A power loss before the write reaches stable storage turns that success into data loss. A database replica can acknowledge locally while its remote copy is still behind. A backup can exist but be too old, corrupt, inaccessible, or impossible to restore.
+
+The naive design treats “the client received 200” as equivalent to “the data is safe.” The improvement is to define an acknowledgement boundary and persist data through a mechanism that survives the required failure scope. Durability is about state survival, not whether the API remains reachable during the failure.
+
+## Mental Model
+
+Ask four questions:
+
+1. **What data?** An order, ledger entry, event, object, or cache value.
+2. **When is it acknowledged?** After memory, a local log, a local disk, one replica, or multiple failure domains.
+3. **What failure must it survive?** Process restart, power loss, disk loss, zone loss, region loss, operator mistake, or corruption.
+4. **How is recovery verified?** Replay, replica promotion, point-in-time restore, checksum validation, and a tested runbook.
+
+Durability is a statement about a write's survival probability and recovery semantics. It does not promise that the service can answer during a failure, that a read is fresh, or that a write was semantically correct.
+
+## How It Works
+
+### A durable write path
+
+A simplified database write can be:
+
+~~~text
+client write
+  → append record to write-ahead log
+  → flush log to stable storage
+  → optionally replicate and wait for another failure domain
+  → acknowledge
+  → apply log record to data pages or materialized state
+~~~
+
+Write-ahead logging lets recovery replay committed intent after a crash. Checksums, full-page images, and filesystem guarantees help detect or repair partial writes. Synchronous replication waits for a required copy before acknowledgement; asynchronous replication lowers write latency but leaves a lag window.
+
+Backups provide a separate recovery path and can protect against logical deletion or corruption that live replicas faithfully copy. A backup's useful durability depends on retention, isolation, integrity checks, restore time, and restore testing.
+
+### RPO is an acknowledgement and recovery question
+
+If a remote replica is 30 seconds behind, a region loss can lose up to that acknowledged history unless another mechanism closes the gap. Call that possible loss explicitly; do not claim that replication factor alone guarantees zero data loss.
+
+## Example
+
+Suppose an order service receives a payment confirmation and must preserve it through a zone failure.
+
+### Naive → failure → improvement
+
+1. **Naive:** update an in-memory order object, return success, and flush to local disk every few seconds.
+2. **Failure:** a process and host power loss occurs before the flush; the customer has a confirmation but the order is missing.
+3. **Improvement:** append the order transition to a WAL, flush before acknowledgement, and synchronously replicate the log to a separate zone. Stream encrypted backups to separate storage and test point-in-time restore.
+4. **New trade-off:** synchronous cross-zone acknowledgement adds latency and can reject writes when the second zone is unavailable; backups add storage and operational cost and may still have a recovery window.
+
+If the requirement allows five minutes of data loss during a regional disaster, asynchronous cross-region replication plus frequent backups may be cheaper. The acknowledgement and failure scope decide the design.
+
+## Visualization We Eventually Want
+
+Build a write-acknowledgement simulator:
+
+- choose memory-only, local flush, local WAL, synchronous replica, asynchronous replica, or backup-only acknowledgement;
+- inject process, disk, zone, region, operator-delete, and corruption failures;
+- display which acknowledged records survive, the recovery path, replication lag, and RPO;
+- toggle checksums, point-in-time restore, and restore verification;
+- show write latency and availability cost for each acknowledgement policy.
+
+The learner should see why an asynchronous replica improves disaster recovery without making an acknowledgement zero-loss.
+
+## Scaling Behavior
+
+More replicas improve survival across independent failure domains but multiply write bandwidth, storage, network, repair, and consistency work. More data requires compaction, snapshot, index, and backup capacity; a backup that cannot finish before the next backup window creates an expanding recovery gap.
+
+At high write rates, synchronous remote copies can become the latency or availability bottleneck. Partition data by ownership or use log-based replication, but preserve ordering and acknowledgement semantics for each invariant. Retention, encryption, deletion, and legal holds also affect the recoverable dataset.
+
+## Failure Modes
+
+- **Memory acknowledgement:** process or host loss drops accepted writes.
+- **Unflushed disk cache:** hardware or filesystem behavior reorders or loses writes.
+- **Replica lag:** failover promotes a copy that is missing acknowledged records.
+- **Correlated loss:** all replicas share a zone, credential, operator, or corruption bug.
+- **Replica corruption:** bad data is copied before detection.
+- **Backup illusion:** backups are incomplete, inaccessible, expired, or never restored successfully.
+- **Recovery overload:** a restore or replay cannot keep up with incoming traffic.
+
+Mitigate with explicit write concerns, WAL and checksum validation, independent failure domains, immutable or isolated backups, replication-lag alerts, and regular restore and disaster-recovery exercises.
+
+## Trade-offs
+
+Stronger durability at acknowledgement increases write latency, storage cost, bandwidth, and sometimes unavailability during a failure. Asynchronous replication improves local latency and write availability but creates a bounded or unbounded loss window. Backups protect against broader mistakes but usually do not provide instant serving capacity.
+
+Do not make cache data or derived recommendations durable unless the product requires it. For a ledger, order, or audit record, the cost of durable acknowledgement is often lower than the cost of reconstructing trust after loss.
+
+## Alternatives
+
+- **Local WAL and flush:** use when surviving process, host, or local power failures is sufficient.
+- **Synchronous replica across zones:** use when acknowledged writes must survive a zone loss.
+- **Asynchronous cross-region replication:** use when regional recovery matters and a bounded RPO is acceptable.
+- **Immutable versioned object storage:** use for large blobs, snapshots, and audit history.
+- **Periodic backups and point-in-time restore:** use as a defense against corruption, deletion, and broad operational mistakes.
+
+## When to Use
+
+Introduce durability when an API acknowledges state, a prompt says “no data loss,” or a design includes replicas, queues, logs, backups, or failover. State what failure can be survived and what the user sees if durability cannot be confirmed.
+
+## When Not to Use
+
+Do not pay for synchronous multi-region writes for ephemeral caches or recomputable views. Do not call a copy a backup if it shares the same deletion path or corruption source. Do not promise zero loss without defining the acknowledgement boundary and recovery test.
+
+## Common Misconceptions
+
+- **“Replication equals durability.”** Lag, correlated failure, and copied corruption can defeat it.
+- **“A database commit always means data is on independent storage.”** The storage and write concern determine that.
+- **“Backups solve recovery.”** They must be complete, retained, accessible, and restorable within the target.
+- **“Durability means availability.”** A durable record can be temporarily inaccessible.
+- **“Asynchronous replication is unsafe.”** It can be correct when the RPO and user contract allow a lag window.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I define durability at the acknowledgement point and against a specific failure scope. A local WAL or flush can survive a process or host crash; synchronous replication across zones can survive a zone loss; asynchronous replication and backups provide broader recovery with a possible RPO. I would state the latency and availability cost, monitor lag, isolate backups, and prove the claim with restore tests.
+
+### When to Introduce It
+
+Introduce durability when choosing a database write concern, queue acknowledgement, object-storage design, replication topology, or disaster-recovery plan.
+
+### Common Follow-Ups
+
+- What exactly has been acknowledged?
+- Which failure must the write survive?
+- How much data can be lost and over what recovery window?
+- How do you detect replica lag or corrupted backups?
+- How do you test restore and replay?
+
+### Common Candidate Mistakes
+
+- Saying “three replicas means no data loss.”
+- Ignoring the time between local acknowledgement and remote replication.
+- Treating a live replica as protection from logical deletion.
+- Failing to define RPO and the recovery source.
+- Placing all copies in one failure domain.
+
+## Summary
+
+- Durability is survival of acknowledged state through named failures.
+- The acknowledgement point determines what the system promises.
+- WAL, flushes, synchronous copies, asynchronous replicas, and backups cover different scopes.
+- Replication lag, corruption, operator mistakes, and untested restores are first-class durability risks.
+- Stronger durability costs latency, capacity, and sometimes availability; choose it per data class.
+
+## Quiz Seeds
+
+1. Why can a successful HTTP response still be followed by data loss?
+2. What failure scope does a local WAL usually address, and what does it not address?
+3. How does synchronous replication change write latency and availability?
+4. Why does asynchronous cross-region replication imply an RPO window?
+5. Why are backups useful even when live replicas exist?
+6. What should a “zero data loss” requirement specify?
+7. How can a restore test reveal a durability gap that replication metrics miss?
+8. Which data could safely remain in a recomputable cache rather than a durable store?
+
+## Related Topics
+
+- [Reliability](./reliability.mdx) — define correct operation and recovery evidence.
+- [Redundancy and Fault Tolerance](./redundancy-and-fault-tolerance.mdx) — place durable copies across failure domains.
+- [Functional and Non-Functional Requirements](../00-interview-method/requirements.mdx) — turn “no data loss” into an acknowledgement and failure contract.
+
+## References
+
+### Documentation / Articles
+
+- [Reliability and the Write-Ahead Log — PostgreSQL Documentation](https://www.postgresql.org/docs/current/wal-reliability.html) — explains committed-data durability, stable storage, full-page images, checksums, and crash recovery.
+- [Atomic Commit In SQLite](https://www.sqlite.org/atomiccommit.html) — provides a concrete explanation of journaling, atomic commit, power loss, and rollback behavior.
+- [Data Durability in Amazon S3](https://docs.aws.amazon.com/AmazonS3/latest/userguide/DataDurability.html) — documents object-storage durability claims and the distinction between durability and availability.
+- [Availability and Durability — Google Cloud Storage](https://cloud.google.com/storage/docs/availability-durability) — explains storage-class durability, redundancy, and the limits of a durability percentage.
+
+### Papers
+
+No paper is required for the write-path introduction; the cited database and storage documentation grounds the mechanisms directly.
+
+### Videos
+
+No video is included because the database and storage documentation gives more precise acknowledgement and recovery semantics.

@@ -1,0 +1,230 @@
+---
+type: lesson
+id: 03-02-load-balancing-algorithms
+slug: load-balancing-algorithms
+title: Load-Balancing Algorithms
+description: Choose a traffic-distribution policy that matches request cost, server capacity, state, and key locality.
+module: traffic-and-services
+order: 2
+difficulty: core
+estimatedMinutes: 30
+prerequisites:
+  - 03-01-reverse-proxy-and-load-balancer
+  - 01-03-latency-vs-throughput
+  - 01-04-percentiles-tail-latency
+tags:
+  - load-balancing
+  - round-robin
+  - least-connections
+  - weighted-routing
+  - hashing
+  - consistent-hashing
+objectives:
+  - Compare round robin, weighted, least-connections, least-response-time, random, and hash-based policies.
+  - Explain why equal request counts do not imply equal work or equal latency.
+  - Select an algorithm using capacity, request duration, locality, and failure assumptions rather than habit.
+  - Identify skew, stale state, and hot-key behavior that a balancing algorithm cannot solve by itself.
+relatedLessons:
+  - 03-01-reverse-proxy-and-load-balancer
+  - 03-03-l4-vs-l7
+  - 03-04-health-checks-and-failover
+  - 00-03-estimation
+---
+
+# Load-Balancing Algorithms
+
+> A balancing algorithm distributes a chosen unit of work according to an observed signal; it cannot make unequal work, unequal capacity, or hot keys disappear.
+
+## Why This Exists
+
+Suppose four identical application instances receive requests whose average cost is similar. Round robin is a sensible first policy: request 1 goes to A, request 2 to B, then C and D. The counts remain close with enough traffic.
+
+The assumption breaks quickly. One request may render a small profile while another generates a large recommendation query. Instances may have different CPU limits during a rolling deployment. A file upload can hold a connection for seconds while a cached lookup finishes in milliseconds. A policy that counts requests rather than work can report a perfectly even distribution while one node's queue and p99 latency are far worse.
+
+The improvement is to choose a signal that approximates the bottleneck: configured capacity, active work, observed latency, or a key that must stay near state. Every signal is delayed, partial, or expensive to collect, so the new policy has a trade-off rather than a universal win.
+
+## Mental Model
+
+First name the unit being assigned:
+
+- a TCP connection,
+- an HTTP request,
+- a long-lived stream,
+- a session or user key, or
+- a cache/database key.
+
+Then name the evidence available when assigning it:
+
+| Policy | Assignment signal | Useful when | Typical skew or cost |
+| --- | --- | --- | --- |
+| Round robin | Position in a rotating list | Requests are similar and instances are equal | Ignores request cost and capacity. |
+| Weighted round robin | Configured capacity weight | Heterogeneous or partially provisioned fleet | Bad weights or stale capacity cause overload. |
+| Least connections | Current open connections | Connection duration correlates with work | A cheap long-lived idle socket can look expensive; counts are stale. |
+| Least outstanding requests | Current in-flight requests | Request-level work is measurable | Requires timely counters and may chase transient minima. |
+| Least response time | Observed latency plus load | Costs differ and feedback is useful | Tail spikes and measurement lag can cause oscillation. |
+| Random / power of two choices | Random sample and a local load signal | Very large pools and low coordination overhead | A single sample can miss a hot node; power-of-two improves odds. |
+| Hash / sticky | Hash of a key | Affinity or cache locality is required | Key skew and node changes create hotspots or remapping. |
+
+“Least” is not magic. If every balancer replica sees a different view of active work, each may pick the same apparently idle server. The policy needs bounded staleness, tie-breaking, and a fallback when metrics are missing.
+
+## How It Works
+
+### Equal work: round robin
+
+With a list `[A, B, C]`, a basic round-robin picker assigns requests in order and wraps around. It has near-zero coordination and stable behavior. It is appropriate for stateless APIs with similar request cost and equal instances. It is not inherently fair under unequal request durations.
+
+### Unequal capacity: weighted rotation
+
+Assign weights proportional to measured sustainable capacity. If A can handle 800 requests/s and B can handle 400 requests/s under the same SLO, a rough weight ratio is `2:1`. A weighted policy sends about twice as many assignments to A over a sufficiently long window. Treat weights as configuration with a rollout and measurement process, not as permanent truth: a noisy neighbor, degraded dependency, or autoscaling transition changes capacity.
+
+### Active work: least connections or requests
+
+The balancer selects the eligible instance with the smallest count of open connections or outstanding requests. This adapts to long requests better than plain round robin. It still needs a clear definition of “active”: a keep-alive connection waiting for work should not be treated like an executing query if the goal is to balance CPU.
+
+### Feedback: least response time
+
+An observed-latency policy combines recent response time with active load or a configured weight. It can steer away from a slow node, but feedback has a delay. If all nodes become slow due to a shared database, choosing the least slow node does not fix the database. Use windows, floors, and hysteresis to avoid rapidly oscillating routes.
+
+### Locality: hash-based selection
+
+Hash a stable key such as a user ID or cache key and map it to a server. This preserves affinity without storing a session table in the balancer. Plain `hash(key) mod N` is easy but changing `N` remaps many keys. Consistent hashing or rendezvous hashing limits the expected remapping when nodes change, though it still cannot guarantee equal load if the key distribution is skewed. Virtual nodes or weighted points help represent capacity, and hot keys may need replication or a different access strategy.
+
+Selection and health are separate concerns. An unhealthy node must be removed from the eligible set before any algorithm chooses it; weights and latency do not make a dead process healthy.
+
+## Example
+
+Consider a checkout API with six instances. During a rolling deployment, three instances have a 1 vCPU limit and three have 2 vCPUs. Traffic contains:
+
+- 85% short cart reads,
+- 10% inventory writes that spend about 100 ms in a database transaction, and
+- 5% payment-authority calls that can hold a request for 2 seconds.
+
+Plain round robin sends one sixth of requests to each node, but the long payment calls can leave a node with a larger active queue by chance. Equal counts hide unequal work. A weighted policy can account for CPU capacity, while least-outstanding-requests reacts to long calls. The design should cap per-node concurrency and use an upstream timeout so one slow dependency cannot fill every slot.
+
+Now suppose the feed cache is partitioned by user ID. A hash-based cache client sends key `user-42` to one cache owner, preserving locality. If a node fails, plain modulo hashing may remap most users at once, producing a cold-cache storm. Consistent or rendezvous hashing reduces the changed ownership set, but a celebrity account can still be one hot key. Replicate or precompute that hot result rather than expecting the hash algorithm to make one key ordinary.
+
+If the fleet grows from 6 to 8 nodes, measure the expected remapping and cache-miss spike before the change. A route policy is part of the rollout and capacity story, not an isolated one-line configuration.
+
+## Visualization We Eventually Want
+
+Build an algorithm comparison simulator with the same request trace replayed against multiple policies. Controls should include:
+
+- instance count, per-instance capacity, and a weight slider;
+- request cost distribution (short, medium, and long work), open-connection duration, and arrival rate;
+- policy selector for round robin, weighted, least connections, least outstanding requests, latency-aware, random, and key hashing;
+- node addition/removal, health state, metric-reporting delay, and a hot-key probability;
+- sticky versus reassign-on-failure behavior; and
+- a toggle for request-level versus connection-level selection.
+
+Show per-node assignments, active work, queue depth, utilization, p50/p95/p99 latency, rejected work, and key remapping after a topology change. A preset named **“mixed checkout work”** should make round robin's count equality and workload inequality visible. A second preset named **“celebrity cache key”** should show that consistent hashing limits remapping but does not remove a hot key.
+
+## Scaling Behavior
+
+At small scale, a local counter or static list may be enough. At a large fleet:
+
+- collecting global load for every request adds coordination and stale state;
+- per-proxy views can disagree and create correlated choices;
+- weight updates need bounded rollout time and a safe default;
+- hashing ring changes and node churn can cause cache misses or connection movement;
+- multi-region routing may prioritize locality and failure domains over global fairness; and
+- algorithms should account for capacity units such as CPU, memory, database connections, or queue slots rather than only QPS.
+
+Use a simple policy until a measured workload justifies more feedback. A sophisticated algorithm cannot compensate for a wrong capacity model or a shared bottleneck.
+
+## Failure Modes
+
+- **Stale health or metrics:** A balancer continues selecting a node that has died or just became saturated.
+- **Weight drift:** Autoscaling changes capacity while the configured weights remain fixed, overloading the smaller nodes.
+- **Oscillation:** Every picker reacts to the same latency spike and shifts traffic together, creating a new spike elsewhere.
+- **Hot keys:** Hashing concentrates a popular key on one owner; key-level replication or admission control may be needed.
+- **Connection skew:** A few long-lived connections dominate least-connections counts even though they are idle.
+- **Topology churn:** Rapid add/remove events cause repeated remapping, handshake bursts, and cold caches.
+- **Algorithm blind spots:** If a database or downstream API is shared, moving requests between app nodes leaves the actual bottleneck unchanged.
+
+Use health checks, bounded telemetry, circuit breaking, concurrency limits, and staged membership changes. Keep a fallback policy for missing metrics and define whether a key may move during a failure.
+
+## Trade-offs
+
+Round robin is cheap, predictable, and easy to debug, but assumes equal work and capacity. Weighted policies encode known heterogeneity but create configuration and measurement debt. Least-load policies adapt to changing work but need timely signals and can oscillate. Hashing improves locality and affinity but trades fairness for key concentration and makes topology changes visible. More global coordination can improve decisions while increasing control-plane traffic and coupling.
+
+## Alternatives
+
+- **Client-side balancing:** Useful for low-latency internal RPC when clients already discover endpoints and can see per-request load. It duplicates policy in many clients.
+- **Queue-based work assignment:** Better for asynchronous jobs where workers can pull work and acknowledge completion; it changes latency and delivery semantics instead of routing an immediate response.
+- **Partition ownership:** For stateful shards, route by data ownership rather than generic request balancing; rebalancing and hot partitions become explicit.
+- **Anycast or DNS routing:** Useful for coarse geographic or regional selection; it is not a substitute for per-instance balancing inside a region.
+
+## When to Use
+
+Start with round robin for equal, stateless, short requests. Choose weights when capacity differs and can be measured. Choose least-outstanding or latency-aware routing when request duration varies and the signal is available. Choose hashing only when affinity or data locality is a real requirement, and pair it with a plan for hot keys and node changes.
+
+## When Not to Use
+
+Do not use sticky hashing to hide missing shared state. Do not choose least response time because a dashboard shows one slow request; verify that the signal is stable and tied to the bottleneck. Do not add global load telemetry for a small homogeneous pool when its coordination cost exceeds the improvement. Do not treat a balancing algorithm as admission control, health checking, or overload protection.
+
+## Common Misconceptions
+
+- **Round robin always balances load.** It balances assignments under its assumptions, not CPU, bytes, queue depth, or tail latency.
+- **Least connections equals least work.** Connection lifetime and executing work can differ, especially with keep-alive, streaming, and idle sockets.
+- **Consistent hashing means no key moves.** It reduces expected movement; nodes joining, leaving, weights changing, and failures still move keys.
+- **Latency-aware routing fixes a slow database.** If every instance shares the same dependency, routing only rearranges the symptom.
+- **Sticky sessions are free scalability.** They reduce flexibility during failover and can create large skew from a few users or keys.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I choose the balancing signal from the workload. Round robin is a good baseline for equal stateless requests; weights model known capacity differences; least outstanding work or latency-aware policies help when request duration varies; hashing is for required affinity or data locality. I remove unhealthy nodes first, measure skew and tail latency, and explain how hot keys, topology changes, stale metrics, and failure affect the choice.
+
+### When to Introduce It
+
+Introduce an algorithm after naming the unit being routed, the request-cost distribution, instance heterogeneity, and state/affinity needs. Use a simple policy as the baseline and justify complexity with a visible bottleneck.
+
+### Common Follow-Ups
+
+- What does one “connection” represent for this protocol?
+- How do weights change during autoscaling or a rolling deployment?
+- How do you prevent a hot key from overwhelming its hash owner?
+- What happens to keys and cache hit rate when a node is added?
+- Where do health and load measurements come from, and how stale can they be?
+
+### Common Candidate Mistakes
+
+- Saying “use least connections” without discussing request duration or idle keep-alive sockets.
+- Treating node capacity as equal during a mixed-instance or degraded deployment.
+- Choosing sticky sessions before asking whether application state can be externalized.
+- Claiming consistent hashing solves hot spots rather than remapping.
+- Ignoring measurement lag and synchronized feedback across balancer replicas.
+
+## Summary
+
+- A load-balancing policy distributes a defined unit of work using a defined signal.
+- Equal request counts are not equal work; capacity, duration, locality, and downstream limits matter.
+- Health eligibility comes before algorithm selection.
+- Hashing preserves locality at the cost of skew and topology-change behavior; hot keys need a separate plan.
+- Prefer the simplest measured policy that meets the SLO and explain its failure behavior.
+
+## Quiz Seeds
+
+1. Three equal instances receive one request each, but one request runs for 2 seconds and the others for 10 ms. Why can round robin still create uneven queues?
+2. When would weighted round robin be better than plain round robin, and how should weights be maintained during autoscaling?
+3. Why might least connections route a new request to an instance with a long-lived idle WebSocket?
+4. A latency-aware balancer moves traffic away from every node at once. What shared bottleneck could make this feedback ineffective or oscillatory?
+5. What does consistent hashing reduce when a cache node is added, and what problem does it not solve for a celebrity key?
+6. A service pool has 800, 400, and 400 requests/s of sustainable capacity. What rough weighted ratio represents those capacities?
+7. Why should a balancer remove an unhealthy endpoint before applying its normal selection algorithm?
+
+## Related Topics
+
+- [Reverse proxies and load balancers](reverse-proxy-and-load-balancer.mdx)
+- [Health checks and failover](health-checks-and-failover.mdx)
+- [Back-of-the-envelope estimation](../00-interview-method/estimation.mdx)
+
+## References
+
+### Documentation / Articles
+
+- [NGINX HTTP load balancing](https://docs.nginx.com/nginx/admin-guide/load-balancer/http-load-balancer/) — documents round robin, weighted round robin, least connections, and IP-hash behavior.
+- [HAProxy backends](https://www.haproxy.com/documentation/haproxy-configuration-tutorials/proxying-essentials/configuration-basics/backends/) — explains round-robin, least-connections, random, and hash-based selection policies and when their signals fit.
+- [Envoy load balancing](https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/upstream/load_balancing/load_balancers.html) — describes locality-aware, weighted, ring-hash, and other production policies.
+- [Amazon EC2 Application Load Balancer](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/load-balancer-target-groups.html) — shows configurable target-group algorithms and the distinction between routing and target health.

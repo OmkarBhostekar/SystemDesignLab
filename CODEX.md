@@ -1013,67 +1013,67 @@ Status: **Complete**
 ## 01 — Foundations
 
 - [x] Module structure
-- [ ] Performance vs Scalability
-- [ ] Horizontal vs Vertical Scaling
-- [ ] Latency vs Throughput
-- [ ] Percentiles / Tail Latency
-- [ ] Availability
-- [ ] Reliability
-- [ ] Durability
-- [ ] Fault Tolerance / Redundancy
-- [ ] CAP Theorem
-- [ ] Consistency Models
-- [ ] Module review / cross-links
+- [x] Performance vs Scalability
+- [x] Horizontal vs Vertical Scaling
+- [x] Latency vs Throughput
+- [x] Percentiles / Tail Latency
+- [x] Availability
+- [x] Reliability
+- [x] Durability
+- [x] Fault Tolerance / Redundancy
+- [x] CAP Theorem
+- [x] Consistency Models
+- [x] Module review / cross-links
 
-Status: **Structure complete; lesson authoring not started**
+Status: **Complete**
 
 ---
 
 ## 02 — Networking and Communication
 
 - [x] Module structure
-- [ ] Request Lifecycle
-- [ ] DNS
-- [ ] TCP vs UDP
-- [ ] HTTP/1.1
-- [ ] HTTP/2
-- [ ] HTTP/3 / QUIC overview
-- [ ] REST
-- [ ] RPC
-- [ ] gRPC
-- [ ] GraphQL
-- [ ] Polling
-- [ ] Long Polling
-- [ ] Server-Sent Events
-- [ ] WebSockets
-- [ ] API Design for Interviews
-- [ ] Cursor vs Offset Pagination
-- [ ] API Versioning
-- [ ] Idempotency Keys
-- [ ] Module review / cross-links
+- [x] Request Lifecycle
+- [x] DNS
+- [x] TCP vs UDP
+- [x] HTTP/1.1
+- [x] HTTP/2
+- [x] HTTP/3 / QUIC overview
+- [x] REST
+- [x] RPC
+- [x] gRPC
+- [x] GraphQL
+- [x] Polling
+- [x] Long Polling
+- [x] Server-Sent Events
+- [x] WebSockets
+- [x] API Design for Interviews
+- [x] Cursor vs Offset Pagination
+- [x] API Versioning
+- [x] Idempotency Keys
+- [x] Module review / cross-links
 
-Status: **Structure complete; lesson authoring not started**
+Status: **Complete**
 
 ---
 
 ## 03 — Traffic Distribution and Service Architecture
 
 - [x] Module structure
-- [ ] Reverse Proxy
-- [ ] Load Balancer
-- [ ] L4 vs L7 Load Balancing
-- [ ] Load-Balancing Algorithms
-- [ ] Health Checks
-- [ ] Failover
-- [ ] Service Discovery
-- [ ] API Gateway
-- [ ] Monolith
-- [ ] Modular Monolith
-- [ ] Microservices
-- [ ] Service Boundaries
-- [ ] Module review / cross-links
+- [x] Reverse Proxy
+- [x] Load Balancer
+- [x] L4 vs L7 Load Balancing
+- [x] Load-Balancing Algorithms
+- [x] Health Checks
+- [x] Failover
+- [x] Service Discovery
+- [x] API Gateway
+- [x] Monolith
+- [x] Modular Monolith
+- [x] Microservices
+- [x] Service Boundaries
+- [x] Module review / cross-links
 
-Status: **Structure complete; lesson authoring not started**
+Status: **Complete**
 
 ---
 
@@ -1578,7 +1578,7 @@ Update this section whenever Codex finishes a meaningful task.
 - [ ] Repository initialization
 - [x] Documentation setup
 - [x] Curriculum directory setup
-- [~] Theory authoring — Module 00 complete; Module 01 next
+- [~] Theory authoring — Modules 00–03 complete; Module 04 next
 
 ## Recently Completed
 
@@ -1587,6 +1587,7 @@ Update this section whenever Codex finishes a meaningful task.
 - Accepted the Markdown-compatible MDX and build-time content-indexing decision in ADR-001.
 - Scaffolded all 14 curriculum modules with dependency, depth, and downstream-connection guidance.
 - Completed all four Module 00 theory lessons with checked examples, future visualization specifications, quiz seeds, cross-links, interview lenses, and verified references.
+- Completed 25 theory lessons across Foundations, Networking, and Traffic/Services with verified references and integrated dependency links.
 
 ## Blockers
 
@@ -1594,9 +1595,9 @@ None known.
 
 ## Next Recommended Tasks
 
-1. Implement the smallest deterministic content-index and local-link validation command justified by the four real lessons.
-2. Author `01-foundations` in dependency order, beginning with performance/scalability and horizontal versus vertical scaling.
-3. Validate Module 01 against the established lesson template and reference-quality baseline.
+1. Implement the smallest deterministic content-index and local-link validation command justified by the 29 real lessons.
+2. Author `04-databases` in dependency order, preserving its deeper subtopic boundaries.
+3. Continue with `05-caching` and `06-messaging` after validating the database lesson structure.
 4. Continue theory authoring through the remaining modules before prioritizing interactive visualizations.
 5. Initialize the strict TypeScript Next.js theory reader only after the content schema and index have been proven by real lessons.
 

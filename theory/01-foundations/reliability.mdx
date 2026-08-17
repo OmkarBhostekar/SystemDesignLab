@@ -1,0 +1,219 @@
+---
+type: lesson
+id: 01-06-reliability
+slug: reliability
+title: Reliability
+description: Reason about correct, dependable behavior over time and separate it from uptime and data survival.
+module: foundations
+order: 6
+difficulty: core
+estimatedMinutes: 30
+prerequisites:
+  - 01-05-availability
+  - 00-02-requirements
+tags:
+  - reliability
+  - correctness
+  - failure-modes
+  - slo
+  - error-budget
+objectives:
+  - Define reliability as dependable correct behavior under stated conditions and time.
+  - Distinguish reliability from availability, durability, recoverability, and latency.
+  - Identify silent correctness failures that a simple uptime check cannot detect.
+  - Connect reliability targets to SLOs, error budgets, testing, and operational feedback.
+  - Choose mitigations that reduce both the probability and impact of failure.
+relatedLessons:
+  - 01-05-availability
+  - 01-07-durability
+---
+
+# Reliability
+
+> Reliability is the ability of a system to perform its specified function correctly under stated conditions for a specified period; being reachable is only one part of that promise.
+
+## Why This Exists
+
+A notification service can return HTTP 200 while dropping half its messages. A checkout API can be available while charging a customer twice. A database can answer queries while returning corrupted or stale state. A green process health check says that a process is running, not that the system is doing the right work.
+
+The naive approach measures only uptime and treats every successful response as success. The failure is a mismatch between the metric and the contract. Reliability begins with the behavior that must remain correct, the conditions under which it must hold, and the evidence used to detect deviations.
+
+## Mental Model
+
+| Property | Core question | Example |
+| --- | --- | --- |
+| Availability | Can an eligible request receive usable service now? | 99.9% of checkout attempts complete or return a defined retryable result. |
+| Reliability | Does the system perform the intended function correctly over time and failures? | An accepted notification is delivered once or is durably visible for retry. |
+| Durability | Does acknowledged state survive a defined failure and recovery? | A confirmed order survives a node and zone loss. |
+| Latency | How long does the operation take? | Checkout status p99 under 250 ms. |
+| Recoverability | How quickly and completely can service or data be restored? | Restore within four hours with at most five minutes of data loss. |
+
+The properties interact but are not interchangeable. A service can be highly available but unreliable because it produces wrong results, or reliable but temporarily unavailable because it refuses unsafe work during a partition. A durable record can survive while the API serving it is down.
+
+## How It Works
+
+### Specify the contract
+
+Write a reliability statement with an operation, expected result, failure scope, and observation window:
+
+~~~text
+For valid notification commands, the service either returns a durable command ID
+or rejects before acknowledgement; each accepted command is processed at least once,
+and duplicate delivery does not duplicate the user-visible side effect.
+~~~
+
+This contract exposes semantics that a generic “99.99% reliable” label hides: accepted work, duplicate behavior, durability boundary, and the recovery path.
+
+### Measure and reduce risk
+
+Use service-level indicators for successful outcomes, not just process signals. Pair availability and latency with correctness checks, duplicate rates, reconciliation, data-integrity checks, and queue age. SLOs create an error budget that makes reliability work and feature work comparable; it is a decision mechanism, not a guarantee that failures cannot occur.
+
+Reliability engineering combines prevention, detection, containment, and recovery:
+
+1. validate inputs and state transitions;
+2. make side effects idempotent and bounded;
+3. isolate failures with timeouts, bulkheads, and queues;
+4. detect bad behavior with metrics, traces, audits, and synthetic checks;
+5. rehearse rollback, failover, restore, and reconciliation;
+6. learn from incidents and update the design.
+
+## Example
+
+Consider a notification API that sends an email after a user changes a password.
+
+### Naive → failure → improvement
+
+1. **Naive:** write the notification to memory, call an email provider, and return 200 when the provider responds.
+2. **Failure:** a process crash after the provider accepts the email but before the API records success causes an ambiguous retry; a timeout can produce either a lost message or a duplicate. A green health check cannot distinguish either case.
+3. **Improvement:** persist a command and idempotency key before acknowledgement, process it through a durable queue, and make the provider call duplicate-safe or reconcile provider status. Expose command state separately from delivery completion.
+4. **New trade-off:** the API may return an accepted or pending state instead of immediate delivery; the system now needs deduplication, retention, queue monitoring, and reconciliation logic.
+
+The service may be unavailable for a short period while protecting a password-change guarantee, yet still be more reliable than an always-answering service that silently loses or duplicates notifications.
+
+## Visualization We Eventually Want
+
+Build a reliability contract simulator:
+
+- choose an operation, acknowledgement point, duplicate policy, and failure injection;
+- toggle process crash, provider timeout, lost response, corrupted result, and queue replay;
+- compare an uptime-only metric with correctness, duplicate, loss, and recovery metrics;
+- show an error-budget panel and a timeline of prevention, detection, containment, and recovery;
+- include a reconciliation run that repairs or surfaces ambiguous outcomes.
+
+The learner should see that an HTTP success metric can stay green while correctness fails, and that a fail-closed design can reduce availability while protecting reliability.
+
+## Scaling Behavior
+
+Reliability work scales with the number of components, versions, tenants, regions, and failure combinations. More replicas reduce some single-node risks but add coordination, rollout, and consistency paths. More traffic increases the cost of rare bugs and makes retries, duplicate effects, and silent data errors harder to inspect.
+
+At scale, define ownership and invariants so that a reconciliation job can detect drift. Automate safe rollback, schema compatibility, capacity checks, and failure testing. A design that is reliable for one tenant may fail when a noisy tenant exhausts shared resources.
+
+## Failure Modes
+
+- **Silent wrong answer:** a response is syntactically valid but violates a business invariant.
+- **Lost acknowledgement:** a side effect succeeds but its result is not recorded, creating an ambiguous retry.
+- **Duplicate side effect:** retry or replay repeats a charge, email, or job.
+- **Corruption:** a bad write or software bug propagates to replicas and backups.
+- **Cascading failure:** overload, retries, and timeouts spread from one dependency.
+- **Unobservable failure:** no metric or reconciliation process detects missing or incorrect work.
+- **Recovery regression:** failover restores availability but loses ordering, freshness, or data integrity.
+
+Mitigate with explicit state machines, idempotency, durable logs, validation, checksums, bounded retries, isolation, audit trails, and tested recovery procedures.
+
+## Trade-offs
+
+Stronger correctness checks, synchronous coordination, and reconciliation improve confidence but add latency, storage, operational work, and sometimes unavailability. Relaxing guarantees can improve response rate and cost while requiring conflict handling and user-visible uncertainty.
+
+Reliability is not maximized by making every operation synchronous and fail-closed. Rank invariants: a password reset, payment, or inventory decrement may need stronger protection than a recommendation or analytics event. Invest in the failures that matter to users and the business.
+
+## Alternatives
+
+- **Fail closed:** reject when an invariant cannot be proven; prefer for payments, authorization, and inventory.
+- **Fail open with audit:** continue serving with a bounded risk and reconcile later; prefer for low-risk analytics or personalization.
+- **Synchronous commit:** wait for the required durability or dependency result; use on a correctness-critical path.
+- **Asynchronous workflow:** accept durable work and complete later; use when latency and availability matter more than immediate completion.
+- **Compensation:** undo or offset a completed step when a later step fails; use when distributed atomicity is impractical and the business can model reversal.
+
+## When to Use
+
+Use reliability language whenever a prompt includes “correct,” “no duplicate,” “no lost events,” “safe,” “recover,” or “trustworthy.” Define the invariant, acknowledgement point, failure modes, and evidence before selecting a component.
+
+## When Not to Use
+
+Do not promise perfect reliability or use a single percentage without an operation and failure model. Do not add a distributed transaction when an idempotent asynchronous workflow satisfies the requirement. Do not treat a low error rate as acceptable when the rare failures cause irreversible harm.
+
+## Common Misconceptions
+
+- **“Reliable means always available.”** A system can reject unsafe work and remain reliable.
+- **“HTTP 200 proves reliability.”** It proves only that one response path completed, not that every side effect was correct.
+- **“Retries improve reliability for free.”** Retries can duplicate side effects and create overload.
+- **“Replication makes incorrect data safe.”** Replication can copy corruption unless validation and recovery exist.
+- **“Durability is reliability.”** Durable state may be preserved while the service is wrong, slow, or unavailable.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I define reliability as correct, dependable behavior over a stated period and failure model. I separate it from availability, which asks whether a usable response is possible now, and durability, which asks whether acknowledged state survives recovery. I then define invariants and acknowledgement points, make operations idempotent where needed, instrument correctness and loss, and test failover and recovery rather than relying on uptime alone.
+
+### When to Introduce It
+
+Introduce reliability when discussing critical state transitions, retries, queues, failover, data integrity, or operational SLOs. Return to it after every deep dive that adds a side effect or failure boundary.
+
+### Common Follow-Ups
+
+- What exactly counts as a successful operation?
+- What happens after a timeout with an ambiguous side effect?
+- How do you detect lost, duplicate, or corrupted work?
+- Which path may fail closed, degrade, or compensate?
+- How do you test recovery instead of only normal operation?
+
+### Common Candidate Mistakes
+
+- Calling a design reliable because it has replicas.
+- Measuring only availability and latency.
+- Ignoring duplicate and ambiguous outcomes.
+- Making every path fail open or every path fail closed.
+- Treating a backup or failover plan as reliable without restore testing.
+
+## Summary
+
+- Reliability means correct function under stated conditions and time.
+- Availability, durability, latency, and recoverability are related dimensions, not synonyms.
+- Contracts should name the operation, acknowledgement, invariant, duplicate behavior, and recovery evidence.
+- Prevention, detection, containment, and recovery all matter.
+- Reliability is a prioritized business trade-off expressed through measurable SLOs and tested failure behavior.
+
+## Quiz Seeds
+
+1. Give an example of a service that is available but unreliable.
+2. Why does a lost response after a provider timeout create an ambiguous outcome?
+3. Which invariants might justify failing closed instead of accepting work?
+4. What metrics detect duplicate or lost notifications that uptime cannot?
+5. How can replication preserve corrupted data?
+6. When is an asynchronous workflow more reliable than a synchronous call?
+7. Why does an error budget help prioritize reliability work?
+8. Distinguish availability, reliability, durability, and recoverability for a payment record.
+
+## Related Topics
+
+- [Availability](./availability.mdx) — measure usable service and dependency composition.
+- [Durability](./durability.mdx) — define what acknowledged state must survive.
+- [Functional and Non-Functional Requirements](../00-interview-method/requirements.mdx) — turn “reliable” into an invariant and target.
+
+## References
+
+### Documentation / Articles
+
+- [Reliability — NIST CSRC Glossary](https://csrc.nist.gov/glossary/term/reliability) — defines reliability as functioning under stated conditions for a specified period and provides standards-based context.
+- [Embracing Risk — Google SRE](https://sre.google/sre-book/embracing-risk/) — explains reliability engineering as managing measurable service risk with availability targets and error budgets.
+- [Service Level Objectives — Google SRE](https://sre.google/sre-book/service-level-objectives/) — connects user-relevant indicators, availability, durability, and SLO-based operational decisions.
+- [Reliability Pillar — AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/reliability-pillar/welcome.html) — provides production guidance for recovery, failure management, and reliable workload operation.
+
+### Papers
+
+No paper is required for this systems-engineering distinction; the NIST definition and SRE guidance provide the relevant reliability model.
+
+### Videos
+
+No video is included because the cited SRE material offers more concrete reliability practices than a broad overview.

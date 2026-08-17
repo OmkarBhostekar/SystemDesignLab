@@ -1,0 +1,209 @@
+---
+type: lesson
+id: 03-04-health-checks-and-failover
+slug: health-checks-and-failover
+title: Health Checks and Failover
+description: Remove unsafe instances from traffic, drain work safely, and recover without turning transient slowness into a false outage.
+module: traffic-and-services
+order: 4
+difficulty: core
+estimatedMinutes: 30
+prerequisites:
+  - 03-01-reverse-proxy-and-load-balancer
+  - 03-02-load-balancing-algorithms
+  - 01-05-availability
+  - 01-08-redundancy-and-fault-tolerance
+tags:
+  - health-checks
+  - failover
+  - readiness
+  - graceful-drain
+  - availability
+  - failure-detection
+objectives:
+  - Separate liveness, readiness, startup, active, and passive health signals.
+  - Calculate the approximate detection and recovery timing created by interval, timeout, and success/failure thresholds.
+  - Design draining and failover behavior that protects in-flight requests and prevents false positives from cascading.
+  - Explain why a healthy process can still be unable to serve a particular dependency or workload.
+relatedLessons:
+  - 03-01-reverse-proxy-and-load-balancer
+  - 03-02-load-balancing-algorithms
+  - 00-04-interview-framework
+  - 03-05-service-discovery
+---
+
+# Health Checks and Failover
+
+> A health check is a delayed, imperfect decision about whether to send new work; safe failover combines the right signal with timeouts, hysteresis, draining, and enough spare capacity.
+
+## Why This Exists
+
+If a load balancer keeps sending requests to a crashed process, clients receive errors even though other instances are available. The naive fix is to probe `/health` every second and remove an instance after one failed response. That detects a hard crash quickly, but it can also eject every instance during a brief database timeout, network flap, CPU pause, or overloaded health endpoint. A false positive creates a capacity cliff: fewer instances receive more traffic, become slower, and fail more checks.
+
+The improvement is to define what “safe to receive new work” means, measure it with an appropriate signal, require evidence over time, and drain an instance before shutdown. Failover then becomes a controlled state transition rather than an instant teleport of traffic. The trade-off is detection delay, recovery complexity, and the possibility that an overly forgiving policy sends work to a genuinely bad instance longer.
+
+## Mental Model
+
+Keep distinct signals separate:
+
+| Signal | Question | Typical consumer | Common mistake |
+| --- | --- | --- | --- |
+| Startup | Has the process initialized enough to be probed? | Orchestrator / load balancer | Killing a slow-starting process as if it were dead. |
+| Liveness | Is the process making progress, or is it wedged? | Restart controller | Including every dependency and causing restart loops. |
+| Readiness | Can this instance accept this class of new work now? | Load balancer / orchestrator | Returning success while a required dependency or warmup is unavailable. |
+| Active check | Does an independent probe succeed? | Balancer or registry | Treating one observer's path as universal truth. |
+| Passive signal | Are real requests timing out or failing? | Balancer / outlier detector | Ejecting on one client-side blip without thresholds. |
+| Capacity signal | Is there bounded queue or concurrency headroom? | Admission controller | Calling an overloaded but responsive instance “healthy.” |
+
+Health is scoped. An instance can be ready for cached catalog reads but not for writes requiring a failed primary database. Expose separate pools or readiness states when the workload truly differs; do not make one broad probe claim that every endpoint is safe.
+
+## How It Works
+
+An active checker sends a request every `I` seconds, waits up to timeout `T`, and marks an endpoint unhealthy after `U` consecutive failures. It marks it healthy after `H` consecutive successes. A rough lower-bound detection time is:
+
+```text
+detection ≈ T + (U − 1) × I
+```
+
+The exact value depends on when the failure occurs relative to the probe schedule, parallel checks, and implementation. A recovery signal similarly takes roughly `(H − 1) × I` plus any warm-up time. State transitions should include hysteresis—different failure and recovery thresholds—so a flapping instance does not oscillate in and out of the pool.
+
+The probe should test the property needed by the traffic class. A cheap process-only liveness endpoint can detect a deadlock without making a database query. A readiness endpoint can verify that configuration is loaded, queues are bounded, and a required dependency is usable. Keep probe work cheap and bounded; a health endpoint that performs an expensive fan-out can become the outage itself.
+
+On planned removal:
+
+1. Mark the instance not ready so no new requests are assigned.
+2. Stop accepting new connections where possible.
+3. Allow in-flight work to complete until a drain deadline.
+4. Close or hand off long-lived streams according to an explicit reconnect/resume contract.
+5. Terminate and observe that traffic and errors return to normal.
+
+For an unplanned death, no drain is possible. The balancer removes the endpoint after detection; clients may retry only when the operation's idempotency and deadline allow it. Failover is not a guarantee that an uncommitted write is recovered.
+
+## Example
+
+An order API runs four instances across two zones. Each instance can serve reads while the inventory database is reachable, but `POST /orders` requires a primary database connection. During a primary failover, the process remains alive and its HTTP `/health` returns 200. If that endpoint is used as readiness for all traffic, the balancer keeps assigning orders that will time out.
+
+Define two signals:
+
+- `/live` reports that the process event loop and memory are making progress; it does not call the database.
+- `/ready/orders` reports that the instance has a valid database connection, bounded queue, and completed warmup. It returns not-ready while the primary is unavailable.
+
+Use a 2-second interval, a 1-second timeout, three consecutive failures to eject, and two successes to recover. The observed ejection is on the order of 5 seconds in the worst schedule plus transport delay; state the implementation's exact semantics rather than presenting the arithmetic as a universal guarantee. During a deployment, the instance is marked not-ready first, drained for 20 seconds, and then stopped. If order creation is still in flight at the deadline, the API returns a retryable result only if the client supplied an idempotency key and the service can safely reconcile the outcome.
+
+The four-instance pool should be sized so one zone loss plus one ejected instance still leaves enough capacity. Otherwise a correct health signal merely moves traffic to an overloaded remainder.
+
+## Visualization We Eventually Want
+
+Build a health-state timeline for a pool of instances. Controls should include:
+
+- probe interval, timeout, unhealthy threshold, healthy threshold, and startup grace period;
+- liveness versus readiness probe target and dependency failure mode (process crash, DB outage, high latency, packet loss, or queue saturation);
+- planned drain toggle with drain deadline and stream lifetime;
+- number of instances, zones, spare capacity, and failover policy; and
+- client retry and idempotency settings.
+
+Animate probe attempts and state transitions (`starting → ready → suspect → unhealthy → draining → ready`) while requests continue. Show detection delay, in-flight requests, rejected/new assignments, false-positive count, capacity after a zone loss, and p95 latency. A preset **“flapping dependency”** should demonstrate why one failed probe is too aggressive; **“rolling deploy”** should show drain preserving in-flight requests.
+
+## Scaling Behavior
+
+More instances and regions create more health traffic and more observers with potentially different views. A 1-second probe interval across 10,000 endpoints is itself a control-plane workload. Use bounded fan-out, aggregation or agent-based checks, and adaptive intervals where appropriate. Keep health endpoints cheap and prioritize traffic classes.
+
+Detection speed must be balanced against false-positive risk. At larger scale, choose failure domains carefully: ejecting one instance should not trigger every proxy to eject the entire zone, and a regional failover should have enough warm capacity to absorb redirected traffic. Warmup, slow start, and connection ramping reduce a thundering herd on a recovering instance.
+
+## Failure Modes
+
+- **False positive:** A shared dependency or transient network issue makes healthy processes look bad. Thresholds, dependency-aware readiness, passive signals, and correlated-failure safeguards help.
+- **False negative:** A process returns 200 while requests fail due to a full queue, stale config, or one endpoint's dependency. Test the serving property, not just process existence.
+- **Flapping:** An instance alternates healthy/unhealthy, causing repeated connection churn and cache loss. Add hysteresis and a minimum ejection period.
+- **Slow failover:** Long intervals or thresholds keep routing to a dead endpoint. Use deadlines and a bounded detection target for the critical path.
+- **Failover overload:** Remaining instances saturate after ejection. Reserve capacity and shed or degrade non-critical work.
+- **Unsafe drain:** New connections stop but existing writes are killed without a result contract. Drain deadlines and idempotent reconciliation are needed.
+- **Probe attack or overload:** Probes consume the same constrained dependency or are forged across an untrusted boundary. Authenticate where appropriate and keep probe work small.
+
+## Trade-offs
+
+Short intervals and low thresholds reduce detection time but increase probe traffic and false positives. Long drain windows preserve work but delay deploys and keep old capacity alive. Dependency-aware readiness avoids known failures but can remove an entire fleet when a shared dependency is down. Passive checks reflect real traffic but have little information during idle periods. Active and passive signals should complement one another rather than compete for a single binary truth.
+
+## Alternatives
+
+- **Client retries with no ejection:** Simple for a small client pool, but each client repeats failure detection and can amplify load.
+- **Circuit breaking / outlier detection:** Useful for per-target error and latency patterns; it still needs a recovery policy and capacity after ejection.
+- **DNS-based failover:** Appropriate for coarse regional recovery; TTL and cache behavior make removal slower.
+- **Queue pull model:** Workers can stop pulling when overloaded, which is often safer for asynchronous work than trying to probe every worker.
+- **Human or automated traffic shifting:** Useful for releases and regional incidents, but it is slower than per-instance health and must be rehearsed.
+
+## When to Use
+
+Use liveness to restart a wedged process, readiness to decide whether new work is safe, active checks to detect silent failures, and passive signals to capture real request behavior. Choose intervals and thresholds from an explicit detection target, false-positive budget, request deadline, and spare-capacity plan.
+
+## When Not to Use
+
+Do not put every dependency in liveness. Do not mark a process ready merely because its HTTP server responds when the critical endpoint cannot work. Do not rely on health checks as a substitute for timeouts, overload limits, retries, or data correctness. Do not fail over to a pool that cannot carry the resulting load.
+
+## Common Misconceptions
+
+- **A green health check means every request succeeds.** Health is scoped, delayed, and sampled.
+- **Lower intervals always improve availability.** Faster detection can eject too many healthy nodes and reduce capacity.
+- **Failover recovers an in-flight write.** It only changes where future work goes; the write outcome still needs durable/idempotent handling.
+- **Readiness and liveness are interchangeable.** Restarting a process because a dependency is down can create a restart storm.
+- **Draining means immediate termination is safe.** Long-lived streams and writes need a deadline and client contract.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I use liveness to detect a wedged process and readiness to decide whether it should receive new work. Active checks have interval, timeout, and failure/recovery thresholds, so detection is delayed and can be noisy; passive request failures add evidence. On planned removal I mark the instance unready, drain in-flight work, and then stop it. I also reserve capacity for failover and explain what a lost write or long-lived connection does.
+
+### When to Introduce It
+
+Introduce health and failover as soon as the design has multiple instances, rolling deploys, or a stated availability target. Tie probe semantics to the request classes and quantify detection, drain, and recovery timing.
+
+### Common Follow-Ups
+
+- What exactly does the health endpoint test, and which dependency failures should it surface?
+- How do you distinguish a slow instance from a slow shared database?
+- How much capacity remains after an instance or zone failure?
+- What happens to in-flight POSTs and WebSockets during drain?
+- What prevents a flapping node from repeatedly rejoining?
+
+### Common Candidate Mistakes
+
+- Using one dependency-heavy endpoint for both liveness and readiness.
+- Removing an instance after one failed probe with no hysteresis.
+- Claiming failover is instantaneous or lossless.
+- Ignoring warmup, slow start, and overload of the failover pool.
+- Forgetting that health probes and recovery traffic consume capacity.
+
+## Summary
+
+- Health is a scoped, delayed decision about new work, not a universal truth.
+- Separate startup, liveness, readiness, active, passive, and capacity signals.
+- Interval, timeout, and thresholds define detection/recovery timing and false-positive behavior.
+- Drain planned removals; make retries and lost in-flight writes explicit.
+- Failover is only useful when surviving capacity, dependency behavior, and recovery are designed together.
+
+## Quiz Seeds
+
+1. Why should a database outage usually affect readiness before liveness for an order service?
+2. With a 2-second interval and three consecutive failures, what factors make the actual unhealthy detection time differ from a simple `3 × 2` calculation?
+3. What is the purpose of a healthy threshold greater than one after a node recovers?
+4. A zone is ejected and the remaining pool's p99 latency doubles. What capacity assumption was missing from the failover design?
+5. What steps should a planned deployment take before terminating an instance with in-flight requests?
+6. Why can an expensive health check make an outage worse?
+7. When would passive outlier detection complement, rather than replace, active readiness checks?
+
+## Related Topics
+
+- [Reverse proxies and load balancers](reverse-proxy-and-load-balancer.mdx)
+- [Load-balancing algorithms](load-balancing-algorithms.mdx)
+- [Service discovery](service-discovery.mdx)
+- [Redundancy and fault tolerance](../01-foundations/redundancy-and-fault-tolerance.mdx)
+
+## References
+
+### Documentation / Articles
+
+- [Kubernetes: Liveness, Readiness, and Startup Probes](https://kubernetes.io/docs/concepts/configuration/liveness-readiness-startup-probes/) — distinguishes probe purposes and explains how readiness controls traffic while startup protects slow initialization.
+- [Elastic Load Balancing: Health checks for Application Load Balancer target groups](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/target-group-health-checks.html) — documents interval, timeout, threshold, and target-state behavior.
+- [Envoy: Health checking](https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/upstream/health_checking) — covers active checks, outlier detection, and how endpoints leave and rejoin an upstream pool.
+- [Google SRE: Handling overload](https://sre.google/sre-book/handling-overload/) — grounds the connection between overload, admission, load shedding, and failure cascades.

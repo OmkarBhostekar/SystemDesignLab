@@ -1,0 +1,217 @@
+---
+type: lesson
+id: 03-08-service-boundaries
+slug: service-boundaries
+title: Service Boundaries and Data Ownership
+description: Choose boundaries around cohesive business capabilities, data ownership, and team responsibility while pricing every network failure edge.
+module: traffic-and-services
+order: 8
+difficulty: advanced
+estimatedMinutes: 40
+prerequisites:
+  - 03-07-monolith-to-microservices
+  - 03-05-service-discovery
+  - 03-06-api-gateway
+  - 00-02-requirements
+tags:
+  - service-boundaries
+  - data-ownership
+  - bounded-context
+  - coupling
+  - cohesion
+  - team-topology
+objectives:
+  - Identify a service boundary from business capabilities, invariants, access patterns, change cadence, and ownership rather than nouns or tables alone.
+  - Explain why each service should own its data and how cross-boundary reads, writes, and events affect consistency.
+  - Evaluate synchronous calls, asynchronous events, shared schemas, and modular boundaries using latency and failure budgets.
+  - Connect architecture boundaries to team responsibility, deployability, security, observability, and incident cost.
+relatedLessons:
+  - 03-07-monolith-to-microservices
+  - 03-06-api-gateway
+  - 03-05-service-discovery
+  - 00-02-requirements
+---
+
+# Service Boundaries and Data Ownership
+
+> A good service boundary keeps a business capability's invariants and data changes cohesive while making the remaining coupling explicit, observable, and affordable to operate.
+
+## Why This Exists
+
+“Split the marketplace into user, product, cart, order, payment, and shipping services” sounds plausible because the nouns are familiar. It is a naive boundary method. It can put one user action across six synchronous calls, require multiple services to update one table, and leave no clear owner when an order is paid but inventory is not reserved.
+
+The improvement is to start with capabilities and invariants: what decisions belong together, what data changes must be atomic, which terms mean different things in different contexts, how often code changes, who operates it, and where scale/security boundaries differ. A service owns its state and exposes commands, queries, or events rather than allowing neighbors to reach into its tables. A boundary is not successful merely because a process or repository exists; it is successful when ownership and failure behavior are understandable.
+
+The new trade-off is real network coupling. A local function call becomes a timeout, a partial result, a retry/idempotency question, a trace span, a versioned contract, and an on-call handoff. Splitting too little preserves change and scaling coupling; splitting too much creates a distributed monolith.
+
+## Mental Model
+
+Evaluate a candidate boundary across four dimensions:
+
+| Dimension | Boundary question | Signal of a healthy boundary |
+| --- | --- | --- |
+| Cohesion | Which rules and state must change together? | Invariants can be enforced locally or through a named workflow. |
+| Coupling | How often must this capability call or coordinate with others? | Few stable contracts; no shared-table writes. |
+| Ownership | Which team can make decisions and respond at 2 a.m.? | One accountable owner for code, data, SLO, and runbook. |
+| Change/scale | Does it release, scale, secure, or fail differently? | Independent evolution has user or operational value. |
+
+Data ownership means one service is the authority for a piece of state. Other services can hold projections, caches, or references, but they cannot silently mutate the owner's tables. “One database per service” is a common implementation, not the entire principle: separate schemas with enforced ownership inside a modular monolith can be a valid intermediate boundary, while multiple services sharing unrestricted tables are still coupled.
+
+Use domain language carefully. “Customer,” “account,” and “user” may refer to different concepts and lifecycle rules. A bounded context gives one model authority inside a boundary; integration contracts translate rather than leaking every internal field.
+
+## How It Works
+
+A practical boundary exercise:
+
+1. List the critical user journeys and the commands/queries/events in each.
+2. Write the invariants that must hold and the data they touch.
+3. Group behavior that changes together and separate terms whose rules differ.
+4. Map reads, writes, fan-out, latency, volume, security, retention, and failure dependencies.
+5. Assign one team as the owner of code, data, SLO, deploy, and incident response.
+6. Draw the contract: request/response schema, event semantics, versioning, idempotency, and error behavior.
+7. Estimate the cost of each network edge: latency budget, timeout, retries, concurrency, partial result, and observability.
+8. Try the boundary in a modular monolith or a narrow extraction before committing to many independent services.
+
+For writes that span boundaries, choose deliberately:
+
+- Keep the transaction local and publish an event after commit when asynchronous propagation is acceptable.
+- Use an orchestrated workflow when a coordinator must track steps, timeouts, and compensation.
+- Use a synchronous call only when the caller needs an immediate result and the failure/latency budget supports it.
+- Use a projection or read model when another service needs a query view rather than authority to write.
+
+Avoid a shared database “for convenience” unless the ownership and migration rules are explicit. A shared schema can make a prototype faster, but it hides coupling until teams deploy incompatible changes or one service bypasses another's invariants.
+
+## Example
+
+For an online marketplace, an order journey may touch:
+
+- **Order:** owns the customer's order state machine (`pending → confirmed → cancelled`) and order-line snapshot.
+- **Inventory:** owns stock and reservation leases; it decides whether a quantity is available.
+- **Payment:** owns payment attempts, idempotency keys, and processor reconciliation.
+- **Shipping:** owns fulfillment and carrier tracking after an order is confirmed.
+
+The order service can issue a `ReserveInventory` command and wait for a bounded response if the product requires synchronous confirmation. The inventory service remains the owner of stock. Payment emits a durable status event or returns a state that the order workflow records; the gateway does not edit payment or inventory tables. Shipping can subscribe to `OrderConfirmed` and lag without blocking a catalog read.
+
+Now compare two boundary proposals. Splitting “order header” and “order line” into separate services would make one invariant—an order's total and line snapshot—cross a network for little independent value. Splitting payment can be justified by processor secrets, audit, release cadence, and failure isolation, even though the order workflow now needs a timeout and reconciliation. If the team cannot operate four services, keep these modules inside a modular monolith with explicit ownership and an asynchronous notification worker.
+
+The design should say what users see if inventory reserves but payment times out: perhaps the order is `payment_pending`, a reconciliation worker retries idempotently, and a timeout notification is sent. That state machine is part of the boundary; without it, “service” is only a box on a diagram.
+
+## Visualization We Eventually Want
+
+Build a boundary workshop simulator for the marketplace example. Let the learner drag capabilities, data entities, and invariants into candidate services or modular-monolith modules. Controls should include:
+
+- team ownership, deploy cadence, traffic/read-write mix, latency SLO, security/retention requirements, and failure domains;
+- call graph mode (in-process, synchronous RPC, asynchronous event, shared table) and contract/version state;
+- one transaction spanning selected entities, duplicate events, timeout, inventory conflict, payment outage, and team unavailability;
+- data projection lag, retry policy, queue capacity, and observability coverage; and
+- a “split too far” and “shared database” warning mode.
+
+Show cohesion/coupling indicators, synchronous hop count, p99 critical-path latency, partial-failure states, data owners, deploy blast radius, on-call load, and monthly operational units. A preset **“order boundary”** should demonstrate local order invariants plus asynchronous shipping. A **“split by nouns”** preset should produce chatty calls and shared writes so the learner can repair the boundary.
+
+## Scaling Behavior
+
+Boundaries can let a hot capability scale independently, but only if its data and downstream dependencies are not a shared bottleneck. A read-heavy catalog projection may scale separately from order writes; a service whose every request synchronously calls a single user database still inherits that database's limit.
+
+As service count and teams grow, coordination cost becomes a capacity concern: schema reviews, contract compatibility, deployment windows, incident handoffs, and dependency upgrades. More boundaries can improve team autonomy until the organization lacks platform support, observability, or on-call coverage. Measure deploy lead time, change failure rate, dependency latency, incident ownership, and resource cost rather than counting services as progress.
+
+## Failure Modes
+
+- **Shared-table ownership:** Two services write the same rows with different invariants; no team can safely evolve the schema.
+- **Chatty synchronous graph:** A simple user request depends on many serial services; tail latency and failure probability multiply.
+- **Circular dependency:** Service A calls B while B calls A, making startup, deploy, and incident recovery fragile.
+- **Distributed transaction surprise:** A local transaction becomes a partial workflow with no compensation or reconciliation state.
+- **Eventual-read surprise:** A projection is stale, but callers assume it is authoritative and make incorrect decisions.
+- **Team boundary mismatch:** A service has two owners or no clear on-call; fixes wait for another team during incidents.
+- **Security/retention mismatch:** Data is copied across services without the same access, residency, deletion, or audit rules.
+- **Over-splitting:** Tiny services add network and deployment costs without independent scale, change, or failure value.
+
+Mitigate with explicit owners, contract tests, bounded calls, workflow state, idempotent commands, event versioning, projection freshness metrics, cycle checks, and a modular-monolith fallback.
+
+## Trade-offs
+
+Fine-grained boundaries can isolate releases, scale, secrets, and failures; they cost latency, consistency, infrastructure, telemetry, and human coordination. Shared data can make local transactions easy but destroys autonomy and makes schema change risky. Asynchronous events reduce synchronous coupling but introduce lag, duplicates, ordering, and debugging work. A single owner per datum improves authority but may require read projections or API calls for consumers. The right balance depends on the invariant, workload, organization, and failure budget.
+
+## Alternatives
+
+- **Modular monolith with owned schemas:** Best when boundaries are understood but independent deployment is not yet worth the cost.
+- **Coarser service-oriented boundaries:** Good for organizational or security isolation with fewer distributed edges.
+- **Shared database with strict ownership:** A transitional option if one deployable or platform constraint requires it; enforce that only the owner writes each table.
+- **Event-driven projections:** Good for read decoupling and independent scaling when bounded staleness is acceptable.
+- **Workflow/orchestrator:** Good for multi-step business processes that need explicit state, timeout, compensation, and operator visibility.
+- **BFF/read model:** Good for client composition without making domain services share each other's data or business rules.
+
+## When to Use
+
+Use a separate service boundary when a cohesive capability has a distinct invariant/data owner, independent scale/release/security need, and a team able to operate it. Use a module or coarse service when network and operational costs would dominate. Make every cross-boundary edge and consistency promise visible.
+
+## When Not to Use
+
+Do not split a transaction merely because its entities have different nouns. Do not create a service without an accountable team, SLO, deployment path, and data owner. Do not use synchronous calls for work that can be safely asynchronous, and do not use events to hide a correctness-critical invariant that has no reconciliation path.
+
+## Common Misconceptions
+
+- **One database per service is the definition of microservices.** Data ownership and autonomous evolution are the goal; storage technology is an implementation choice.
+- **Boundaries should follow tables or nouns.** Behavior, invariants, language, change, and ownership are stronger signals.
+- **Events remove coupling.** They reduce synchronous coupling but add schema, delivery, ordering, lag, and operational coupling.
+- **A shared database is always wrong.** It can be a deliberate transitional or modular design if ownership and access are enforced; unrestricted shared writes are the problem.
+- **Team topology is separate from architecture.** If no team can own the service's data, deploys, and incidents, the boundary is not operationally real.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I draw boundaries around cohesive capabilities and invariants, then assign one service/team as the owner of the data and SLO. Consumers use APIs, commands, events, or projections rather than writing shared tables. For each network edge I state latency, timeout, retry, consistency, and partial-failure behavior. If the boundary would create chatty calls or a distributed transaction with no reconciliation, I keep it in a modular monolith or use a workflow/read model instead.
+
+### When to Introduce It
+
+Introduce boundary reasoning when an interview asks for microservices, when a workflow spans multiple domains, or when independent scaling/team ownership matters. Start from critical journeys and invariants before naming service boxes.
+
+### Common Follow-Ups
+
+- Which team owns this data and enforces its invariants?
+- Is this cross-boundary call synchronous, asynchronous, or a projection—and why?
+- What does the user see when one step commits and the next times out?
+- How do schema/version changes roll out without synchronized deploys?
+- What would make you collapse two services into one module?
+
+### Common Candidate Mistakes
+
+- Partitioning by nouns or database tables without mapping invariants.
+- Drawing each service with a shared database and claiming autonomy.
+- Ignoring team ownership, on-call, observability, security, and retention.
+- Hiding a multi-step transaction behind synchronous calls with no workflow state.
+- Treating eventual projections as authoritative without freshness and reconciliation rules.
+
+## Summary
+
+- Boundaries should preserve cohesive behavior and data ownership, not merely divide nouns or repositories.
+- A network edge replaces an in-process call with latency, failure, versioning, and operational cost.
+- Use local transactions, APIs, events, projections, or workflows according to the invariant and freshness need.
+- Service/team ownership includes data, SLO, deploy, security, observability, and incident response.
+- A modular monolith is a valid answer when a split would create more coupling than it removes.
+
+## Quiz Seeds
+
+1. Why is splitting order header and order line into separate services often a poor boundary?
+2. What does “data ownership” prohibit even if services share one physical database?
+3. An inventory reservation succeeds but payment times out. Which workflow state and reconciliation behavior should be explicit?
+4. How can events reduce synchronous coupling while introducing a different kind of coupling?
+5. Which evidence would justify extracting payment rather than leaving it a module?
+6. Why does one service per noun often create a chatty request graph?
+7. What operational signals indicate that an organization has crossed from useful autonomy into too many services?
+
+## Related Topics
+
+- [From monolith to modular monolith to microservices](monolith-to-microservices.mdx)
+- [API gateways](api-gateway.mdx)
+- [Service discovery](service-discovery.mdx)
+- [Requirements clarification](../00-interview-method/requirements.mdx)
+
+## References
+
+### Documentation / Articles
+
+- [Domain analysis for microservices](https://learn.microsoft.com/en-us/azure/architecture/microservices/model/domain-analysis) — uses domain analysis and bounded contexts to find cohesive service responsibilities.
+- [Identify microservice boundaries](https://learn.microsoft.com/en-us/azure/architecture/microservices/model/microservice-boundaries) — discusses business capabilities, data ownership, coupling, and the cost of too many services.
+- [Bounded Context](https://martinfowler.com/bliki/BoundedContext.html) — gives a concise explanation of keeping a model's terms and invariants inside a boundary.
+- [Microservices](https://martinfowler.com/articles/microservices.html) — grounds independent deployment, decentralized data, and the operational trade-offs of a service architecture.

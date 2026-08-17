@@ -1,0 +1,212 @@
+---
+type: lesson
+id: 03-03-l4-vs-l7
+slug: l4-vs-l7
+title: L4 versus L7 Routing
+description: Decide whether traffic should be routed from transport metadata or parsed application requests, with explicit TLS, latency, and failure consequences.
+module: traffic-and-services
+order: 3
+difficulty: core
+estimatedMinutes: 25
+prerequisites:
+  - 03-01-reverse-proxy-and-load-balancer
+  - 02-03-tcp-vs-udp
+  - 02-04-http-evolution
+  - 02-05-rest-rpc-grpc-graphql
+tags:
+  - l4
+  - l7
+  - tcp
+  - http
+  - tls
+  - protocol-routing
+objectives:
+  - Explain what metadata an L4 proxy can see and what an L7 proxy must terminate or parse.
+  - Choose L4, L7, or a layered design for opaque streams, HTTP routing, TLS policy, and protocol compatibility.
+  - Account for connection multiplexing, long-lived streams, encryption boundaries, and proxy resource costs.
+  - Trace how a layer choice changes observability, failure handling, and retry safety.
+relatedLessons:
+  - 03-01-reverse-proxy-and-load-balancer
+  - 03-02-load-balancing-algorithms
+  - 03-06-api-gateway
+  - 00-04-interview-framework
+---
+
+# L4 versus L7 Routing
+
+> L4 routing chooses using transport-level facts such as IP, port, and connection state; L7 routing understands an application request and therefore buys policy at the cost of termination, work, and visibility.
+
+## Why This Exists
+
+Start with one listener on `:443` that forwards encrypted bytes to one pool. A transport proxy can spread connections without needing to know whether a payload is HTTP, gRPC, database traffic, or a custom protocol. It is fast and preserves end-to-end encryption.
+
+Then product requirements appear: `/api` should go to the API pool, `/events` to a streaming pool, old clients need a version header, and oversized requests should be rejected before they consume application capacity. Encrypted bytes do not expose those fields to a simple transport proxy. The improvement is an application-aware L7 hop that terminates or legitimately participates in the protocol, parses the request, and applies policy. The new costs are TLS trust at the proxy, parsing and buffering, another timeout boundary, and a bigger blast radius when configuration is wrong.
+
+Neither layer is “better.” The request's protocol, routing information, security model, and performance target determine the appropriate boundary.
+
+## Mental Model
+
+Layer numbers describe the information available to a component, not a product's marketing category:
+
+| Property | L4 (transport) | L7 (application) |
+| --- | --- | --- |
+| Common inputs | Source/destination IP and port, TCP/UDP state, connection bytes | HTTP method/path/headers, gRPC service, cookies, content type, application status |
+| Typical decision | Pick a target for a connection or opaque stream | Pick a target for a request or route based on content |
+| TLS | Can pass through encrypted TLS; cannot inspect HTTP inside | Usually terminates TLS or uses a protocol-aware secure hop |
+| Multiplexing | Sees one connection even if it carries many logical requests | Can route logical requests if it terminates the multiplexed protocol |
+| Cost | Lower parsing and per-request work | Higher CPU, memory, policy, and configuration cost |
+| Failure boundary | Connection disruption and retransmission behavior | Request timeout, parse failure, policy error, and upstream retry behavior |
+
+L4 does not mean “no observability.” It can count bytes, connections, resets, and transport latency. L7 adds request semantics but cannot see what remains encrypted beyond its termination point. A layered path is common: an L4 edge preserves a network boundary while an internal L7 proxy performs HTTP routing.
+
+## How It Works
+
+### L4 path
+
+```text
+client ──TCP/TLS bytes──> L4 listener ──opaque stream──> server
+```
+
+The L4 component selects a backend when a TCP connection or UDP flow is established. The backend handles the TLS handshake and HTTP parsing. A client connection may remain pinned to one backend even when multiple HTTP requests travel over it, depending on the protocol and proxy behavior.
+
+L4 is useful for database connections, custom binary protocols, TLS passthrough, and very large or long-lived streams. It cannot safely route `/v1` versus `/v2` without an additional protocol-aware signal.
+
+### L7 path
+
+```text
+client ──TLS/HTTP──> L7 proxy ──HTTP/gRPC──> selected service
+```
+
+The proxy accepts and usually terminates TLS, parses the request, selects a target, and opens or reuses an upstream connection. It can route `/v1/orders` separately from `/v1/catalog`, enforce request size, attach trace metadata, and return a policy response before the application runs. The upstream hop needs its own TLS and identity decision if the network is not fully trusted.
+
+HTTP/2 and HTTP/3 multiplex many streams over a connection. An L4 balancer may pin all streams to one target; an L7 proxy can potentially make a request-level decision, though it must preserve protocol semantics and flow control. A WebSocket upgrade begins as HTTP but becomes a long-lived stream, so an L7 proxy must handle upgrade and drain behavior rather than assuming ordinary short requests.
+
+## Example
+
+Consider a public media platform with three traffic classes:
+
+1. `GET /api/*` is short JSON traffic and needs user-aware authentication and rate limits.
+2. `GET /events` is server-sent events with connections lasting minutes.
+3. `upload.example.com` accepts large uploads and must keep client TLS end to end to a dedicated upload service.
+
+An L7 proxy can route API paths and apply request-level policy. It may also place event streams in a separate pool with higher connection limits and no per-request timeout that would terminate a healthy stream. For uploads, an L4/TLS-passthrough path can preserve the application’s certificate and streaming semantics; an L7 upload proxy could be valid too, but only if its buffering, size, timeout, and trust model are intentionally designed.
+
+A layered design could use a managed L4 network entry point per zone, then an internal L7 proxy for API traffic. Document which hop terminates TLS, which component authenticates the client, and which identity the application trusts. If both layers retry, one timeout can duplicate a write or amplify load; assign a single retry owner and propagate a deadline.
+
+## Visualization We Eventually Want
+
+Build a side-by-side simulator with the same traffic trace sent through L4, L7, and layered paths. Controls should include:
+
+- protocol (`TCP`, `UDP`, HTTP/1.1, HTTP/2, WebSocket, or a custom stream);
+- TLS passthrough versus termination and whether the upstream hop is encrypted;
+- path/header-based route rules, connection count, stream count per connection, and message size;
+- backend pools, health state, request timeout, stream timeout, and drain duration; and
+- an injected parse error, certificate failure, backend reset, or proxy restart.
+
+Show what each layer can observe, the chosen target per connection and per request, TLS handshakes, active streams, bytes, request errors, and connection resets. A preset with ten HTTP/2 requests over one connection should make the L4 pinning versus L7 per-request decision visible. A second preset should show why an encrypted path cannot route by URL without a trusted terminating hop.
+
+## Scaling Behavior
+
+L4 generally scales with connections, packets, bytes, and flow-table state. L7 scales with requests, streams, parsed headers, TLS handshakes, buffering, compression, and policy rules. Multiplexing reduces connection count but can create head-of-line effects at a pinned L4 target or concentrate many logical requests on one backend.
+
+At high traffic, separate pools by protocol or workload shape, reuse connections, bound buffers, and capacity-test both layers. Use multiple replicas and zones for either layer. If an L7 aggregator fans out one request to several services, its outgoing work can grow faster than client QPS and should be estimated explicitly.
+
+## Failure Modes
+
+- **TLS termination mismatch:** The proxy presents a certificate or protocol that clients reject, or the backend trusts an unverified forwarded identity.
+- **Opaque connection pinning:** One HTTP/2 or WebSocket connection carries enough streams to overload its single L4 target.
+- **L7 parser/configuration bug:** A malformed rule rejects valid requests or routes sensitive traffic to the wrong pool.
+- **Buffer exhaustion:** Large bodies or slow clients consume proxy memory and connection slots.
+- **Stream drain failure:** A restart drops long-lived connections and creates a reconnect surge.
+- **Protocol upgrade mismatch:** WebSocket, gRPC streaming, or HTTP/3 features work at one hop but fail at another.
+- **Double retries:** Multiple layers repeat a timed-out operation without knowing whether the first attempt committed.
+
+Mitigate with explicit protocol contracts, bounded buffers, per-class limits, canary configuration, end-to-end tracing, graceful drain, and one clearly owned retry/deadline policy.
+
+## Trade-offs
+
+L4 preserves opacity, end-to-end TLS, and often lower per-request overhead, but gives up path routing, application-level auth hooks, and request-specific telemetry. L7 enables richer routing, security policy, validation, and observability, but makes the proxy a trust boundary and consumes more CPU and memory. A layered architecture can combine both but adds hops, operations, and two failure surfaces.
+
+## Alternatives
+
+- **DNS or host-based routing:** Suitable for coarse endpoint or regional selection; it does not inspect each request.
+- **Client-side routing:** Useful when trusted clients understand service contracts and can select endpoints; it spreads policy and exposes topology.
+- **Service-mesh sidecars:** Useful for internal protocol policy and telemetry when the platform can absorb per-service proxy cost.
+- **Application-level router:** Appropriate when routing depends on domain state, but it couples traffic distribution to business code and may be harder to operate.
+- **Direct end-to-end TLS with a separate control plane:** Preserves confidentiality when the edge must not inspect content, at the cost of less centralized request policy.
+
+## When to Use
+
+Use L4 for opaque TCP/UDP or TLS passthrough, custom protocols, and workloads where connection-level routing is sufficient. Use L7 when routing or policy depends on HTTP/gRPC semantics, client identity, path, headers, or application status. Use both when separate edge preservation and internal request-aware routing solve distinct requirements.
+
+## When Not to Use
+
+Do not terminate TLS at L7 solely because “the load balancer should see everything” when policy does not need content visibility. Do not place a heavy L7 proxy in front of a high-bandwidth opaque stream without measuring CPU, memory, and buffering. Do not assume L4 automatically preserves application semantics for multiplexed or upgraded protocols.
+
+## Common Misconceptions
+
+- **L4 means faster in every case.** It avoids parsing, but connection pinning, TLS work at the backend, or poor distribution can dominate.
+- **L7 can route encrypted traffic without termination.** It needs a trusted protocol signal or a terminating/participating endpoint to inspect HTTP semantics.
+- **One TCP connection equals one request.** Keep-alive, HTTP/2, HTTP/3, and WebSocket make that false.
+- **L7 owns authentication.** It can authenticate or enforce edge policy, but services still need authorization for their own resources.
+- **Moving up a layer removes failure.** It moves and adds boundaries; timeouts, drains, and trust must be designed at each hop.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> L4 routes using transport facts and can preserve opaque end-to-end TLS, so it fits connection-oriented or custom protocols. L7 terminates or understands the application protocol, enabling path, header, auth, and request-level routing, but adds parsing cost and a trust boundary. I choose based on what must be inspected, whether connection pinning is acceptable, how multiplexing works, and which hop owns timeouts, retries, and TLS.
+
+### When to Introduce It
+
+Introduce the layer decision when drawing the request path or selecting a managed balancer. Ask whether routing requires application fields, whether TLS can terminate at the edge, whether connections multiplex requests, and whether long-lived streams need special draining.
+
+### Common Follow-Ups
+
+- Where is TLS terminated, and how is the upstream authenticated?
+- Can one HTTP/2 connection overload a single backend?
+- How are WebSocket or gRPC streams drained during deployment?
+- Which component can reject a request before it reaches the service?
+- How do you avoid duplicate retries across L4, L7, and the client?
+
+### Common Candidate Mistakes
+
+- Choosing L7 without acknowledging the new trust boundary or CPU cost.
+- Claiming L4 can route HTTP paths while TLS remains opaque.
+- Ignoring HTTP/2 multiplexing and long-lived connections.
+- Giving every layer its own retries and unbounded timeout.
+- Treating a load-balancer layer as a replacement for service-level authorization.
+
+## Summary
+
+- L4 sees transport state; L7 sees application requests after a trusted protocol boundary.
+- Choose the layer from routing information, TLS requirements, multiplexing, and workload shape.
+- L7 buys policy and observability but adds termination, parsing, buffering, and blast radius.
+- L4 can pin many logical requests to one backend; protocol behavior matters more than labels.
+- Explicitly assign TLS, identity, deadlines, retries, and drain responsibilities across layers.
+
+## Quiz Seeds
+
+1. What can an L4 proxy decide that does not require parsing HTTP?
+2. Why can an HTTP/2 connection create skew behind an L4 balancer?
+3. A requirement says route `/events` to a streaming pool while keeping client TLS end to end. What design choices and trust boundaries should be discussed?
+4. Which resources grow differently for L4 and L7 as traffic becomes many short requests versus a few long streams?
+5. Why is a proxy that terminates TLS not automatically authorized to make every business-level decision?
+6. Two proxy layers each retry a timed-out `POST`. What correctness and load risks follow?
+7. When is a layered L4-plus-L7 design justified over one L7 edge?
+
+## Related Topics
+
+- [Reverse proxies and load balancers](reverse-proxy-and-load-balancer.mdx)
+- [Load-balancing algorithms](load-balancing-algorithms.mdx)
+- [API gateways](api-gateway.mdx)
+- [HTTP evolution](../02-networking/http-evolution.mdx)
+
+## References
+
+### Documentation / Articles
+
+- [AWS: Choose a load balancer](https://docs.aws.amazon.com/elasticloadbalancing/latest/userguide/choose-load-balancer.html) — compares transport-oriented Network Load Balancers with application-aware Application Load Balancers.
+- [HAProxy: Proxies](https://www.haproxy.com/documentation/haproxy-configuration-tutorials/proxying-essentials/) — explains TCP and HTTP proxy modes and their different visibility.
+- [Envoy architecture: listeners and filters](https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/listeners/listeners.html) — describes how a proxy accepts connections and applies protocol-aware filters.
+- [HTTP/2 (RFC 9113)](https://www.rfc-editor.org/rfc/rfc9113.html) — grounds stream multiplexing over a single connection, which affects connection-level routing.

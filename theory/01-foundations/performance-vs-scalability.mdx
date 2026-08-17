@@ -1,0 +1,219 @@
+---
+type: lesson
+id: 01-01-performance-vs-scalability
+slug: performance-vs-scalability
+title: Performance vs. Scalability
+description: Separate making one request better from serving more work as demand grows.
+module: foundations
+order: 1
+difficulty: core
+estimatedMinutes: 25
+prerequisites:
+  - 00-02-requirements
+  - 00-03-estimation
+tags:
+  - performance
+  - scalability
+  - bottlenecks
+  - capacity
+  - qps
+objectives:
+  - Distinguish request performance from system scalability using measurable workload assumptions.
+  - Locate a bottleneck by connecting latency, utilization, and capacity to a resource.
+  - Explain why an optimization can improve one operating point without making a service scalable.
+  - Derive a first design change from a growing QPS or data requirement rather than from a technology name.
+  - Describe the cost and failure implications of improving performance or adding capacity.
+relatedLessons:
+  - 00-04-interview-framework
+  - 01-02-horizontal-vs-vertical-scaling
+---
+
+# Performance vs. Scalability
+
+> Performance is how well a system handles a given workload; scalability is how its behavior and capacity change as the workload or resources grow.
+
+## Why This Exists
+
+An API that responds in 40 ms for ten requests per second may still collapse at one thousand requests per second. Conversely, adding ten servers can increase total capacity while leaving each request just as slow. Interviews expose this distinction because a design must satisfy both the current user experience and the future workload.
+
+The naive design is one application process connected directly to one database:
+
+~~~text
+Client → application server → database
+~~~
+
+At a small load it may be perfectly adequate. When QPS rises, CPU, memory, database connections, disk I/O, or a lock becomes the limiting resource. The first improvement is not automatically a cache or a cluster: measure which resource is limiting the requested service level, then change that constraint.
+
+## Mental Model
+
+Use three questions:
+
+1. **How good is one operation?** Response time, error rate, resource work, and freshness describe performance at an operating point.
+2. **How much work can the system sustain?** Capacity is a rate at an explicit target, such as 2,000 requests per second while p95 latency remains below 200 ms.
+3. **What happens when demand or resources grow?** A scalable design increases useful capacity predictably, keeps coordination bounded, and avoids moving the bottleneck to one shared dependency.
+
+Performance is multidimensional. Reducing CPU time can lower latency; reducing network round trips can improve latency but increase payload size; raising concurrency can raise throughput until queues, locks, or memory pressure make latency worse. Scalability is therefore a relationship, not a single score:
+
+~~~text
+capacity at target SLO = sustainable work rate before the next constraint dominates
+~~~
+
+An optimization targets the cost of each operation. Scaling changes how many operations can be handled or where their work is placed. The two often reinforce each other, but neither implies the other.
+
+## How It Works
+
+Start with an explicit workload and target. For example, “the short-link redirect endpoint must serve a peak of 5,000 QPS with p95 below 100 ms and fewer than 0.1% errors.” Measure a baseline under representative data and concurrency.
+
+Then use the resource view:
+
+| Signal | Question it answers | Typical response |
+| --- | --- | --- |
+| CPU near saturation | Is computation the bottleneck? | Optimize hot code, use cheaper work, or add compute. |
+| Memory pressure or GC | Is state or allocation limiting capacity? | Reduce retained state, bound caches, or add memory. |
+| Database I/O or locks | Is a shared state owner limiting work? | Improve access paths, partition work, cache safe reads, or scale the database. |
+| Network bandwidth or round trips | Is communication the cost? | Reduce hops, batch, compress, or place data closer. |
+| Queue depth and wait time | Is arrival rate exceeding service rate? | Add workers, reduce work, shed load, or apply backpressure. |
+
+Capacity is meaningful only at a target. An instance may process 3,000 cheap health checks per second but only 300 expensive search requests per second at the same p95. Google SRE cautions that QPS alone is a poor capacity proxy when requests have different resource costs; load tests and resource measurements should establish the ratio.
+
+## Example
+
+Consider a URL shortener redirect path. A first implementation stores the mapping in a relational database and has one application server. At 100 QPS, p95 is 45 ms and CPU is 20%. A launch raises demand to 1,000 QPS; p95 climbs to 420 ms and the database connection pool is exhausted.
+
+### Naive → failure → improvement
+
+1. **Naive:** keep the one process and increase its request concurrency. The process queues more work, so memory and tail latency grow while the database still receives only the work its pool can issue.
+2. **Failure:** profile the request. The hot path spends most time on a repeated point lookup; the database is the bottleneck, not the redirect code.
+3. **Improvement:** add a bounded cache for popular immutable mappings and create application replicas behind a load balancer. The cache reduces database reads; replicas increase request-processing capacity.
+4. **New trade-off:** cached redirects can be stale after a link is changed or disabled, and replicas require health checks, deployment coordination, and stateless request handling.
+
+If a redirect lookup itself consumes 2 ms of CPU and an instance has 4 cores, a rough CPU-only ceiling is much higher than the observed 300 QPS. That mismatch is evidence that another resource—database wait, connection limit, or lock—is binding. The design should name and measure that resource instead of claiming that “horizontal scaling” solves every problem.
+
+## Visualization We Eventually Want
+
+Build a one-server-to-many-server capacity simulation:
+
+- sliders for QPS, request cost, database latency, connection-pool size, and cache hit ratio;
+- a toggle for “optimize request” versus “add replica”;
+- traces for CPU, memory, queue depth, database utilization, p50, and p95;
+- a failure button for the database or one application replica;
+- a text panel explaining which resource became the bottleneck and which trade-off the chosen improvement introduced.
+
+The default scenario should show that a faster handler improves p95 at low load, while replicas increase total capacity only until the shared database saturates.
+
+## Scaling Behavior
+
+As traffic grows, the bottleneck usually moves. A stateless application tier can scale out, but a shared database, cache, queue, or rate limiter may remain a single constraint. Data volume can also turn a fast point lookup into a slow index or storage problem.
+
+Ask whether work can be partitioned by tenant, key, or time; whether requests are independent; and whether coordination grows with the number of nodes. A design that adds capacity linearly for ten nodes but only 1.2 times capacity for one hundred nodes may still be useful, but its limit and operating range should be explicit.
+
+Scale also changes failure probability and operations. More instances mean more deployments, health signals, and partial-failure combinations. A design needs enough headroom to lose a failure domain without immediately pushing the remaining nodes into overload.
+
+## Failure Modes
+
+- **Wrong bottleneck:** adding application replicas while a database connection or lock limit is exhausted.
+- **Queue collapse:** increasing concurrency hides overload temporarily, then produces long waits, timeouts, and retries.
+- **Unbounded optimization:** a faster path consumes more memory or network and moves the bottleneck elsewhere.
+- **Hot partition:** nominally distributed work concentrates on one key or tenant.
+- **No headroom:** the system meets average demand but fails during a short peak or one-node loss.
+- **Unrepresentative benchmark:** synthetic data has a warm cache and uniform keys, unlike production.
+
+Mitigate these with workload-shaped load tests, resource-level metrics, admission limits, bounded queues, and a stated target SLO. Fail early and cheaply when the service cannot do useful work.
+
+## Trade-offs
+
+Performance work can reduce latency and infrastructure cost per operation, but it may increase code complexity, memory use, or invalidation risk. Scaling out can add capacity and fault isolation, but it adds network hops, coordination, deployment surface, and duplicated state.
+
+More replicas can improve throughput while worsening cache warmth, consistency, or database pressure. A larger machine may be simpler and faster for a small service, while a fleet can provide better failure isolation and incremental growth. The right choice depends on the workload, failure domain, and operational maturity.
+
+## Alternatives
+
+- **Optimize in place:** prefer when one component is inefficient and the workload fits one failure domain.
+- **Vertical scaling:** prefer when shared memory, low coordination, or simplicity matters and a larger host is available.
+- **Horizontal scaling:** prefer when requests can be partitioned or handled independently and the service needs capacity or failure isolation.
+- **Asynchronous work:** prefer when the user does not need every side effect before the response, but only after correctness and durability semantics are explicit.
+- **Managed service:** prefer when operating a specialized storage or compute tier costs more than the workload justifies; verify its limits and failure model.
+
+## When to Use
+
+Introduce this distinction whenever a prompt says “fast,” “large,” “millions of users,” or “must scale.” Ask for a workload, target latency percentile, error budget, peak shape, data size, and growth horizon. Use performance profiling at the current operating point and scalability experiments as demand or resources change.
+
+## When Not to Use
+
+Do not call a small, low-volume service “distributed” merely because it has multiple processes. Do not optimize before identifying a measurable user or capacity problem. Do not scale out a stateful component until its ownership, replication, or partitioning behavior is understood.
+
+## Common Misconceptions
+
+- **“Performance and scalability are synonyms.”** A system can be fast at one size but unable to handle more work.
+- **“More servers always improve performance.”** They may improve total throughput but add hops and shared-dependency load.
+- **“High CPU means add nodes.”** CPU may be a symptom of retries, serialization, or a hot key rather than the fundamental bottleneck.
+- **“A benchmark number is capacity.”** Capacity must include a workload, target SLO, data distribution, and failure assumptions.
+- **“Caching is free performance.”** It introduces freshness, memory, eviction, and stampede behavior.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> Performance describes the cost and quality of each request at a stated workload. Scalability describes how capacity and SLOs change as demand or resources grow. I would measure the bottleneck—CPU, memory, I/O, network, lock, or queue—then choose an optimization, scale-up, scale-out, or partitioning change and state its new failure and consistency trade-offs.
+
+### When to Introduce It
+
+Start with this distinction after requirements and rough estimates, before drawing replicas or caches. Revisit it whenever the interviewer changes QPS, payload size, latency, data volume, or failure assumptions.
+
+### Common Follow-Ups
+
+- Which resource is the first bottleneck at the target workload?
+- Does adding replicas increase capacity if the database is shared?
+- How do you benchmark an instance at the target p95?
+- What happens during a one-node or one-zone failure?
+- Which state must be partitioned or replicated before scaling out?
+
+### Common Candidate Mistakes
+
+- Using “scalable” without naming a workload and target.
+- Treating average QPS as the only capacity input.
+- Adding a cache before defining freshness and invalidation.
+- Assuming application replicas remove a database bottleneck.
+- Reporting a benchmark without mentioning data shape, concurrency, or headroom.
+
+## Summary
+
+- Performance is per-operation behavior; scalability is behavior as demand or resources change.
+- Capacity is always relative to a workload and a target SLO.
+- Measure the binding resource before choosing an optimization or scaling strategy.
+- Every added node, cache, or asynchronous path introduces coordination, failure, or freshness trade-offs.
+- The next question after “can it scale?” is “what is shared, and what fails first?”
+
+## Quiz Seeds
+
+1. A service has 40 ms p95 at 100 QPS but 900 ms p95 at 1,000 QPS. Is this a performance problem, a scalability problem, or both? Explain.
+2. CPU is 25%, but the database connection pool is exhausted. Why might adding application replicas fail to improve latency?
+3. Give one optimization that improves per-request performance and one change that increases total capacity.
+4. Why must a capacity claim include a target latency and error rate?
+5. A cache lowers database QPS but introduces stale redirects. Which requirement should decide whether it is acceptable?
+6. What measurements would distinguish CPU saturation from queueing behind a shared lock?
+7. Why can adding servers lower availability if the design has no headroom or overload protection?
+8. A benchmark uses a warm cache and uniform keys. Which production failure mode could it hide?
+
+## Related Topics
+
+- [Functional and Non-Functional Requirements](../00-interview-method/requirements.mdx) — turn “fast” and “large” into scoped targets.
+- [Back-of-the-Envelope Estimation](../00-interview-method/estimation.mdx) — convert usage assumptions into workload and capacity.
+- [Horizontal vs. Vertical Scaling](./horizontal-vs-vertical-scaling.mdx) — compare the main ways to add capacity.
+
+## References
+
+### Documentation / Articles
+
+- [Performance Efficiency Pillar — AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/performance-efficiency-pillar/welcome.html) — official guidance on workload-shaped architecture selection, benchmarking, and data-driven performance decisions.
+- [Production Services Best Practices — Google SRE](https://sre.google/sre-book/service-best-practices/) — explains capacity testing, overload behavior, graceful degradation, and why QPS alone is not a sufficient capacity proxy.
+- [Handling Overload — Google SRE](https://sre.google/sre-book/handling-overload/) — grounds the discussion of utilization signals, overload rejection, retry budgets, and degraded responses.
+- [The USE Method](https://www.brendangregg.com/usemethod.html) — a practical framework for checking utilization, saturation, and errors across resources when finding a bottleneck.
+
+### Papers
+
+No paper is required for this introductory distinction; the engineering references provide direct measurement and capacity guidance.
+
+### Videos
+
+No video is included because the official SRE and performance-engineering sources provide more actionable treatment than a generic overview.

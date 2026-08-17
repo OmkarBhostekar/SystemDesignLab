@@ -1,0 +1,213 @@
+---
+type: lesson
+id: 03-05-service-discovery
+slug: service-discovery
+title: Service Discovery
+description: Find changing service instances safely by combining registration, health, naming, and a boundedly stale routing view.
+module: traffic-and-services
+order: 5
+difficulty: advanced
+estimatedMinutes: 35
+prerequisites:
+  - 03-04-health-checks-and-failover
+  - 02-02-dns
+  - 01-08-redundancy-and-fault-tolerance
+tags:
+  - service-discovery
+  - service-registry
+  - client-side-discovery
+  - server-side-discovery
+  - dynamic-topology
+  - health
+objectives:
+  - Explain why static host lists and unbounded DNS caching fail for ephemeral service instances.
+  - Compare client-side discovery, server-side discovery, DNS-based discovery, and platform-native service naming.
+  - Describe registration, leases, health, endpoint metadata, watch/update propagation, and stale-cache behavior.
+  - Design a discovery failure story that avoids routing to dead instances or making the registry a synchronous single point of failure.
+relatedLessons:
+  - 03-04-health-checks-and-failover
+  - 03-01-reverse-proxy-and-load-balancer
+  - 03-06-api-gateway
+  - 00-04-interview-framework
+---
+
+# Service Discovery
+
+> Service discovery is a naming and membership problem: callers need a usable, boundedly stale view of which instances can serve a service right now.
+
+## Why This Exists
+
+An early checkout deployment may have three fixed hosts in configuration:
+
+```text
+checkout = [10.0.1.12, 10.0.1.13, 10.0.1.14]
+```
+
+That works until instances are replaced, autoscaled, moved to another zone, or assigned ephemeral addresses. A manually edited host list becomes stale, and a deploy must coordinate configuration changes with every caller. The naive alternative—publish one DNS name and cache it forever—has the opposite problem: clients continue using an endpoint after it dies, or do not see a new endpoint until a cache expires.
+
+The improvement is a service name backed by a registry or platform control plane. Instances register with identity, address, port, zone, version, and lease/health state; callers or a routing tier resolve a current set and select an endpoint. This decouples callers from instance churn, but it introduces control-plane convergence, stale reads, registration storms, security policy, and another system that must be operated. Discovery is not a promise that every endpoint is healthy at every instant.
+
+## Mental Model
+
+Separate the control plane from the request data plane:
+
+```text
+instance ──register/renew──> registry or platform control plane
+caller ──resolve/watch/cache──> endpoint view
+caller or proxy ──request──> selected instance
+```
+
+The registry answers **who claims to serve this logical name, with what metadata and health evidence?** It does not necessarily proxy requests. A client-side design gives the caller the endpoint list and selection policy. A server-side design gives the caller one stable router; the router resolves and balances on the caller's behalf.
+
+| Choice | Caller sees | Selection happens in | Main benefit | Main cost |
+| --- | --- | --- | --- | --- |
+| Static configuration | Fixed addresses | Caller | Simple, predictable | Manual updates and stale membership. |
+| DNS discovery | A name and resolved records | Caller/library or DNS-aware router | Familiar, widely supported | TTL/cache lag and limited metadata. |
+| Client-side registry | Endpoint list and metadata | Client library | Low hop count, local policy | Every client needs discovery, load, and security logic. |
+| Server-side registry | One stable endpoint | Proxy/gateway/load balancer | Centralized policy and simple clients | Extra hop and router capacity/blast radius. |
+| Platform service name | Logical name and platform semantics | Platform proxy or DNS | Integrated lifecycle and identity | Platform coupling and hidden convergence behavior. |
+
+A useful discovery record includes an endpoint, protocol, zone/region, version or canary label, capacity weight, readiness, and expiration/lease information. Keep metadata bounded and authenticated; a route should never be accepted merely because an untrusted process can publish an address.
+
+## How It Works
+
+1. A deployment starts an instance and obtains an identity or credentials.
+2. The instance registers its service name, endpoint, capabilities, zone, and version.
+3. It renews a lease or reports readiness. The registry or an independent checker removes an expired/unhealthy record.
+4. A client library, proxy, or DNS resolver obtains an endpoint view and caches it for a bounded time.
+5. The caller selects an eligible endpoint using a balancing policy and sends the request.
+6. Endpoint changes propagate through watches, polling, DNS TTLs, or platform updates; in-flight requests use their existing connection and may still fail.
+
+Leases prevent dead records from lasting forever, but lease expiry must tolerate pauses and transient partitions. If a client cannot reach the registry, it may continue using its last known set for a bounded grace period, fail closed for sensitive operations, or use a platform fallback. Treat the registry as eventually convergent rather than making every user request synchronously depend on it.
+
+Client-side discovery can update a local pool quickly and avoid a proxy hop, but every language/runtime needs a correct library. Server-side discovery centralizes policy, can enforce identity and quotas, and keeps clients simple, but router replicas need their own capacity and a stale view can affect many clients at once. DNS is often enough for coarse service naming; it should not be assumed to provide instant removal because resolvers and clients can cache records beyond the nominal TTL.
+
+## Example
+
+The checkout service runs 20 instances across four zones. Instances are replaced every few minutes by an autoscaler, and each gets a new IP. A client-side gRPC library resolves the logical name `checkout` from a registry-backed resolver, receives endpoint metadata such as zone and version, and keeps a local pool. It prefers same-zone endpoints, uses a weighted algorithm, and removes an endpoint after passive failures plus the service's readiness signal.
+
+The registry stores a 15-second lease. An instance renews every 5 seconds and marks itself not-ready before a planned drain. A client refreshes its view on a watch and has a 30-second maximum cache age. If the registry is briefly unavailable, the client continues using its last known endpoints for 20 seconds for reads; new checkout writes fail with a retryable error if no endpoint is confirmed ready. This is a deliberate consistency/availability choice, not a generic discovery rule.
+
+For external clients, place a server-side API gateway in front of the service. The gateway resolves `checkout`, applies a public auth/rate policy, and routes to the same internal pool. It should not expose registry addresses or allow an arbitrary caller to select a canary endpoint. During an instance replacement, old connections may still return errors; the client/gateway timeout and idempotency contract handles that case while discovery converges.
+
+## Visualization We Eventually Want
+
+Build a dynamic-topology simulator with three modes: static configuration, client-side registry, and server-side discovery. Controls should include:
+
+- instance start/stop rate, autoscaling churn, zones, versions, capacities, and readiness;
+- lease duration, renewal interval, health-check interval, DNS TTL, resolver cache age, and client refresh mode;
+- registry latency, registry partition, dropped watch updates, stale client cache, and forged/unauthorized registration;
+- client-side versus server-side selection and zone preference; and
+- a request rate with retry/deadline settings.
+
+Animate registration, renewals, endpoint removal, updates reaching clients, and requests routed to stale members. Show convergence time, stale-route errors, registry QPS, endpoint distribution, request latency, and capacity after a zone failure. A preset **“rolling autoscale”** should demonstrate why static lists break; **“registry partition”** should let the learner compare bounded stale reads, fail-closed writes, and an unbounded stale-cache failure.
+
+## Scaling Behavior
+
+Registry load grows with instance churn, lease renewals, health updates, and watcher fan-out—not directly with every user request if clients cache views. At large scale:
+
+- use hierarchical or regional registries, agents, watches, and batching to avoid a thundering herd;
+- bound metadata and update frequency so endpoint changes do not overwhelm clients;
+- partition failure domains so a regional registry issue does not erase every region's view;
+- use local routing and capacity weights to reduce cross-zone traffic; and
+- capacity-test resolver libraries, proxies, and connection setup during a rollout.
+
+Autoscaling can create a feedback loop: high load starts instances, instances register simultaneously, clients refresh together, and connection/health traffic spikes. Stagger registration, slow-start traffic, and reuse connections.
+
+## Failure Modes
+
+- **Stale endpoint:** A caller routes to an exited instance after a lease, watch, or DNS cache delay. Keep request timeouts, passive ejection, and bounded cache age.
+- **Registry outage:** Making discovery synchronous turns the registry into a system-wide single point of failure. Continue safely with a last-known view where the operation permits, or fail closed for correctness-sensitive writes.
+- **Registration storm:** A deploy or region recovery registers thousands of instances at once. Rate-limit renewals and updates; use backoff and batching.
+- **Split-brain membership:** Different observers accept conflicting views during a partition. Scope decisions by zone/region and define which operations may continue.
+- **Unhealthy-but-registered instance:** Registration proves process intent, not serving readiness. Combine lease, health, and readiness signals.
+- **Metadata/security drift:** A stale version, zone, or certificate label routes traffic incorrectly or permits unauthorized endpoints. Authenticate registration and validate metadata.
+- **Connection inertia:** Existing keep-alive or stream connections remain on a removed endpoint. Drain and reconnect deliberately.
+
+## Trade-offs
+
+Discovery reduces manual coordination and lets instances scale and move, but adds eventual consistency, control-plane cost, client complexity or router dependence, and a security-sensitive membership database. Long caches reduce control-plane load but increase stale-route time. Short leases detect failure quickly but increase renew traffic and make pauses more dangerous. Client-side routing reduces hops but multiplies implementation and observability; server-side routing centralizes behavior but expands blast radius.
+
+## Alternatives
+
+- **Static config / configuration service:** Good for a small stable fleet or an explicit maintenance window; not for high churn.
+- **DNS with short TTL:** Good for simple addresses and broad compatibility; cache behavior and metadata limitations remain.
+- **Platform-native Services:** Kubernetes Services, container schedulers, and managed service maps integrate lifecycle and identity; understand their TTL and failure semantics rather than assuming zero-latency updates.
+- **Service mesh control plane:** Useful when internal mTLS, routing, retries, and telemetry already require sidecars; it adds operational components and data-plane proxies.
+- **Direct endpoint publication:** Suitable for a tightly controlled batch or static infrastructure; callers own failure and rollout handling.
+
+## When to Use
+
+Use service discovery when instance identity and addresses change faster than callers can be safely configured, or when routing needs topology, version, capacity, or health metadata. Choose client-side discovery for trusted clients that can share a robust library and need local low-latency decisions. Choose server-side discovery when clients should see one stable boundary or when routing/auth policy belongs centrally.
+
+## When Not to Use
+
+Do not build a custom registry for a stable two-instance service that a platform service name already handles. Do not add dynamic discovery before identifying the churn, routing, or availability problem. Do not expose registry records to untrusted callers or assume discovery replaces request timeouts, health checks, and graceful draining.
+
+## Common Misconceptions
+
+- **Discovery returns only healthy instances.** It returns a view based on registration and checks that can be stale or scoped differently from a request's real dependency.
+- **A DNS TTL guarantees failover timing.** Resolvers, libraries, and long-lived connections can outlive the nominal TTL.
+- **The registry must be available for every request.** Caching and last-known views can decouple data-plane traffic, subject to correctness rules.
+- **Client-side discovery is free.** Every client needs compatible resolver, balancing, health, security, and observability behavior.
+- **A new instance is ready when it registers.** Startup, warmup, migrations, cache state, and dependency readiness may still prevent safe traffic.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> Dynamic instances need a logical service name and a boundedly stale membership view. Instances register and renew a lease with readiness, health, zone, and version metadata; clients or a proxy resolve and cache that view, then select an endpoint. Client-side discovery gives local control but distributes complexity; server-side discovery simplifies clients but adds a router hop and blast radius. I explain registry outage, stale endpoints, churn, security, and which operations may continue from a last-known view.
+
+### When to Introduce It
+
+Introduce discovery after showing instance churn, autoscaling, multi-zone routing, or independent deployment. Define the service identity, registration authority, lease/health signal, cache freshness bound, and behavior when the control plane is unreachable.
+
+### Common Follow-Ups
+
+- Who is allowed to register an endpoint and how is identity verified?
+- How quickly must an exited instance stop receiving traffic?
+- What does a caller do while the registry is partitioned?
+- Which endpoint metadata is required for zone, version, or capacity-aware routing?
+- How do you prevent a rollout or recovery from creating a registration storm?
+
+### Common Candidate Mistakes
+
+- Treating service discovery as a magic always-fresh list.
+- Making the registry a synchronous dependency for every data-plane request.
+- Ignoring DNS and client cache behavior when claiming fast failover.
+- Registering an instance before it is ready to serve its critical workload.
+- Omitting registration authorization, stale metadata, and observability of convergence time.
+
+## Summary
+
+- Discovery decouples logical service names from changing instance endpoints.
+- Registration, lease, readiness, health, metadata, and cache freshness are separate concerns.
+- Client-side discovery trades hops for distributed client complexity; server-side trades simple clients for a router dependency.
+- Bounded stale views can keep safe data-plane work moving during a control-plane incident; correctness-sensitive writes may need to fail closed.
+- Churn, security, convergence, and connection draining are part of discovery's design, not implementation details.
+
+## Quiz Seeds
+
+1. Why does a static host list fail when autoscaling assigns new IP addresses?
+2. What is the difference between registration, lease renewal, and readiness?
+3. During a registry partition, when is a last-known endpoint view safer than failing every read? When should writes fail closed?
+4. Compare one operational cost of client-side and server-side discovery.
+5. Why does a short DNS TTL not guarantee that a dead instance stops receiving traffic immediately?
+6. A rollout starts 1,000 instances at once. Which discovery and data-plane effects can create a registration storm?
+7. What metadata would zone-aware routing need, and what security risk follows if that metadata is untrusted?
+
+## Related Topics
+
+- [Health checks and failover](health-checks-and-failover.mdx)
+- [Reverse proxies and load balancers](reverse-proxy-and-load-balancer.mdx)
+- [API gateways](api-gateway.mdx)
+- [DNS](../02-networking/dns.mdx)
+
+## References
+
+### Documentation / Articles
+
+- [Consul service discovery](https://developer.hashicorp.com/consul/docs/discover) — explains service registration, health-aware discovery, DNS lookup, and client/server integration concepts.
+- [Kubernetes Services](https://kubernetes.io/docs/concepts/services-networking/service/) — shows how a stable Service abstraction routes to changing Pods and how endpoint membership is managed by the platform.
+- [AWS Cloud Map](https://docs.aws.amazon.com/cloud-map/latest/dg/what-is-cloud-map.html) — documents a managed service registry with health-aware discovery and namespace choices.
+- [CoreDNS Kubernetes plugin](https://coredns.io/plugins/kubernetes/) — grounds DNS-based service naming and the distinction between DNS answers and real-time endpoint state.

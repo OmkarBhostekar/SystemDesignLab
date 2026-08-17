@@ -1,0 +1,273 @@
+---
+type: lesson
+id: 02-02-dns
+slug: dns
+title: "DNS: Names, Caches, and Routing"
+description: Understand recursive resolution, authoritative data, TTLs, negative caching, and the limits of DNS-based traffic steering.
+module: networking
+order: 2
+difficulty: core
+estimatedMinutes: 32
+prerequisites:
+  - 02-01-request-lifecycle
+  - 01-03-latency-vs-throughput
+  - 01-05-availability
+tags:
+  - dns
+  - name-resolution
+  - ttl
+  - caching
+  - geo-routing
+  - failover
+objectives:
+  - Trace a recursive DNS lookup through local, recursive, root, TLD, and authoritative caches/servers.
+  - Explain A, AAAA, CNAME, NS, and TTL behavior at an architecture level without treating DNS as a database with instant writes.
+  - Predict how TTL and negative caching affect failover time, stale answers, resolver load, and rollout safety.
+  - Choose between DNS steering, an application-level router, or a service-discovery mechanism based on the required control loop.
+  - Design a DNS failure and migration plan that accounts for existing connections, resolver diversity, and health-check limits.
+relatedLessons:
+  - 02-01-request-lifecycle
+  - 02-03-tcp-vs-udp
+  - 03-04-health-checks-and-failover
+---
+
+# DNS: Names, Caches, and Routing
+
+> DNS maps stable names to changing resource records through distributed authority and caching; it is a control plane with bounded freshness, not an instant global switch.
+
+## Why This Exists
+
+The naive design puts an IP address in every client configuration. It works until an instance moves, an address changes, a region fails, or a fleet grows beyond one endpoint. Updating every client is slow and brittle, and it couples a user-facing name to infrastructure identity.
+
+DNS introduces a shared name space and lets clients ask for the current records for a name. Its distributed hierarchy and caches make ordinary lookups efficient, but they also create a crucial trade-off: an answer can remain usable in a resolver cache after the operator has changed the authoritative record. A lower TTL can shorten the intended freshness window but increases query load; it cannot revoke an already established connection and cannot force every resolver or application to behave identically.
+
+```text
+naive:       clients ──▶ hard-coded 203.0.113.10
+failure:     address change requires synchronized client updates
+improved:    clients ──▶ api.example.com ──▶ cached DNS answer ──▶ endpoint
+new cost:    TTL-driven staleness, resolver dependence, and a separate control plane
+```
+
+## Mental Model
+
+Think of DNS as a globally distributed, mostly read-through cache over a hierarchical database:
+
+```text
+application
+   │ asks local stub resolver
+   ▼
+recursive resolver (cache)
+   │ cache miss: follows referrals
+   ├── root servers: who serves .com?
+   ├── TLD servers: who serves example.com?
+   └── authoritative servers: what is api.example.com?
+            │ answer + TTL
+            └──────────────▶ recursive cache ──▶ client
+```
+
+The **authoritative server** owns a zone's source records. The **recursive resolver** does work for a client and caches positive answers, referrals, and often negative answers. The local operating system, browser, language runtime, service mesh, or connection pool may cache or reuse the result too. A client therefore experiences a chain of caches, not one globally synchronized table.
+
+The TTL is a freshness instruction in seconds for a resource record. It is not a promise that every observer will refresh at exactly that instant, nor is it a maximum lifetime for an existing TCP/TLS/QUIC connection. A name can point to several addresses; selecting among them may support basic distribution, but it is not automatically load balancing with request-level health knowledge.
+
+## How It Works
+
+### 1. A client asks a stub resolver
+
+When an application needs `api.example.com`, it generally calls an OS or runtime resolver rather than speaking to a root server itself. The stub may have a cached A/AAAA answer, search-domain rules, or a negative result. If it has no usable answer, it sends a query to a configured recursive resolver, commonly via UDP or another supported DNS transport. Transport details matter for packet size and reliability, but do not change DNS authority semantics.
+
+### 2. The recursive resolver follows the hierarchy
+
+On a cache miss, the recursive resolver starts at a root server, follows a referral to the relevant TLD (such as `.com`), then asks an authoritative server for the zone. Each response can carry records and further referrals. The resolver caches records for their TTL and returns an answer to the stub. Subsequent clients using that resolver can avoid the full walk.
+
+An authoritative server is not necessarily a single machine. A zone normally has multiple authoritative name servers, often in different failure domains. The resolver can retry another server when one is unreachable, but authoritative redundancy does not guarantee that a client will immediately use a new answer if a recursive or local cache still holds the old one.
+
+### 3. Records express different relationships
+
+- **A** maps a name to an IPv4 address; **AAAA** maps to IPv6.
+- **CNAME** aliases one name to another name; the resolver must continue resolving the target, and the target's TTL and failure behavior matter too.
+- **NS** identifies authoritative name servers for a zone or delegation.
+- **TXT**, **MX**, and other types support other protocols and policies; do not use the existence of an A record as proof that an HTTP service is healthy.
+
+The same name may return multiple A/AAAA records. Clients and resolvers may rotate or select an address, but behavior varies. If an application needs per-request load, connection draining, admission control, or precise health state, an L4/L7 load balancer or service-discovery client is a better control point.
+
+### 4. TTL controls cache lifetime, not rollout completion
+
+When authoritative data changes from `old` to `new`, resolvers that fetched the old record may use it until its TTL expires. A “lower TTL today” plan does not shorten already cached answers; it only helps future fetches honor a shorter window. A record with a 300-second TTL may make a planned migration take roughly minutes at intended caches, while a record with 86,400 seconds may leave many clients on the old endpoint for much longer. Existing keep-alive or real-time connections can continue to use the old address after DNS refresh.
+
+TTL selection is a product and operations decision:
+
+```text
+short TTL  → faster intended changes, more resolver queries and control-plane load
+long TTL   → fewer queries and stable caches, longer stale-answer window
+```
+
+Many operators use a long steady-state TTL, lower it before a planned migration, change the records, observe traffic, and raise it afterward. This is a risk-reduction pattern, not a guarantee; verify actual resolver behavior and have an application-level drain/fallback plan.
+
+### 5. Negative answers are cached too
+
+If a name does not exist (NXDOMAIN) or exists without the requested record type, a resolver can cache that negative result according to the zone's SOA/negative-caching rules. A typo or prematurely queried new name can therefore remain invisible for a bounded period even after the record is created. Test migrations with the exact name and record type, and account for negative caching when choosing names.
+
+### 6. Routing can use DNS signals, with limits
+
+An authoritative service or managed DNS provider can answer based on geography, latency estimates, weights, failover state, or health checks. This can move new clients toward a nearby or healthy region. The signal is coarse and cache-delayed: the authoritative service may not see every request, a resolver's location may differ from the user's, and an existing client connection bypasses DNS. Weighted answers are distribution hints, not a transaction or lease.
+
+## Example
+
+### Moving a global API from one region to two
+
+Suppose `api.example.com` serves a read-heavy catalog. The naive deployment hard-codes one region's load-balancer address in a mobile client. When that region loses connectivity, clients continue trying the dead address until an application update is released.
+
+An improved design delegates `api.example.com` to authoritative DNS with two regional load-balancer addresses. The answer has a 60-second TTL during migration and a health-aware policy prefers the nearest healthy region. Each region still has an L7 load balancer that checks instances and drains connections. The application can return a retryable error or use a cached catalog if both origins are unavailable.
+
+```text
+client / OS cache
+   │ api.example.com (possibly stale for intended TTL)
+   ▼
+recursive resolver
+   │ cached weighted answer
+   ▼
+regional LB ──▶ catalog service ──▶ regional cache/database
+```
+
+Now consider failover. The health policy marks region A unhealthy at time `t0`, but a recursive resolver fetched A at `t0 − 40 s` and has 20 seconds of TTL left. A client with an open HTTP/2 connection to A may continue using it even longer. The design therefore combines DNS with application retries to a safe alternate endpoint, bounded by an idempotency policy, and a connection-drain/failover test. The new trade-off is extra cross-region traffic and the possibility of stale reads during a regional transition.
+
+For a blue/green release, first ensure the new fleet is healthy behind a separate name, lower the relevant TTL ahead of time, shift a controlled weight, observe error/latency and connection counts, then increase the weight. Do not create a new name and immediately assume all clients can resolve it; negative caching and offline clients can make a new name slower to appear than expected.
+
+## Visualization We Eventually Want
+
+Create a DNS resolution and failover simulator with a visible cache at each layer: client, recursive resolver, and authoritative service.
+
+### Controls
+
+- TTL for positive records and negative-cache duration;
+- query rate, number of recursive resolvers, cache hit ratio, and resolver location;
+- number of authoritative servers and simulated packet loss/latency;
+- A/AAAA/CNAME records, multiple regions, weighted/latency/failover policy, and health state;
+- at a chosen time, change an address, add a record, remove a record, or fail a region;
+- existing connection lifetime and client retry policy.
+
+### Behavior and outputs
+
+Step through a cache hit, root/TLD/authoritative referrals, a CNAME chain, NXDOMAIN, and a TTL expiry. Show which layer supplied each answer, its remaining TTL, query count, stale-client count, and time until new connections mostly reach the healthy region. Keep a text event log so the learner sees that lowering TTL cannot retroactively invalidate a cached answer or an existing connection. Compare DNS-only steering with a load balancer that has immediate health knowledge.
+
+## Scaling Behavior
+
+- **More clients:** recursive caching amortizes authoritative work, but low TTLs and high-cardinality names increase query volume. Measure QPS per resolver and authoritative zone.
+- **More records:** delegate zones and use multiple authoritative servers; keep zone data operationally manageable. Large record sets increase response size and may trigger transport fallback or fragmentation concerns.
+- **More regions:** add health/latency/weight policies, but document the resolver-location approximation and data-consistency behavior. DNS does not coordinate a global write.
+- **More frequent deployments:** use a stable service name plus an L7/L4 routing layer or service discovery for fast control; DNS remains useful for coarse endpoint changes.
+- **More subdomains/tenants:** wildcard or delegated zones may reduce management work, but be careful with accidental routing, certificate coverage, and negative caching.
+- **More IPv6 clients:** publish and test A and AAAA behavior independently; a broken AAAA answer can cause clients to wait or fall back before trying IPv4.
+
+## Failure Modes
+
+| Failure | Why it surprises teams | Mitigation |
+| --- | --- | --- |
+| Recursive resolver unavailable | A healthy authoritative service is invisible to clients using that resolver | Use multiple resolver paths where appropriate, local cache, and monitor resolver reachability; do not assume the application can query authority directly. |
+| Authoritative server outage | Cache hits hide the outage until records expire | Multiple authoritative servers/failure domains, provider health, and expiry drills. |
+| Stale record during failover | TTL is remaining at the cache, not when the operator pressed “change” | Pre-lower TTL, use application/LB failover, drain old endpoints, and test worst-case stale windows. |
+| Negative caching | Newly created name remains NXDOMAIN | Create records before clients need them, use a stable name, and account for SOA negative TTL. |
+| CNAME chain or loop | Resolution adds latency or fails before HTTP starts | Keep aliases shallow, validate chains, and monitor resolution time. |
+| Wrong health policy | DNS returns an IP that accepts connections but cannot serve the request | Health checks should test meaningful readiness; keep per-request routing and retries at a closer layer. |
+| Oversized response or packet loss | UDP response may need another transport or suffer network issues | Keep record sets deliberate, support DNS transport fallback, and monitor truncation/errors. |
+| DNS hijack/poisoning | Clients reach an attacker or wrong service | Use authenticated DNS operations, DNSSEC where it meets the threat model, TLS/application authentication, and independent monitoring. |
+
+DNS errors also have a different retry profile from HTTP errors. A client should not blindly retry resolution in a tight loop; that amplifies an outage. Cache negative and transient outcomes according to the resolver/client policy and use bounded backoff.
+
+## Trade-offs
+
+- **Short TTL:** faster intended changes and potentially faster steering; higher query/control-plane load and less cache amortization.
+- **Long TTL:** lower resolver/authoritative load and stable behavior; longer stale-answer and failover windows.
+- **DNS load balancing:** simple, globally reachable, and useful before a connection exists; coarse, cache-delayed, and unaware of per-request load or application state.
+- **Many addresses per name:** can distribute clients; clients may select unpredictably, and one unhealthy address can still receive traffic.
+- **CNAME indirection:** enables ownership and migration; adds another lookup/cache dependency and constraints at zone apexes.
+- **DNSSEC:** authenticates DNS data against tampering; adds operational key/signature complexity and does not encrypt requests or prove an HTTP server is healthy.
+
+## Alternatives
+
+- **L4/L7 load balancer:** choose when a single endpoint needs connection/request-level health, draining, TLS termination, or precise distribution.
+- **Service discovery (client-side or mesh):** choose for rapidly changing internal instances and local health-aware selection; accept client/library or mesh operational complexity.
+- **Anycast IP:** choose for network-level proximity and DDoS absorption when the network can advertise/withdraw routes; it requires routing expertise and still needs application health behavior.
+- **Application redirect or bootstrap endpoint:** choose when the client must receive policy, version, or region information at request time; accept an extra request and a dependency on the bootstrap service.
+- **Static configuration:** choose for a small, controlled environment with rare changes; it is unsafe as the only mechanism for a dynamic, multi-region public service.
+
+## When to Use
+
+Use DNS when clients need a stable name while endpoint addresses, regions, or providers change, or when coarse geographic/weighted/failover steering is sufficient. In an interview, mention TTL, resolver caching, existing connections, authoritative redundancy, and the closer-layer health check before claiming failover behavior.
+
+## When Not to Use
+
+Do not use DNS as a per-request service registry, an authorization decision, a transaction coordinator, or an instant kill switch. Do not depend on a low TTL to mask an unhealthy application; put readiness and load-aware routing at a layer that observes the request. Avoid adding complex geo policies when a single regional load balancer and a clear disaster-recovery plan meet the requirement.
+
+## Common Misconceptions
+
+- **“DNS maps a name to one IP.”** A name can have several records, aliases, IPv4/IPv6 answers, and policy-dependent responses.
+- **“TTL means the change completes in TTL seconds.”** It bounds intended cache freshness but does not control every local cache, application, resolver behavior, or existing connection.
+- **“Authoritative DNS is queried on every request.”** Recursive and local caches are the point; most clients do not contact authority directly.
+- **“DNS health checks guarantee application availability.”** They observe the check path and may be stale or coarser than user requests.
+- **“A lower TTL creates more immediate failover.”** It only helps answers fetched after the lower TTL is observed; it may also increase resolver load.
+- **“DNS and HTTP retries are interchangeable.”** Resolution, connection, and application retries have different costs and idempotency/failure semantics.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+“DNS gives clients a stable name while the infrastructure behind it changes. A local or recursive resolver caches records, and on a miss follows root, TLD, and authoritative referrals; the answer carries a TTL. Short TTLs can make planned changes fresher but increase query load, and they do not revoke existing connections or instantly update every client. I use DNS for coarse endpoint or region steering, then rely on a load balancer or service discovery for request-level health and distribution.”
+
+### When to Introduce It
+
+Introduce DNS while drawing the first client-to-service hop, then revisit it for global routing, migrations, region failure, IPv6, or “how fast can we fail over?” questions.
+
+### Common Follow-Ups
+
+- What happens during a resolver or authoritative outage?
+- How do positive and negative TTLs affect a blue/green migration?
+- Why can a client still reach an old region after the record changes?
+- How would you route by geography while avoiding overloaded regions?
+- Where do TLS certificates, health checks, connection draining, and application retries live?
+- Why is DNS not sufficient for service discovery inside a fast-changing cluster?
+
+### Common Candidate Mistakes
+
+- Claiming “DNS failover is instant” without discussing caches and existing connections.
+- Treating DNS round-robin as a health-aware load balancer.
+- Ignoring negative caching when introducing a new hostname.
+- Listing low TTL as free, without authoritative/resolver QPS and operational cost.
+- Sending sensitive routing or authorization decisions to an unauthenticated, coarse control plane.
+
+## Summary
+
+1. DNS is a hierarchical, cached name-resolution system with authoritative data and recursive work.
+2. TTLs express intended cache freshness; they do not revoke connections or synchronize the world.
+3. Positive and negative answers are both cacheable, so migrations need preconditioning and rollback plans.
+4. DNS is useful for coarse region/endpoint steering; load balancers and service discovery provide closer, richer health and load signals.
+5. Every DNS plan should state resolver diversity, TTL, stale-window behavior, and what happens while an old endpoint remains reachable.
+
+## Quiz Seeds
+
+1. Walk a cache-miss lookup for `api.example.com` from a stub resolver to an authoritative answer.
+2. Why does lowering a record's TTL immediately before a migration not shorten all existing caches?
+3. A region is removed from DNS, but clients with existing HTTP/2 connections still send requests there. What additional mechanism is needed?
+4. How do NXDOMAIN and a missing A record affect a later record creation?
+5. When is DNS weighted routing preferable to a load balancer, and what does it fail to observe?
+6. What is the operational cost of changing a steady-state TTL from one hour to ten seconds?
+7. Why might an AAAA record make a service appear slower even when IPv4 is healthy?
+8. Design a rollback for a weighted blue/green DNS migration with a 60-second TTL and a 20-minute-lived client connection.
+
+## Related Topics
+
+- [The request lifecycle](./request-lifecycle.mdx) places DNS in the full client-to-storage path.
+- [TCP versus UDP](./tcp-vs-udp.mdx) explains the transport choices used by DNS and application protocols.
+- [Health checks and failover](../03-traffic-and-services/health-checks-and-failover.mdx) compares DNS-level steering with request-level health decisions.
+- [Availability](../01-foundations/availability.mdx) supplies the redundancy and failure-budget vocabulary used in DNS plans.
+
+## References
+
+### Documentation / Articles
+
+- [Domain Names—Concepts and Facilities (RFC 1034)](https://www.rfc-editor.org/rfc/rfc1034.html) — the original DNS architecture and hierarchy, including resolver/name-server roles and TTL intent.
+- [Domain Names—Implementation and Specification (RFC 1035)](https://www.rfc-editor.org/rfc/rfc1035.html) — message formats, resource records, queries, and implementation details behind recursive resolution.
+- [Negative Caching of DNS Queries (RFC 2308)](https://www.rfc-editor.org/rfc/rfc2308.html) — authoritative rules for caching NXDOMAIN and other negative responses, which matter during migrations.
+- [Serving Stale Data to Improve DNS Resilience (RFC 8767)](https://www.rfc-editor.org/rfc/rfc8767.html) — explains when resolvers may serve stale answers to preserve availability during authoritative failures.
+- [DNS](https://developer.mozilla.org/en-US/docs/Glossary/DNS) — MDN’s concise client-facing explanation of names, resolvers, and address lookup.
+- [DNS records](https://developers.cloudflare.com/dns/manage-dns-records/reference/dns-record-types/) — an operational reference for common record types and their intended uses; useful after the protocol model is clear.

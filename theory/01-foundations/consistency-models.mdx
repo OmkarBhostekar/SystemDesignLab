@@ -1,0 +1,225 @@
+---
+type: lesson
+id: 01-10-consistency-models
+slug: consistency-models
+title: Consistency Models
+description: Compare strong, eventual, weak, session, and causal guarantees by the reads and writes a user can observe.
+module: foundations
+order: 10
+difficulty: core
+estimatedMinutes: 40
+prerequisites:
+  - 01-09-cap
+  - 01-06-reliability
+  - 00-02-requirements
+tags:
+  - consistency
+  - linearizability
+  - eventual-consistency
+  - causal-consistency
+  - session-guarantees
+objectives:
+  - Describe linearizable or strong reads, eventual convergence, and weaker guarantees without treating them as one universal ladder.
+  - Explain read-after-write and monotonic-read session guarantees with concrete timelines.
+  - Explain causal consistency at a high level and identify what it preserves.
+  - Choose a consistency model from invariants, latency, availability, topology, and conflict-handling requirements.
+  - Identify stale reads, read regressions, lost updates, and unsafe last-write-wins behavior.
+relatedLessons:
+  - 01-09-cap
+  - 01-06-reliability
+---
+
+# Consistency Models
+
+> A consistency model is the contract that tells readers which writes they may observe, in what order, and with what freshness or causality guarantees.
+
+## Why This Exists
+
+After a write, should the next read return it immediately? If a user reads version 7, may a later read show version 6? If one user sees a post and then a comment, must everyone who sees the comment also see the post? A replicated service cannot answer these questions by saying only “the database is consistent.”
+
+The naive design routes reads to whichever replica is closest and assumes replicas behave like one database. Replication delay then creates stale reads, read-after-write surprises, and histories that move backward. The improvement is to choose a model for each data path and enforce it with routing, versions, coordination, or merge logic. The new trade-off is latency, availability, cost, or application complexity.
+
+## Mental Model
+
+Consistency is about observable histories, not simply whether bytes eventually match. The following models are useful interview vocabulary:
+
+| Model | Useful guarantee | Typical cost or gap |
+| --- | --- | --- |
+| Strong / linearizable | Each operation appears atomic in real-time order; a successful read reflects the latest completed write | Coordination, latency, and partition-time unavailability for some operations |
+| Eventual | If updates stop and repair succeeds, replicas converge; reads may be stale before then | No fixed freshness bound or immediate read-after-write guarantee |
+| Weak | Fewer ordering or freshness guarantees; convergence may not be promised by the model | Application must tolerate surprising histories |
+| Read-after-write | A session that writes a value can subsequently read that value or a newer one | Requires session routing, version tokens, or a stronger read |
+| Monotonic reads | A session never observes an older version after a newer one | Requires session affinity or version-aware routing |
+| Causal | Causally related writes are observed in causal order; concurrent writes may be observed in different orders | Metadata, dependency tracking, and possible waiting or conflict resolution |
+
+“Strong” is often used informally. When an interview says strong consistency, ask whether it means linearizability for one item, serializable transactions across items, read-your-writes, or a product-specific invariant. These are different guarantees.
+
+## How It Works
+
+### A three-replica timeline
+
+Suppose a user writes profile name = Mira to replica A while replicas B and C are behind.
+
+~~~text
+t0: A = Ana, B = Ana, C = Ana
+t1: write Mira acknowledged at A
+t2: read from B → Ana       (eventual/stale read)
+t3: replication reaches B
+t4: read from B → Mira
+~~~
+
+A strong read waits for a coordinated current value. A read-after-write session can be routed to A or carry a version token that requires a replica at least as new as the write. Monotonic reads prevent the user from seeing Mira at t4 and then Ana after being routed to a lagging replica.
+
+### Causality
+
+If a user publishes a post and then comments on it, the comment is causally dependent on the post. Causal consistency requires a reader who sees the comment to see the post first, or at least not observe the dependent event without its cause. Independent posts from two users are concurrent; the model need not impose one arbitrary global order on them.
+
+### Eventual is not immediate or harmless
+
+Eventual consistency usually means convergence after writes stop and anti-entropy or repair succeeds. It does not promise a bound on staleness, monotonic reads, conflict-free updates, or that a read after a successful write is fresh. The application must decide whether stale, conflicting, or missing data is acceptable.
+
+## Example
+
+Design a user-profile service with a write endpoint and a read-heavy profile page.
+
+### Naive → failure → improvement
+
+1. **Naive:** write to one leader, replicate asynchronously, and route every read to the nearest replica.
+2. **Failure:** a user changes the display name, refreshes immediately, and sees the old name. A later request reaches an even more lagged replica and appears to go backward.
+3. **Improvement:** route the writer's session to the leader or attach a version token for read-after-write; use monotonic session versions; allow anonymous profile reads to be eventually consistent.
+4. **New trade-off:** session routing can reduce load-balancing flexibility; version-aware reads may wait or reject on lagging replicas; strong reads cost latency and availability; profile edits still need conflict handling across regions.
+
+For a wallet balance, the invariant may require linearizable or transactionally coordinated reads and writes. For a public follower count, eventual or monotonic reads may be enough. The data's meaning determines the model.
+
+## Visualization We Eventually Want
+
+Create a three-replica consistency timeline:
+
+- controls for write location, replication delay, read routing, session affinity, and network partition;
+- toggles for strong, eventual, read-after-write, monotonic-read, and causal policies;
+- a timeline showing values, versions, causal dependencies, stale reads, and read regressions;
+- presets for profile edits, wallet balance, social likes, and post/comment causality;
+- a panel explaining which operations wait, reject, conflict, or converge and what that costs.
+
+The learner should be able to perform the same write/read sequence under each model and compare user-visible histories rather than memorizing labels.
+
+## Scaling Behavior
+
+Strong consistency across distant replicas adds coordination and often puts the slowest or partitioned link on the critical path. Session guarantees can provide useful user experience with less global coordination when requests can carry versions or maintain affinity.
+
+Eventual and causal systems can scale reads and accept local writes more freely, but replication metadata, repair, conflict resolution, and anti-entropy consume resources. More fan-out and more regions increase lag and the number of causal dependencies. A bounded staleness requirement may be stronger and more expensive than “eventual.”
+
+Consistency is often per operation: a service can use strong writes for inventory, read-after-write for a user's own order, and eventual reads for search indexing. Document the boundary so downstream consumers do not assume a stronger model than they receive.
+
+## Failure Modes
+
+- **Stale read:** a replica has not applied a completed write.
+- **Read regression:** a session moves from a fresh replica to an older one.
+- **Lost update:** concurrent writes overwrite each other without a merge or version check.
+- **Causal inversion:** a dependent event appears before the event it refers to.
+- **Unbounded staleness:** repair is delayed indefinitely while the model is described as eventual.
+- **Last-write-wins loss:** clock skew or arbitrary timestamps discard a valid concurrent update.
+- **False strong claim:** a local leader read is called globally linearizable without a failover/partition proof.
+
+Mitigate with version tokens, session affinity, read repair, quorum or leader coordination, causal metadata, conflict-free data structures where appropriate, explicit staleness bounds, and business-level reconciliation.
+
+## Trade-offs
+
+Stronger guarantees simplify application reasoning and protect invariants but add coordination latency, metadata, cost, and partition-time failures. Weaker or session-scoped guarantees improve local latency and availability but push stale-data, conflict, and ordering decisions into application code.
+
+Consistency and durability are independent: a stale value can be durably stored, and a strongly consistent read can still fail to recover data that was never durably acknowledged. Consistency and correctness are also related but not identical; a consistent implementation can faithfully enforce the wrong business rule.
+
+## Alternatives
+
+- **Single-writer primary with read replicas:** use for clear ownership and strong writes when read lag is acceptable.
+- **Quorum/linearizable store:** use for shared invariants that cannot tolerate stale reads.
+- **Session guarantees:** use when a user needs read-your-writes or monotonic history without global strong reads.
+- **Causal replication:** use for feeds, comments, collaboration, or workflows where dependency order matters.
+- **Eventual plus merge:** use for counters, sets, and user experiences that can reconcile concurrent updates.
+- **Materialized view with freshness indicator:** use when a stale read is acceptable if the UI communicates or bounds the lag.
+
+## When to Use
+
+Introduce consistency models when choosing replicas, read routing, caches, multi-region writes, search/index propagation, or a queue-driven projection. Start from the operation and invariant, then name the weakest model that satisfies the user contract.
+
+## When Not to Use
+
+Do not require strong consistency for every read by habit. Do not call eventual consistency acceptable without describing stale or conflicting states and repair. Do not select a model from a vendor label without reading the actual operation, topology, and failure semantics.
+
+## Common Misconceptions
+
+- **“Eventual means immediate after a short delay.”** It may have no specified bound unless the system adds one.
+- **“Strong consistency means ACID transactions.”** Linearizable reads/writes and multi-item serializability are different guarantees.
+- **“Read-after-write is global strong consistency.”** It can be a session guarantee for one client or entity.
+- **“A timestamp makes last-write-wins correct.”** Clock skew and concurrent business updates can lose information.
+- **“If replicas converge, every history is safe.”** Convergence does not prevent stale reads, regressions, or unsafe intermediate states.
+- **“Causal consistency orders all writes.”** It orders causally related writes, not every concurrent pair.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I choose a consistency model per operation and invariant. Linearizable reads provide a single real-time order but require coordination; eventual reads can be local and scalable but may be stale until repair; session guarantees such as read-after-write and monotonic reads protect one user's history; causal consistency preserves dependency order. I would state what a reader may observe, how lag and conflicts are handled, and the latency and partition-time cost.
+
+### When to Introduce It
+
+Introduce consistency after identifying replicas and a partition policy. Ask what must be fresh, what may lag, whether reads may regress, and whether concurrent updates can merge.
+
+### Common Follow-Ups
+
+- Does the writer have to read its own write?
+- What happens if the user changes replicas between requests?
+- What is the maximum acceptable staleness?
+- How are concurrent writes or conflicts resolved?
+- Which operation must remain usable during a partition?
+
+### Common Candidate Mistakes
+
+- Using “strong” without defining the guarantee.
+- Treating eventual as a time bound.
+- Ignoring read regression and session behavior.
+- Using last-write-wins for non-mergeable business state.
+- Forgetting that indexes, caches, and projections can have different consistency.
+
+## Summary
+
+- A consistency model defines observable ordering, freshness, and convergence guarantees.
+- Linearizability, eventual, weak, session, and causal guarantees solve different problems.
+- Read-after-write and monotonic reads are useful user-facing contracts without making every read globally strong.
+- Weaker models require explicit staleness, conflict, repair, and causality handling.
+- Choose the weakest model that preserves the business invariant, and state its failure behavior.
+
+## Quiz Seeds
+
+1. What does a linearizable read guarantee that an eventual read may not?
+2. Give a timeline that violates read-after-write consistency.
+3. What is a monotonic-read violation?
+4. Why does eventual consistency not imply a fixed staleness bound?
+5. Why should a comment not be visible before its post under causal consistency?
+6. When is last-write-wins unsafe?
+7. How can session affinity provide read-after-write behavior without globally strong reads?
+8. Why can a wallet balance require stronger consistency than a public like count?
+
+## Related Topics
+
+- [CAP Theorem](./cap.mdx) — choose partition-time behavior before choosing a model.
+- [Reliability](./reliability.mdx) — tie consistency guarantees to correctness and recovery.
+- [Functional and Non-Functional Requirements](../00-interview-method/requirements.mdx) — define freshness, ordering, and invariants.
+
+## References
+
+### Documentation / Articles
+
+- [DynamoDB Read Consistency — AWS Documentation](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/HowItWorks.ReadConsistency.html) — concrete documentation of eventually consistent, strongly consistent, and multi-region read modes and their observable guarantees.
+- [Dynamo: Amazon's Highly Available Key-value Store — Amazon Science](https://www.amazon.science/publications/dynamo-amazons-highly-available-key-value-store) — original engineering paper describing versioning, conflict resolution, and the availability/eventual-consistency trade-off.
+- [Consistency in Non-Transactional Distributed Storage Systems — Bailis et al.](https://arxiv.org/abs/1512.00168) — a taxonomy that distinguishes linearizability, eventual, session, causal, and other models without collapsing them into one ladder.
+
+### Papers
+
+- [Linearizability: A Correctness Condition for Concurrent Objects — Herlihy and Wing](https://www.cs.columbia.edu/~wing/publications/HerlihyWing90.pdf) — original formal treatment of linearizability and real-time ordering.
+- [Don't Settle for Eventual: Scalable Causal Consistency for Wide-Area Storage with COPS](https://www.cs.cmu.edu/~dga/papers/cops-sosp2011.pdf) — demonstrates causal consistency with dependency tracking for a wide-area replicated store.
+- [Highly Available Transactions: Virtues and Limitations — Bailis et al.](https://www.vldb.org/pvldb/vol7/p181-bailis.pdf) — analyzes which transactional and consistency guarantees remain possible while preserving high availability under partitions.
+
+### Videos
+
+No video is included because the formal papers and operational API documentation provide the precise guarantees needed for this lesson.

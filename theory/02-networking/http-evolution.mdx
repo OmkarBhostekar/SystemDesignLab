@@ -1,0 +1,260 @@
+---
+type: lesson
+id: 02-04-http-evolution
+slug: http-evolution
+title: HTTP/1.1, HTTP/2, and HTTP/3
+description: Follow HTTP from persistent text messages to multiplexed streams over TCP and QUIC, and connect each change to real latency and failure behavior.
+module: networking
+order: 4
+difficulty: core
+estimatedMinutes: 38
+prerequisites:
+  - 02-03-tcp-vs-udp
+  - 02-01-request-lifecycle
+  - 01-03-latency-vs-throughput
+  - 01-04-percentiles-tail-latency
+tags:
+  - http
+  - http1
+  - http2
+  - http3
+  - multiplexing
+  - quic
+objectives:
+  - Explain what HTTP semantics remain stable across HTTP/1.1, HTTP/2, and HTTP/3.
+  - Describe how persistent connections, binary framing, multiplexing, header compression, and QUIC change connection behavior.
+  - Identify HTTP/1.1, HTTP/2-over-TCP, and HTTP/3-over-QUIC bottlenecks under high RTT, packet loss, many assets, and long-lived streams.
+  - Choose a protocol version based on client support, intermediaries, latency, failure behavior, and operational cost rather than version-number fashion.
+  - Explain fallback, connection reuse, stream limits, and caching implications in an interview.
+relatedLessons:
+  - 02-01-request-lifecycle
+  - 02-03-tcp-vs-udp
+  - 02-05-rest-rpc-grpc-graphql
+  - 02-06-realtime-transports
+  - 02-07-api-design-interviews
+---
+
+# HTTP/1.1, HTTP/2, and HTTP/3
+
+> HTTP’s resource and request semantics stay familiar while its framing and transport evolve to use connections, multiplexing, and loss behavior more efficiently.
+
+## Why This Exists
+
+The naive web client opens a fresh connection for every object and sends one request at a time. A page with HTML, CSS, JavaScript, images, and API calls then pays repeated handshakes and waits behind network round trips. Opening many parallel connections reduces waiting for one page but spends more sockets and congestion-control state and can hurt other traffic.
+
+HTTP/1.1 made persistent connections and host-based reuse practical. HTTP/2 added binary framing and multiplexed streams so many requests can share a connection. HTTP/3 maps the same HTTP semantics onto QUIC, which provides encrypted streams over UDP and can avoid TCP's cross-stream head-of-line behavior. Each improvement responds to a concrete bottleneck and introduces new limits; “HTTP/3 is faster” is not a complete architecture argument.
+
+```text
+naive:     one connection + one outstanding resource at a time
+failure:   handshake/RTT and serialized assets dominate page latency
+improved:  persistent connection → framed/multiplexed streams → QUIC streams
+new cost:  stream scheduling, proxy/client support, connection limits, and fallback complexity
+```
+
+## Mental Model
+
+Separate **HTTP semantics** from **wire mapping**:
+
+- Semantics include methods, status codes, request/response fields, content, caching, conditional requests, and authentication conventions.
+- A version defines how those messages are framed and transported over a connection.
+
+| Version | Wire model | Main gain | Important remaining cost |
+| --- | --- | --- | --- |
+| HTTP/1.1 | Textual message syntax over persistent TCP; one response at a time per connection in ordinary use | Connection reuse, host routing, chunked transfer | Application-level serialization/head-of-line; many connections for concurrency |
+| HTTP/2 | Binary frames, streams, multiplexed over a TCP connection, compressed fields | Interleave many requests/responses over fewer connections | TCP loss can block bytes for all streams on that connection; flow-control/scheduling complexity |
+| HTTP/3 | HTTP semantics and frames over QUIC streams | QUIC connection setup, per-stream loss behavior, migration; encrypted transport | UDP path support, CPU/implementation/proxy operations, stream/connection limits |
+
+Multiplexing is not unlimited parallelism. A connection and each stream have flow-control windows, server concurrency limits, scheduler priorities, buffers, and application capacity. A protocol can carry more concurrent work than a backend should admit.
+
+## How It Works
+
+### HTTP/1.1: persistent text messages
+
+HTTP/1.1 defines request/response methods and fields using a textual message format and supports persistent connections. A client can send multiple sequential requests on one TCP connection; to fetch many resources concurrently, browsers commonly opened several connections within limits. HTTP/1.1 pipelining existed in the specification but was difficult to deploy safely because responses had to be consumed in order and intermediaries varied; ordinary clients generally preferred parallel connections or later HTTP versions.
+
+The `Host` field enables virtual hosting: one endpoint can serve several names. Persistent connections amortize TCP/TLS handshakes, but the server and intermediary must bound idle time, request count, buffers, and connection count. Connection reuse also makes draining and DNS changes less immediate: existing sockets can outlive an address decision.
+
+### HTTP/2: binary frames and streams
+
+HTTP/2 maps each request/response to a logical stream and breaks messages into binary frames. HEADERS and DATA frames from multiple streams can interleave on one TCP connection. Field compression (HPACK) reduces repeated headers. Connection and stream flow control prevents an aggressive sender from consuming unlimited receiver memory. A server or proxy can schedule streams, but application work still needs its own limits.
+
+HTTP/2 solves the “one response blocks every other request at the HTTP message layer” problem, not TCP's in-order byte-stream requirement. If a TCP segment containing frames for several streams is lost, TCP waits for retransmission before delivering later bytes to the HTTP/2 layer. The streams may be logically independent, but the connection's bytes are not. A client can use more than one connection to isolate failures, at the cost of extra sockets and congestion state.
+
+### HTTP/3: HTTP semantics over QUIC
+
+HTTP/3 uses the same general HTTP semantics and maps frames onto QUIC streams. QUIC combines transport negotiation with TLS, provides stream-level flow control and reliable ordered delivery, and can maintain a connection ID across some network path changes. A lost packet holding one stream's data need not block delivery on other streams, although the affected stream and shared congestion window still feel the loss.
+
+HTTP/3 is usually negotiated with ALPN (for example `h3`) or advertised through an HTTP mechanism such as `Alt-Svc`. A client can fall back to HTTP/2 or HTTP/1.1 over TCP when UDP is blocked, unavailable, or not worth using. The fallback must preserve authorization, caching, method semantics, and observability; it is not a license to quietly change correctness behavior.
+
+### Connection lifecycle and caching
+
+At a high level, a client:
+
+1. resolves the origin name and selects an address;
+2. reuses a compatible connection or negotiates a version and security context;
+3. opens a request stream (or sends a sequential HTTP/1.1 message);
+4. receives headers/body while flow control and backpressure apply;
+5. reuses or closes the connection according to protocol, origin, idle, and policy rules.
+
+HTTP version does not make an unsafe response cacheable. Cache keys, `Vary`, authorization, freshness, validators (`ETag`/`Last-Modified`), and method semantics remain application concerns. A CDN or reverse proxy may support one version at the edge and another to the origin.
+
+## Example
+
+### A mobile product page with many assets
+
+Suppose a mobile client loads an HTML shell plus 30 small API/image resources over a 100-ms RTT path. The naive HTTP/1.1 design opens one new TLS connection per asset and serializes each request. It pays repeated handshake/slow-start cost and has poor time-to-first-render.
+
+An HTTP/1.1 improvement reuses connections and permits a bounded set of parallel sockets. HTTP/2 then interleaves requests over one or a few connections, compresses repeated headers, and avoids application-level response serialization. Under a 1% packet-loss path, however, a lost TCP segment can pause all streams on that connection. HTTP/3 can let unaffected QUIC streams progress, and a connection ID may survive a mobile network change.
+
+```text
+client
+ ├─ HTTP/1.1: conn A ─ request 1 → response 1 → request 2 ...
+ ├─ HTTP/1.1 improved: conn A/B/C, bounded parallel requests
+ ├─ HTTP/2: one TCP conn, stream 1/2/3 frames interleaved
+ └─ HTTP/3: one QUIC conn, independent QUIC streams over UDP
+```
+
+The production decision is not automatically HTTP/3. Measure time to first byte, page completion, p95 under loss, handshake CPU, connection failures, and fallback rate. If an enterprise proxy blocks UDP or the workload is an internal low-RTT service, HTTP/2 may be simpler and equally effective. If mobile handoffs and long-lived multiplexed connections dominate, HTTP/3's behavior may justify it.
+
+### A service-to-service API
+
+For an internal order service, a connection pool using HTTP/2 can multiplex bounded RPCs to reduce sockets while preserving standard HTTP observability. The caller sets per-request deadlines and cancels work after a client timeout; the HTTP connection's persistence does not make the order write idempotent. A gateway can terminate HTTP/3 from browsers and use HTTP/2 or HTTP/1.1 to an origin, but it must propagate request IDs, errors, and deadlines across the translation.
+
+## Visualization We Eventually Want
+
+Create a request waterfall simulator that starts with one HTTP/1.1 connection and reveals improvements step-by-step: keep-alive, bounded parallel connections, HTTP/2 streams, then HTTP/3/QUIC streams.
+
+### Controls
+
+- number and size of assets, cache hit ratio, request dependency graph, and server concurrency;
+- RTT, packet-loss probability, bandwidth, connection setup cost, and mobile path change;
+- HTTP/1.1 connection count, HTTP/2 stream limit/window, HTTP/3 stream count/window;
+- one slow/lost response, server push disabled/enabled where supported, and protocol fallback;
+- header size/repetition and compression toggle.
+
+### Behavior and outputs
+
+Animate frames and streams, but show a textual waterfall for accessibility. Under a loss event, HTTP/1.1 shows which requests wait behind a connection; HTTP/2 shows shared TCP head-of-line; HTTP/3 shows unaffected streams progressing. Report handshake time, time to first byte, page completion, p50/p95/p99 request latency, active connections, open streams, bytes on wire, retransmissions/loss, fallback rate, and server memory/CPU. Let learners add a CDN/cache and observe that protocol improvements do not replace cache locality.
+
+## Scaling Behavior
+
+- **More small requests:** multiplexing and header compression reduce connection/metadata overhead, but stream scheduling and per-request work still scale with request count. Batch or design a resource-oriented endpoint when many tiny calls are semantically related.
+- **More long-lived streams:** bound concurrent streams, idle time, heartbeats, and per-stream memory. Do not let one tenant consume all connection windows.
+- **More clients:** reuse connections, size file descriptors and TLS/QUIC CPU, and protect against synchronized reconnects after a load balancer or region failure.
+- **More RTT:** connection reuse, 0/1-RTT handshakes where safe, caching, and multiplexing matter more; measure rather than assume.
+- **More loss:** HTTP/3 may isolate loss between streams, but congestion and the affected stream still slow. Tune deadlines and consider whether the application should drop stale work.
+- **More intermediaries:** ensure every proxy/gateway version supports the chosen protocol and preserves headers, timeouts, flow control, tracing, and security policy.
+
+## Failure Modes
+
+| Failure | HTTP/1.1 | HTTP/2 | HTTP/3 / deployment response |
+| --- | --- | --- | --- |
+| New connection handshake fails | Retry/fallback; repeated setup can amplify load | Same, with fewer connections but larger blast radius per connection | UDP may be blocked; fall back to TCP version while measuring the reason |
+| Packet loss | Delays response on affected TCP connection | TCP loss can delay all streams on the connection | QUIC can progress unrelated streams; shared congestion still reacts |
+| Slow consumer | Socket/write buffers fill; connection can tie resources | Stream and connection flow control apply | Per-stream/connection flow control applies |
+| One stream is huge | Can monopolize a connection or consume one request slot | Scheduler/flow control must prevent starvation | Stream limits and scheduler must prevent starvation |
+| Proxy does not understand version | Request fails or is downgraded | Gateway may translate/terminate | HTTP/3 negotiation/fallback must preserve semantics |
+| Connection remains after DNS change | Existing socket reaches old endpoint | Same | QUIC connection ID may survive path changes, so DNS is even less of a live connection switch |
+| Retry after timeout | Response may have arrived; mutation may have committed | Same | Same; use idempotency keys and status reconciliation |
+
+Protocol fallback can hide a regional or path-specific problem. Monitor version negotiation and errors by client, network, geography, and endpoint; otherwise “HTTP/3 adoption” can look healthy while most traffic quietly fails over to HTTP/2.
+
+## Trade-offs
+
+- HTTP/1.1 is broadly compatible and easy to inspect, but many requests can require several connections and careful client concurrency.
+- HTTP/2 improves utilization with multiplexing and compressed fields, but TCP head-of-line, flow-control tuning, and one-connection failure scope remain.
+- HTTP/3 reduces cross-stream loss coupling and supports QUIC features, but UDP deployment, CPU, observability, and fallback increase operational work.
+- Fewer connections reduce handshakes and socket overhead but increase the blast radius of a connection failure and can concentrate queueing.
+- More streams increase utilization until server, proxy, memory, or fairness limits become the bottleneck.
+- Header compression saves bytes but creates dynamic-table state and must be configured with security/privacy awareness.
+
+## Alternatives
+
+- **HTTP/1.1 with connection pooling:** prefer for compatibility, simple internal services, or environments where the request count is modest.
+- **HTTP/2 over TCP:** prefer for multiplexed APIs and browser/service traffic where UDP support is uncertain.
+- **HTTP/3 over QUIC:** prefer for mobile/high-RTT paths, connection migration, or workloads sensitive to cross-stream TCP loss, when measured benefits justify operations.
+- **WebSocket:** prefer for a bidirectional application session; it can run over HTTP/1.1 or HTTP/2/3-specific mechanisms, but it is not a replacement for ordinary cacheable HTTP resources.
+- **Batch/streaming API:** prefer when many requests share one domain operation or when the workload is continuous; define framing, flow control, replay, and partial-failure semantics explicitly.
+
+## When to Use
+
+Use ordinary HTTP semantics for public APIs, browser interactions, and request/response service calls. Start with HTTP/1.1 or HTTP/2 based on client/proxy support, then consider HTTP/3 when high RTT, mobile path changes, or multiplexed loss behavior is a measured concern. In an interview, explain the request shape, connection lifetime, and fallback rather than asserting a protocol version is universally faster.
+
+## When Not to Use
+
+Do not migrate a stable low-volume internal service to HTTP/3 solely for novelty, or use multiplexing to hide unbounded fan-out. Do not assume HTTP/2 solves all head-of-line blocking or that HTTP/3 removes congestion. Avoid long-lived HTTP streams when a queue or batch job better models durable asynchronous work.
+
+## Common Misconceptions
+
+- **“HTTP/2 changes HTTP methods and status semantics.”** Its main change is framing, streams, and connection behavior; core HTTP semantics remain shared.
+- **“HTTP/2 has no head-of-line blocking.”** It avoids HTTP message serialization but still has TCP byte-stream head-of-line blocking per connection.
+- **“HTTP/3 is HTTP over raw UDP.”** It maps HTTP over QUIC, which supplies security, streams, flow control, loss recovery, and congestion control.
+- **“One HTTP/2/3 connection is always best.”** Connection limits, failure blast radius, flow control, origin authority, and load-balancer behavior can justify more than one.
+- **“Keep-alive means no limits are needed.”** Idle sockets, streams, buffers, heartbeats, and reconnects still consume resources.
+- **“A newer version fixes a slow database.”** Protocol overhead may be a small part of request latency; measure the critical path.
+- **“Fallback is invisible.”** It changes latency, transport failure modes, and capacity; expose version and fallback telemetry.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+“HTTP/1.1 added persistent connections but often needs several connections for concurrent resources. HTTP/2 keeps HTTP semantics while using binary frames and multiplexed streams over TCP, reducing connection and header overhead, but one lost TCP segment can still delay all streams on that connection. HTTP/3 maps HTTP onto QUIC, giving encrypted per-stream transport and better loss isolation, but it needs UDP support and a careful fallback path. I choose based on RTT, loss, connection count, clients, proxies, and measured SLOs.”
+
+### When to Introduce It
+
+Introduce HTTP evolution when the prompt mentions browser/mobile performance, many small requests, long-lived streams, protocol upgrades, high RTT/loss, or gateway compatibility. Tie each version to a bottleneck, not a timeline recital.
+
+### Common Follow-Ups
+
+- What is multiplexed, and where does head-of-line blocking remain?
+- How do flow-control windows and stream limits protect a server?
+- What happens if UDP is blocked or HTTP/3 negotiation fails?
+- How would you preserve idempotency, caching, and tracing across protocol translation?
+- When would you use more than one HTTP/2/3 connection?
+- How do connection reuse and DNS changes interact during a deployment?
+
+### Common Candidate Mistakes
+
+- Saying HTTP/2 eliminates head-of-line blocking without qualifying TCP.
+- Treating HTTP/3 as an application decision independent of clients, proxies, and UDP paths.
+- Ignoring stream/window limits, idle connections, or reconnect storms.
+- Optimizing wire overhead while the real bottleneck is a dependency or database.
+- Treating protocol fallback as a silent detail rather than an observable capacity/failure path.
+
+## Summary
+
+1. HTTP semantics are largely stable; versions mainly improve framing, multiplexing, and transport behavior.
+2. HTTP/1.1 uses persistent text messages and bounded parallel connections.
+3. HTTP/2 multiplexes binary-framed streams over TCP but inherits TCP connection-level head-of-line blocking.
+4. HTTP/3 uses QUIC streams over UDP for encryption, migration, and more independent loss behavior; it still needs congestion and flow-control limits.
+5. Choose and measure a version with client support, fallbacks, connection limits, and application deadlines in view.
+
+## Quiz Seeds
+
+1. What problem did persistent HTTP/1.1 connections solve, and what new resource cost did they create?
+2. Why can one lost TCP segment delay unrelated HTTP/2 streams?
+3. Which HTTP semantics must remain stable when an edge falls back from HTTP/3 to HTTP/2?
+4. How do stream and connection flow control prevent a large response from exhausting memory?
+5. Why might one HTTP/2 connection be efficient yet have too large a failure blast radius?
+6. What measurements would decide whether HTTP/3 is worthwhile for a mobile API?
+7. How do DNS changes interact with existing persistent HTTP/2 or QUIC connections?
+8. Why does HTTP/3 not automatically fix a backend database bottleneck?
+
+## Related Topics
+
+- [TCP, UDP, and QUIC](./tcp-vs-udp.mdx) defines the transport guarantees underneath each HTTP generation.
+- [The request lifecycle](./request-lifecycle.mdx) places connection setup, intermediaries, and application work in one latency budget.
+- [REST, RPC, gRPC, and GraphQL](./rest-rpc-grpc-graphql.mdx) separates HTTP transport from API interaction style.
+- [Real-time transports](./realtime-transports.mdx) applies long-lived HTTP streams and upgrades to push workloads.
+- [API design for interviews](./api-design-interviews.mdx) covers methods, errors, pagination, compatibility, and idempotency that versions preserve.
+
+## References
+
+### Documentation / Articles
+
+- [HTTP Semantics (RFC 9110)](https://www.rfc-editor.org/rfc/rfc9110.html) — shared HTTP methods, status codes, fields, caching, and message semantics.
+- [HTTP/1.1 (RFC 9112)](https://www.rfc-editor.org/rfc/rfc9112.html) — current HTTP/1.1 message syntax, connection management, and framing.
+- [HTTP/2 (RFC 9113)](https://www.rfc-editor.org/rfc/rfc9113.html) — binary framing, streams, multiplexing, field compression, flow control, and the TCP relationship.
+- [HTTP/3 (RFC 9114)](https://www.rfc-editor.org/rfc/rfc9114.html) — mapping HTTP semantics to QUIC, including stream behavior and protocol negotiation.
+- [HTTP overview](https://developer.mozilla.org/en-US/docs/Web/HTTP/Overview) — MDN’s accessible explanation of HTTP evolution, intermediaries, connections, and caching.
+- [QUIC Transport Protocol (RFC 9000)](https://www.rfc-editor.org/rfc/rfc9000.html) — transport behavior that HTTP/3 relies on for streams, flow control, and migration.

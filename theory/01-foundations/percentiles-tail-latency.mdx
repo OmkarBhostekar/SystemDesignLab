@@ -1,0 +1,228 @@
+---
+type: lesson
+id: 01-04-percentiles-tail-latency
+slug: percentiles-tail-latency
+title: Percentiles and Tail Latency
+description: Use latency distributions and p50/p95/p99 to reason about slow requests that averages hide.
+module: foundations
+order: 4
+difficulty: core
+estimatedMinutes: 30
+prerequisites:
+  - 01-03-latency-vs-throughput
+  - 00-03-estimation
+tags:
+  - latency
+  - percentiles
+  - tail-latency
+  - p95
+  - p99
+  - observability
+objectives:
+  - Compute and interpret p50, p95, and p99 without treating them as maximum latency.
+  - Explain why an acceptable average can coexist with a poor tail.
+  - Estimate tail amplification when one request fans out to many dependencies.
+  - Choose percentile-aware instrumentation and mitigation for queues, retries, and slow dependencies.
+  - State the aggregation and sampling caveats behind a percentile claim.
+relatedLessons:
+  - 01-03-latency-vs-throughput
+  - 01-05-availability
+---
+
+# Percentiles and Tail Latency
+
+> Averages describe the center of a distribution; percentiles reveal how often users encounter the slow edge, where queues and fan-out make failures visible.
+
+## Why This Exists
+
+Suppose an API reports a 70 ms average. If 99 of 100 requests take 60 ms and one takes 1,060 ms, the average is about 70 ms, but one percent of users wait more than a second. An interactive system with millions of requests can make that one percent a large population.
+
+The naive design monitors only average latency and adds capacity when the average crosses a threshold. The average can stay stable while a queue, a slow shard, garbage collection, or a dependency outage makes p99 unusable. The improvement is to measure a distribution and set an SLO at a meaningful percentile, while still retaining volume and error context.
+
+## Mental Model
+
+Sort observed latencies from fastest to slowest:
+
+~~~text
+latency:  12 18 20 22 25 31 44 61 75 900 ms
+          └──────────────┬──────────────┘
+                         p50 ≈ 31 ms
+                         p90 = 75 ms
+                         p99 depends on the sample size and definition
+~~~
+
+- **p50 / median:** half of observations are at or below this value; a useful “typical” signal.
+- **p95:** 95% are at or below it; roughly 5% are slower.
+- **p99:** 99% are at or below it; roughly 1% are slower.
+- **Maximum:** the slowest observed sample; highly sensitive to sample size and outliers.
+
+A percentile is not a promise that exactly one request in every hundred is slow, nor is it a maximum. It is an estimate over a stated time window, population, boundary, and sampling method. p99 for one endpoint in one region is not automatically p99 for the whole product.
+
+## How It Works
+
+### Measure a useful distribution
+
+Record latency at the client or user-journey boundary when possible, and also break it into queue, service, network, and dependency components. Histograms preserve buckets that can be aggregated more meaningfully than averaging per-instance averages. Prometheus documents the different aggregation behavior of histograms and summaries; choose the representation based on query and aggregation needs.
+
+Use a window long enough to contain the traffic needed for a stable estimate, but short enough to show changes. Low-volume p99 can be noisy: ten samples do not provide a reliable picture of the slowest one percent.
+
+### Tail at scale
+
+If one request waits for N independent downstream calls in parallel, it completes after the slowest call. If each call has probability p of exceeding a chosen threshold, the chance that at least one exceeds it is:
+
+~~~text
+1 − (1 − p)^N
+~~~
+
+At p = 0.01 and N = 100, this is about 63%. Independence is a simplifying model; correlated queues can make the real tail better or worse. Sequential hops add latency; parallel fan-out reduces critical-path sum but increases tail exposure and resource use.
+
+### Mitigate the tail
+
+- bound queues and set deadlines;
+- reduce fan-out or make optional calls asynchronous;
+- hedge or duplicate only when the extra load is safe;
+- cache or precompute expensive results;
+- isolate noisy tenants and slow work;
+- use load shedding and graceful degradation;
+- investigate GC, cold starts, lock contention, network retransmits, and storage stalls.
+
+The mitigation must preserve correctness. A hedge that duplicates a non-idempotent write can create a duplicate side effect.
+
+## Example
+
+An account page fetches profile data plus 20 recommendation shards in parallel. Each shard has p99 of 300 ms, while average shard latency is 40 ms. A dashboard that averages all shard calls may display 40 ms and miss the fact that many account pages wait for at least one slow shard.
+
+### Naive → failure → improvement
+
+1. **Naive:** alert when average page latency exceeds 100 ms.
+2. **Failure:** the mean remains near 90 ms, but the page p99 is 750 ms during cache evictions and a busy shard; users report intermittent freezes.
+3. **Improvement:** publish page p50/p95/p99, shard latency distributions, queue depth, and fan-out success. Set a page p99 budget, cap shard work, and return a clearly labeled partial recommendation result when optional shards miss their deadline.
+4. **New trade-off:** partial results improve tail latency but can reduce feature completeness; hedging may reduce tail for reads while increasing backend load.
+
+The page's p99 is not the average of shard p99 values. It depends on the critical-path maximum and on the distribution of each shard, including correlation and timeout behavior.
+
+## Visualization We Eventually Want
+
+Create a request-latency distribution simulator:
+
+- controls for average service time, slow-request probability, fan-out count, queue utilization, and sample window;
+- a timeline that contrasts p50, p95, p99, average, and maximum;
+- a fan-out mode showing the probability that at least one dependency is slow;
+- toggles for hedging, timeout, graceful degradation, and correlated slowdown;
+- a text explanation of why a mitigation changes both the tail and resource cost.
+
+The preset should reproduce an average near 70 ms with p99 near 900 ms, then show how queueing or fan-out changes the tail.
+
+## Scaling Behavior
+
+At larger request volumes, a small tail probability affects more users and more downstream calls. A service that meets p99 in isolation may miss the user p99 after five sequential hops or a 50-way fan-out. Aggregated dashboards can hide one noisy instance if they average per-instance percentiles incorrectly.
+
+More load increases queueing and can create a nonlinear tail even when mean service time grows only modestly. More replicas can improve the tail only if load is balanced and the shared dependencies have capacity. More replicas can also increase fan-out or replication work and create new tail sources.
+
+## Failure Modes
+
+- **Average-only monitoring:** slow users disappear in the mean.
+- **Small samples:** p99 jumps around and is mistaken for a stable guarantee.
+- **Percentile-of-percentiles:** averaging p99 values across instances yields an invalid global p99.
+- **Wrong boundary:** server p99 looks healthy while client DNS, network, or retries dominate.
+- **Coordinated tail:** a storage event, GC pause, or dependency outage slows many requests together.
+- **Tail mitigation overload:** hedges, retries, or parallel fan-out add load and worsen the cause.
+
+Keep raw counts, histograms, and dimensions for endpoint, region, tenant, status, and dependency. Tie latency alerts to traffic and errors rather than a percentile in isolation.
+
+## Trade-offs
+
+Higher percentiles demand more headroom and often more engineering cost. Hedged requests and replication can lower a read tail while increasing traffic and consistency complexity. Timeouts protect callers but can abandon work that continues consuming resources. Partial responses improve responsiveness but need explicit product semantics.
+
+Percentiles are useful abstractions, not complete user experience measures. A p99 target can hide a small group with severe failures or an unacceptable p100; pair it with error rates, freshness, and critical-journey checks.
+
+## Alternatives
+
+- **Average plus standard deviation:** useful for roughly symmetric distributions, but long service tails often violate that assumption.
+- **Percentile SLOs:** prefer for user-facing latency and queueing behavior.
+- **Maximum:** useful for debugging or bounded batches, but unstable as an operational target.
+- **Apdex or deadline success:** useful when the product defines satisfaction by a fixed threshold; retain the underlying distribution for diagnosis.
+- **Quantile sketches/histograms:** use when high-cardinality or distributed aggregation makes raw samples too expensive; document approximation error.
+
+## When to Use
+
+Use p50, p95, and p99 whenever an interview prompt says “low latency,” “real time,” “interactive,” or “SLO.” Choose the percentile based on user impact and traffic volume, then allocate a budget across hops and dependencies.
+
+## When Not to Use
+
+Do not present a p99 without sample size, time window, boundary, or aggregation method. Do not optimize a rare, non-user-visible batch operation at p99 while ignoring completion time and data correctness. Do not use hedging or retries blindly for non-idempotent work.
+
+## Common Misconceptions
+
+- **“p99 is the worst case.”** Maximum is the observed worst case; p99 leaves about one percent of observations above it.
+- **“A p99 of 100 ms means every user sees 100 ms.”** It is a windowed distribution summary, not a per-request promise.
+- **“p99 of components averages to p99 of the system.”** Composition depends on sequential sums, parallel maxima, traffic, and correlation.
+- **“More sampling always fixes the tail.”** Sampling can miss low-frequency but severe events and can distort tenant or region populations.
+- **“Tail latency is only a monitoring issue.”** Queues, fan-out, retries, and shared resources create real user and capacity effects.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I would not use average latency alone. I would measure a distribution at the user boundary and component boundaries, report p50/p95/p99 with traffic and error context, and budget the tail across sequential hops and fan-out. The tail can be amplified by queues and parallel dependencies, so I would bound work, set deadlines, reduce fan-out, and use safe degradation or hedging only when correctness and load allow it.
+
+### When to Introduce It
+
+Introduce percentiles after naming a latency requirement and before choosing capacity, timeouts, retries, caching, or fan-out. Ask whether the target is client-observed or server-observed.
+
+### Common Follow-Ups
+
+- Why can average latency stay flat while p99 gets worse?
+- How do parallel calls compose into a user tail?
+- How would you aggregate latency across instances?
+- When is hedging safe?
+- Which path may degrade when an optional dependency misses its deadline?
+
+### Common Candidate Mistakes
+
+- Quoting a percentile without a population or window.
+- Averaging instance percentiles.
+- Ignoring fan-out and retries.
+- Adding hedges to writes without idempotency.
+- Treating graceful degradation as silently returning incorrect data.
+
+## Summary
+
+- Averages hide rare slow requests; p50, p95, and p99 expose the latency distribution.
+- A percentile is a windowed estimate, not a maximum or universal guarantee.
+- Fan-out and high utilization amplify tails, especially at the user boundary.
+- Histograms and explicit dimensions make distributed percentiles aggregatable and diagnosable.
+- Tail mitigation trades load, completeness, correctness, and cost; make those trade-offs explicit.
+
+## Quiz Seeds
+
+1. How can 70 ms average coexist with p99 of 900 ms?
+2. What does p95 = 200 ms mean, and what does it not mean?
+3. For 100 independent calls each with a 1% chance of exceeding a threshold, what is the chance at least one exceeds it?
+4. Why is averaging p99 across instances invalid?
+5. Which tail causes would you investigate if p50 is stable but p99 rises during a deployment?
+6. When can hedged requests improve a read tail, and what cost do they add?
+7. Why should a latency percentile be paired with traffic volume and errors?
+8. A recommendation shard is optional. How can graceful degradation change the page's p99 and product semantics?
+
+## Related Topics
+
+- [Latency vs. Throughput](./latency-vs-throughput.mdx) — connect queueing and concurrency to response time.
+- [Availability](./availability.mdx) — define whether a slow or partial response is usable.
+- [Back-of-the-Envelope Estimation](../00-interview-method/estimation.mdx) — estimate workload and headroom before setting SLOs.
+
+## References
+
+### Documentation / Articles
+
+- [Service Level Objectives — Google SRE](https://sre.google/sre-book/service-level-objectives/) — explains why high percentiles expose tail behavior and why average-only monitoring can miss user impact.
+- [Histograms and Summaries — Prometheus Documentation](https://prometheus.io/docs/practices/histograms/) — documents percentile estimation and the aggregation trade-off between histograms and summaries.
+- [Practical Alerting from Time-Series Data — Google SRE](https://sre.google/sre-book/practical-alerting/) — emphasizes distributions and latency-tail diagnosis rather than averages alone.
+
+### Papers
+
+- [The Tail at Scale — Dean and Barroso](https://research.google/pubs/the-tail-at-scale/) — the foundational paper on tail latency, fan-out, hedging, and techniques for large distributed services.
+
+### Videos
+
+No video is included because the Google research paper and operational documentation directly support the percentile and tail mechanisms.

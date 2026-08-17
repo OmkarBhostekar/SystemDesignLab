@@ -1,0 +1,289 @@
+---
+type: lesson
+id: 02-05-rest-rpc-grpc-graphql
+slug: rest-rpc-grpc-graphql
+title: REST, RPC, gRPC, and GraphQL
+description: Select an API interaction style by comparing resource semantics, operation coupling, schemas, payload shape, browser fit, streaming, and evolution.
+module: networking
+order: 5
+difficulty: core
+estimatedMinutes: 40
+prerequisites:
+  - 02-04-http-evolution
+  - 02-01-request-lifecycle
+  - 00-02-requirements
+  - 01-03-latency-vs-throughput
+tags:
+  - api-design
+  - rest
+  - rpc
+  - grpc
+  - graphql
+  - schemas
+  - coupling
+objectives:
+  - Distinguish REST as an architectural style from a JSON-over-HTTP convention and identify the constraints that matter for scale and intermediaries.
+  - Compare resource-oriented REST, operation-oriented RPC, gRPC with Protocol Buffers, and GraphQL query execution across clients and service boundaries.
+  - Choose an interaction style using browser/mobile fit, payload shape, schema evolution, streaming, caching, observability, and team-boundary requirements.
+  - Identify hidden fan-out, N+1 resolver work, retry/idempotency, deadline, and compatibility risks in each style.
+  - Explain why an API contract is more important than a protocol brand and how to migrate or expose more than one surface safely.
+relatedLessons:
+  - 02-04-http-evolution
+  - 02-06-realtime-transports
+  - 02-07-api-design-interviews
+  - 00-02-requirements
+---
+
+# REST, RPC, gRPC, and GraphQL
+
+> API style is a contract and coupling decision: choose resource, operation, or client-shaped interaction semantics based on callers and evolution needs, then choose the wire protocol that carries them.
+
+## Why This Exists
+
+The naive API choice is “return JSON from an HTTP endpoint.” It is easy to start, but a generic endpoint such as `POST /doEverything` hides resources, operation semantics, cacheability, errors, and compatibility rules. A mobile screen may over-fetch a large resource and then make five more calls for related data. An internal service may need generated clients, deadlines, bidirectional streaming, and precise schema compatibility. A federated product may need clients to request different fields without waiting for a new server endpoint.
+
+The improvement is to make the interaction model explicit:
+
+```text
+naive:       one generic JSON endpoint
+failure:     hidden coupling, over/under-fetching, weak errors, unclear retries
+improved:    resource API / RPC contract / typed query schema chosen per boundary
+new cost:    schema governance, generated code or query controls, and multiple surfaces to operate
+```
+
+REST, RPC, gRPC, and GraphQL are related but not interchangeable labels. REST is an architectural style; RPC is a call-shaped interaction model; gRPC is a specific RPC framework with a strong IDL and streaming support; GraphQL is a typed query language and execution runtime. Any of them can run through HTTP infrastructure, and none removes the need to design authorization, deadlines, idempotency, limits, or failures.
+
+## Mental Model
+
+Choose along five axes:
+
+1. **Shape:** named resources and representations, named operations, or a client-selected graph.
+2. **Coupling:** how much client and server must agree before deployment and how generated code exposes changes.
+3. **Payload:** fixed server shapes, compact typed messages, or variable field selection.
+4. **Boundary:** public/browser/mobile, internal service-to-service, or an aggregation/BFF layer.
+5. **Behavior:** cacheability, streaming, deadlines/cancellation, retries, observability, and abuse controls.
+
+| Style | Good default boundary | Strength | Main risk |
+| --- | --- | --- | --- |
+| Resource-oriented REST | Public APIs, browser/mobile, cacheable CRUD-like domains | Familiar HTTP semantics, intermediaries, resource links, broad tooling | Endpoint proliferation or vague action endpoints; representation/version discipline needed |
+| RPC | Internal or domain operations with explicit commands | Direct operation model and clear method contract | Couples callers to server methods; retries and semantics can look like local calls |
+| gRPC | Typed internal polyglot services and streaming | Protobuf IDL/code generation, compact messages, deadlines, four stream shapes | Browser/proxy fit, generated-schema governance, debugging and edge translation |
+| GraphQL | Client-shaped views over related domains or BFF | One typed schema, field selection, introspection/tooling, fewer client round trips | Query cost/fan-out, cache complexity, authorization and schema governance |
+
+There is no “fastest” style independent of payload, serialization, network, resolver/backend work, cache hit rate, and connection behavior. A compact protocol can still be slow if one request triggers 100 database queries.
+
+## How It Works
+
+### REST: constraints before conventions
+
+Roy Fielding’s REST style derives properties from constraints including client-server separation, stateless interactions, cacheability, a uniform interface, layered systems, and (optionally) code-on-demand. Production teams often say “REST API” to mean resource-oriented HTTP with JSON; that can be a useful subset, but a URL plus JSON alone does not make an API RESTful.
+
+A resource API names stable concepts and uses HTTP method/status/cache semantics deliberately:
+
+```text
+GET    /v1/accounts/42          → representation of account 42
+GET    /v1/accounts/42/orders   → collection representation
+POST   /v1/accounts/42/orders   → create an order (defined response/idempotency)
+PATCH  /v1/orders/9             → partial update semantics
+DELETE /v1/orders/9             → defined deletion/visibility semantics
+```
+
+The server chooses a representation; content negotiation and fields can evolve through additive changes. HTTP intermediaries can cache safe responses when authorization, `Cache-Control`, `Vary`, and validators are designed correctly. A `POST` is not automatically non-retryable, and a `PUT` is not magically safe if the server's semantics violate its intended replacement/idempotency contract.
+
+### RPC: operation-oriented contracts
+
+RPC exposes operations such as `ReserveInventory`, `GetUser`, or `PublishPost`. It aligns naturally with domain commands and internal workflows, and it can provide generated clients, typed request/response messages, and explicit status. The danger is the local-call illusion: a remote call has latency, partial failure, deadlines, authentication, version skew, and an ambiguous outcome after a connection failure. The method name should not hide whether it is read-only, idempotent, asynchronous, transactional, or eventually consistent.
+
+RPC does not mandate a binary protocol. It can use JSON/HTTP, Protobuf, Thrift, or another wire representation. Select the semantics first, then a framework that satisfies client and operational constraints.
+
+### gRPC: an RPC framework with an IDL
+
+gRPC commonly uses Protocol Buffers to define services and messages, then generates client stubs and server interfaces. It supports unary, server-streaming, client-streaming, and bidirectional-streaming calls. Its APIs expose deadlines and cancellation, metadata, status codes, and message ordering within an individual RPC stream. gRPC commonly runs over HTTP/2 and is suited to typed service-to-service calls.
+
+Generated stubs reduce hand-written serialization and contract drift, but they do not solve semantic compatibility. Adding a field can be safe while changing meaning or reusing a field number is not. A client still needs an error taxonomy, retry policy, request ID, authorization metadata, and a rule for server-side work after cancellation. Browser clients may need gRPC-Web or an HTTP/JSON transcoding gateway, which introduces another contract and translation boundary.
+
+### GraphQL: client-shaped queries and execution
+
+GraphQL exposes a typed schema of fields and relationships. A client sends a query selecting the shape it needs; the server validates it, executes resolvers, and returns data/errors. This can avoid over-fetching and reduce client round trips, especially for screens that combine product, profile, and recommendations data.
+
+The server now owns query planning and cost control. A nested query can fan out into many resolver/database calls (the N+1 problem), request huge lists, or traverse expensive relationships. Batching/data loaders, depth/complexity limits, persisted queries, field-level authorization, pagination, and timeouts make GraphQL operable. HTTP/CDN caching is less direct than for stable REST URLs because the query body and variables shape the response; persisted queries, normalized client caches, or field-aware caching can help.
+
+GraphQL is not “database access for clients.” The schema is an API contract and may aggregate services, caches, and precomputed views. Mutations need explicit idempotency and result semantics, subscriptions need a real-time transport and reconnect/replay design, and errors can be partial (`data` plus `errors`) rather than one HTTP status alone.
+
+### Compare the same domain operation
+
+For “reserve one seat”:
+
+```text
+REST:    POST /v1/events/7/reservations with idempotency key
+RPC:     ReserveSeat(event_id=7, seat_id=21, request_id=...)
+gRPC:    unary ReserveSeat(ReserveSeatRequest) returns (Reservation)
+GraphQL: mutation { reserveSeat(eventId: "7", seatId: "21", key: "...") { ... } }
+```
+
+All four need the same business questions: what happens if the caller times out after commit, which error means “already reserved,” how long is the reservation held, and how does a client query status? The syntax does not answer them.
+
+## Example
+
+### Product detail across web and internal services
+
+Suppose an e-commerce product page needs product metadata, price, inventory availability, reviews, and recommendations. The naive design exposes one `GET /product-page` JSON endpoint owned by the catalog team. It returns a fixed huge payload and synchronously calls four stores; mobile needs half the fields, while a new UI waits for a backend release to add one field.
+
+An improved boundary can use:
+
+- resource-oriented REST for public product, review, and order resources, allowing browser/CDN caching where safe;
+- gRPC unary calls between catalog, pricing, and inventory services, with deadlines, typed messages, and explicit degraded behavior;
+- a GraphQL BFF for web/mobile clients that selects the fields a screen needs and batches resolvers;
+- asynchronous events for inventory-change notifications rather than holding a page request open.
+
+```text
+web/mobile → GraphQL BFF
+                 ├─ gRPC Catalog.GetProduct
+                 ├─ gRPC Pricing.GetPrice
+                 ├─ gRPC Inventory.GetAvailability
+                 └─ REST/cache Reviews list (or an internal typed call)
+```
+
+The BFF enforces query depth, page size, and a total deadline. If recommendations time out, it returns a page without them and records a degraded outcome. The gRPC calls carry cancellation and trace context. Public REST responses use validators and cache headers; personalized price and inventory are not shared without an authorization-aware key.
+
+The new trade-offs are an extra BFF hop, schema ownership across teams, resolver fan-out, and two API surfaces to test. If the product has only two clients and stable shapes, a versioned REST endpoint may be cheaper. If the services are internal and all callers are typed, GraphQL may add more query governance than value.
+
+## Visualization We Eventually Want
+
+Build an API-style comparison lab using the same product-page and reservation workload.
+
+### Controls
+
+- number of client types and requested fields;
+- REST endpoint shape and cacheability;
+- RPC/gRPC method count, serialization size, deadlines, stream mode, and failure policy;
+- GraphQL query depth, list sizes, resolver fan-out, batching/data-loader toggle, and persisted-query allowlist;
+- network RTT/loss, backend latency, cache hit ratio, and one slow/failed dependency;
+- schema change (add field, remove field, change meaning) and old/new client versions.
+
+### Behavior and outputs
+
+Show the client contract, bytes, number of network calls, resolver/service calls, and critical path. Let the learner add a field to a GraphQL query, a REST representation, or a Protobuf message and see compatibility effects. Inject a slow nested resolver or gRPC dependency and show timeout/cancellation and partial response behavior. Report p50/p95/p99 latency, over/under-fetch bytes, backend fan-out, cache hit rate, query rejection count, error categories, and generated-client/schema version skew. Use text summaries so the lesson does not depend on visual syntax.
+
+## Scaling Behavior
+
+- **More clients:** REST can use intermediaries and stable representations; GraphQL concentrates varied query cost at a gateway; gRPC needs generated client/library distribution and version compatibility.
+- **More fields/relationships:** REST may add endpoints or representations; GraphQL schema/resolver cost grows; gRPC adds fields/messages while preserving wire compatibility when evolution rules are followed.
+- **More services:** RPC/gRPC lowers hand-written integration cost but increases call graph and timeout/retry complexity. An aggregation layer should bound fan-out and avoid duplicating domain ownership.
+- **More traffic:** cache safe REST reads, pool/reuse gRPC connections, batch GraphQL resolvers, and protect expensive queries with quotas and admission control.
+- **More regions:** choose whether resource reads are eventually consistent, route clients to regional endpoints, and make mutations idempotent across retries. API style does not remove replication or conflict choices.
+- **More tenants/partners:** use explicit quotas, auth scopes, schema/version policy, and per-consumer metrics. A flexible query surface needs field-level and cost-level limits.
+
+## Failure Modes
+
+| Failure | REST/RPC/gRPC effect | GraphQL effect | Mitigation |
+| --- | --- | --- | --- |
+| Client timeout after server success | Retry may duplicate a mutation | Mutation may be partially returned or hidden by network error | Idempotency key, operation status, reconciliation endpoint/query, durable request ID |
+| Dependency slow | Request waits or returns an HTTP/RPC error | Resolver times out; response may contain partial data and errors | Deadline propagation, cancellation, bounded fan-out, documented degraded fields |
+| N+1 or expensive query | Usually visible as endpoint/backend load | A valid query can trigger hidden multiplicative work | Batch/data-loader, query complexity/depth/page limits, persisted queries, resolver metrics |
+| Schema/version skew | Old clients may reject changed fields/statuses | Removing/changing a field breaks queries; adding is usually additive | Compatibility tests, deprecation windows, tolerant readers, explicit version policy |
+| Gateway/transcoder outage | Public and internal surfaces may share blast radius | GraphQL BFF can become a single bottleneck | Redundant gateways, cached/public fallback, direct safe endpoints where justified |
+| Error ambiguity | HTTP status/body or RPC status may be too coarse | Partial `data` plus `errors` can be misinterpreted | Stable error codes, field/path context, retryability, request ID, docs |
+| Large response/query | Bandwidth/memory and timeout pressure | Recursive query consumes CPU/database capacity | Pagination, limits, compression, complexity budgets, streaming where appropriate |
+
+“The call returned successfully” needs a definition at every style. In gRPC, a server can finish sending while the client misses the deadline; in GraphQL, a 200 response can contain errors. The business contract must distinguish transport success, validation success, durable acceptance, and completed side effects.
+
+## Trade-offs
+
+- REST's uniform, cache-aware HTTP surface improves interoperability and independent evolution, but fixed representations can over/under-fetch and complex commands need carefully designed action resources.
+- RPC/gRPC maps domain operations and typed contracts well, but remote calls can look deceptively local and generated code/schema coordination can couple releases.
+- GraphQL gives clients precise shapes and a central schema, but query cost, caching, authorization, observability, and resolver ownership become first-class operations.
+- JSON is easy to inspect and broadly supported but larger/looser; binary Protobuf is compact and typed but requires schema tooling and is less browser-native.
+- One public style plus one internal style can fit boundary needs, but translation duplicates tests, error mappings, metrics, and compatibility policy.
+
+## Alternatives
+
+- **Versioned REST:** choose for stable public resources, broad clients, HTTP caching, and operational familiarity.
+- **JSON-RPC or lightweight RPC:** choose for a small operation-oriented API where resource semantics add little value; document methods and error/idempotency carefully.
+- **gRPC:** choose for typed internal calls, high fan-out, streaming, and generated clients; add a gateway only when external/browser constraints require it.
+- **GraphQL:** choose for heterogeneous clients and related read views; avoid it as a blanket replacement for command workflows or unbounded arbitrary queries.
+- **BFF/aggregator with REST or gRPC downstream:** choose when a client needs one view and domain services should retain ownership; bound orchestration and deadlines.
+- **Event/API hybrid:** choose when mutations should acknowledge durable intent quickly and downstream projections can catch up; expose status and replay semantics.
+
+## When to Use
+
+Use resource-oriented REST for public CRUD-like resources and cache-friendly reads; use RPC/gRPC for typed internal operations and streaming; use GraphQL when multiple clients need variable, related read shapes and the team can operate query governance. In an interview, name the boundary, caller capabilities, workload, compatibility promise, and failure behavior before naming a style.
+
+## When Not to Use
+
+Do not call a generic JSON endpoint REST without defining resource and HTTP semantics. Do not use gRPC for a browser-facing public API if it forces an unnecessary translation layer, and do not use GraphQL merely to reduce URL count. Avoid exposing arbitrary GraphQL queries against high-cost joins without limits, and avoid operation-shaped RPC for simple cacheable resources if it sacrifices useful HTTP semantics.
+
+## Common Misconceptions
+
+- **“REST means JSON over HTTP.”** JSON/HTTP can be a pragmatic resource API, but REST is an architectural style with constraints; the important lesson is to choose the constraints you need.
+- **“RPC is local-function-like and therefore easy to retry.”** Networks fail after partial execution; retries require deadlines, idempotency, and outcome reconciliation.
+- **“gRPC is always faster than REST.”** Serialization, payload shape, connection reuse, backend work, and client/platform support determine the result.
+- **“GraphQL is one database query.”** It is a typed API and execution runtime; resolvers may fan out to many services and stores.
+- **“GraphQL has no versioning.”** Additive schema evolution and deprecation can avoid URL versions, but fields, meanings, auth, limits, and breaking removals still need compatibility policy.
+- **“HTTP 200 means a GraphQL operation succeeded.”** GraphQL responses can contain both data and errors; clients must inspect both.
+- **“An IDL guarantees compatibility.”** It documents and generates code, but semantic changes, removed fields, and retry/error contracts can still break consumers.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+“I choose the API interaction model by boundary. For public, cacheable resources I prefer a resource-oriented HTTP API with explicit methods, representations, status codes, and compatibility rules. For typed internal calls with deadlines and streaming, gRPC/Protobuf gives generated clients and a clear contract, but I account for remote-call failures and browser fit. For variable read views across clients, GraphQL can reduce round trips, provided I bound query depth/cost, batch resolvers, secure fields, and observe partial errors. The protocol is secondary to semantics, evolution, and failure behavior.”
+
+### When to Introduce It
+
+Introduce API style after clarifying callers and use cases, before drawing service boundaries or estimating payload/fan-out. Revisit it when the prompt asks about public versus internal APIs, mobile bandwidth, schema evolution, streaming, or partner integration.
+
+### Common Follow-Ups
+
+- Which clients call the API, and can they use generated code or HTTP caching?
+- Is this a resource, a command, a query over relationships, or a long-running job?
+- How do deadlines, cancellation, retries, idempotency, and request IDs propagate?
+- How is a schema evolved while old clients remain online?
+- What prevents a GraphQL query or RPC fan-out from exhausting dependencies?
+- How are partial data and retryable errors represented?
+
+### Common Candidate Mistakes
+
+- Selecting REST/RPC/GraphQL before clarifying boundary and caller constraints.
+- Treating transport speed as the main criterion while ignoring backend fan-out and cacheability.
+- Forgetting that generated clients and GraphQL schemas are coupling surfaces.
+- Giving GraphQL arbitrary query access without depth, cost, pagination, and authorization limits.
+- Hiding command idempotency and status reconciliation behind a method name or mutation.
+
+## Summary
+
+1. REST, RPC, gRPC, and GraphQL describe different interaction and contract choices; none is universally superior.
+2. Resource-oriented HTTP is a strong public default when caching and broad interoperability matter.
+3. gRPC/Protobuf is effective for typed internal calls and streaming, with explicit deadline and compatibility discipline.
+4. GraphQL fits client-shaped related reads when query cost, resolver fan-out, caching, and schema governance are engineered.
+5. Every style needs stable semantics for errors, retries, idempotency, authorization, request IDs, and evolution.
+
+## Quiz Seeds
+
+1. Why is JSON over HTTP not by itself enough to call an API RESTful?
+2. Which caller and workload signals would make gRPC preferable to a public REST API?
+3. A GraphQL query requests 100 products and each resolver makes two database calls. What controls prevent an N+1 overload?
+4. How should a client interpret a GraphQL response containing both `data` and `errors`?
+5. Why can a compact Protobuf RPC still be slower than a REST endpoint?
+6. Design the contract for a timed-out `ReserveSeat` mutation so the client can safely retry.
+7. Which schema changes are usually additive and which require a compatibility/deprecation plan?
+8. When would a BFF add value, and what new bottleneck/failure mode does it introduce?
+
+## Related Topics
+
+- [HTTP evolution](./http-evolution.mdx) explains the transport/frame choices that carry these API styles.
+- [Real-time transports](./realtime-transports.mdx) covers streaming, server push, and bidirectional sessions.
+- [API design for interviews](./api-design-interviews.mdx) turns these style choices into concrete pagination, versioning, idempotency, and error contracts.
+- [The request lifecycle](./request-lifecycle.mdx) shows where gateways, aggregators, caches, and dependency deadlines sit.
+- [Functional and non-functional requirements](../00-interview-method/requirements.mdx) identifies the caller and quality constraints that justify a style.
+
+## References
+
+### Documentation / Articles
+
+- [Architectural Styles and the Design of Network-based Software Architectures](https://ics.uci.edu/~fielding/pubs/dissertation/abstract.htm) — Roy Fielding’s dissertation introduces REST and grounds its scalability, uniform-interface, cacheability, and layered-system constraints.
+- [Core concepts, architecture and lifecycle](https://grpc.io/docs/what-is-grpc/core-concepts/) — official gRPC documentation for Protobuf service definitions, unary/streaming RPCs, deadlines, cancellation, metadata, and status.
+- [What is gRPC?](https://grpc.io/docs/what-is-grpc/) — official overview of gRPC’s purpose, supported scenarios, generated clients, and service-to-service use.
+- [GraphQL specification](https://spec.graphql.org/September2025/) — current GraphQL language/type/execution contract; use the version appropriate to the implementation being designed.
+- [GraphQL](https://graphql.org/) — official overview of typed schemas, client-selected fields, relationships, and the operational rationale for GraphQL APIs.
+- [Cloud API Design Guide](https://docs.cloud.google.com/apis/design) — Google’s official resource-oriented guidance covering REST/RPC methods, errors, versioning, and backward compatibility.

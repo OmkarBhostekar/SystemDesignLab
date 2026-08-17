@@ -1,0 +1,212 @@
+---
+type: lesson
+id: 01-09-cap
+slug: cap
+title: CAP Theorem
+description: Reason about consistency and availability specifically when communication partitions separate replicas.
+module: foundations
+order: 9
+difficulty: core
+estimatedMinutes: 35
+prerequisites:
+  - 01-08-redundancy-and-fault-tolerance
+  - 01-05-availability
+tags:
+  - cap
+  - consistency
+  - availability
+  - network-partition
+  - replication
+objectives:
+  - Define CAP consistency, availability, and partition tolerance in the distributed-replica setting.
+  - Explain why the trade-off is about behavior during a network partition, not a permanent choice of two letters.
+  - Compare CP and AP behavior for writes and reads without conflating CAP availability with uptime.
+  - Select a partition-time policy from business invariants, conflict handling, and user impact.
+  - Distinguish CAP consistency from ACID consistency and from ordinary service availability.
+relatedLessons:
+  - 01-08-redundancy-and-fault-tolerance
+  - 01-10-consistency-models
+---
+
+# CAP Theorem
+
+> Under a network partition, a replicated service cannot both guarantee linearizable consistency and guarantee an eligible response from every non-failing side; partition tolerance is the operating assumption that makes the choice relevant.
+
+## Why This Exists
+
+Replicas let a service survive node and network failures, but a partition can split replicas that cannot communicate. If both sides accept conflicting writes, a later read may violate a single, real-time order. If one side refuses to answer or write until coordination is restored, it preserves that order but sacrifices availability for that operation.
+
+The naive explanation is “pick any two of consistency, availability, and partition tolerance forever.” That phrasing hides the actual event: a partition. In a real distributed system, partitions and delayed messages are possible; designers choose whether the operation fails closed (CP-like) or continues with weaker semantics (AP-like) during that event.
+
+## Mental Model
+
+CAP uses precise terms:
+
+- **Consistency (C):** in the theorem's usual form, linearizability: each operation appears to take effect atomically at one point between invocation and response, respecting real-time order.
+- **Availability (A):** every request to a non-failing node eventually receives a response, even when the partition prevents coordination. This is not the same as a service's uptime SLO.
+- **Partition tolerance (P):** the system continues to operate under arbitrary message loss or delay that divides replicas into communicating groups. P is an assumption about the network, not a feature you can purchase away.
+
+When a partition occurs, preserving both C and A is impossible for operations that touch the split replicated state. A service can preserve consistency by refusing or delaying one side, or preserve response availability by allowing divergent state and resolving it later.
+
+## How It Works
+
+Imagine replicas A and B storing one account balance. A partition prevents messages between them.
+
+~~~text
+before:        A  ⇄  B
+partition:     A  ║  B
+client writes  +10     +20
+~~~
+
+### CP behavior
+
+A CP-like design chooses a single quorum, leader, or owner that can safely decide the order. The minority side rejects or times out writes; some reads may also fail or return only data that meets the consistency rule. Once communication returns, replicas catch up without exposing conflicting committed values.
+
+### AP behavior
+
+An AP-like design lets both sides answer with local state. Writes may diverge, and reads may be stale or conflict-bearing. Repair, versioning, deterministic merge, or application reconciliation resolves the divergence. “Available” does not mean “always correct” or “never stale.”
+
+These are behavior choices for a data item and operation. A service can use CP-like inventory writes and AP-like view counters, or offer multiple read/write consistency modes. The theorem does not classify every component with one permanent label.
+
+## Example
+
+Compare a ticket inventory reservation with social “like” counts.
+
+### Naive → failure → improvement
+
+1. **Naive:** allow both sides of a partition to decrement the last ticket because “the service must stay available.”
+2. **Failure:** two buyers receive confirmed reservations for one item; reconciliation cannot create a second ticket.
+3. **Improvement:** make inventory reservation CP-like: require the owner/quorum, reject or queue writes when it cannot be reached, and expose a retryable result. Let like counts use AP-like increments with later merge.
+4. **New trade-off:** inventory loses write availability for a partitioned side, while likes may be temporarily inconsistent or overcounted until repair.
+
+The product requirement—not the database brand—determines where the trade-off belongs. A “checkout page available” metric cannot justify returning two successful reservations.
+
+## Visualization We Eventually Want
+
+Build three replicated nodes with a network-partition control:
+
+- show a single key and concurrent reads/writes on each side;
+- let the learner choose reject writes, route to one owner, or accept both writes;
+- animate replicas, message delay, stale reads, conflicts, merge, and repair;
+- display linearizability violations, acknowledged operations, user-visible availability, and final convergence;
+- include presets for inventory, profile edits, and like counters.
+
+The visualization must label the partition event and explain that CP/AP behavior is chosen during the partition, not a slogan for all operating conditions.
+
+## Scaling Behavior
+
+More replicas and regions increase the chance that a partition matters and increase coordination and repair paths. Quorum sizes, leader placement, traffic routing, and replication lag affect normal latency as well as partition behavior. A cross-region synchronous quorum may preserve stronger semantics at the cost of inter-region latency and write availability.
+
+Partition handling can be per key or shard. A local read may remain available while a cross-shard transaction cannot. A system must also preserve capacity after a partition heals; replaying or merging a large backlog can overload the recovered replicas.
+
+## Failure Modes
+
+- **Split-brain writes:** two sides commit incompatible values.
+- **Misnamed availability:** a fast stale or conflicting response is counted as success for a critical invariant.
+- **Quorum loss:** a CP path rejects operations even though one replica is reachable.
+- **Conflict explosion:** AP repair cannot merge arbitrary application state safely.
+- **Stale reads:** a read is served from a replica that has not received the latest write.
+- **Healing storm:** replay and reconciliation overload the network or storage.
+- **Over-broad classification:** calling an entire database CP or AP hides operation-specific behavior.
+
+Mitigate with explicit consistency contracts, ownership/fencing, versioning, conflict-free data types where appropriate, bounded queues, repair monitoring, and a per-operation failure policy.
+
+## Trade-offs
+
+CP-like behavior protects invariants and simplifies reads at the cost of partition-time availability and possibly latency. AP-like behavior preserves local responses and can reduce coordination cost at the cost of stale or conflicting state, merge logic, and user-visible uncertainty.
+
+Partition tolerance is not optional in a system that relies on an unreliable network; “choosing CA” usually means assuming no partition or using one logical failure domain. Even a single-region system must decide how to behave when replicas cannot communicate.
+
+CAP says little about normal-operation latency, durability, transaction scope, or the cost of coordination outside a partition. Those are separate trade-offs; PACELC is one later framing, not a replacement for stating the partition behavior.
+
+## Alternatives
+
+- **Single writer with replicas:** reduce write conflicts while accepting failover or partition-time unavailability.
+- **Quorum/leader protocol:** coordinate enough replicas for a safe decision; choose quorum and failure behavior explicitly.
+- **AP with mergeable state:** use counters, sets, or CRDT-like structures when concurrent updates have a safe merge.
+- **Partition-local queue:** accept intent durably and apply it after ownership returns; expose pending state.
+- **Centralized source of truth:** use when the invariant is more valuable than multi-region write availability and the latency budget allows.
+
+## When to Use
+
+Use CAP reasoning when a design has replicated state, multiple regions, active-active writes, leader/quorum decisions, or a requirement for both high availability and strong consistency. Ask what should happen when communication fails.
+
+## When Not to Use
+
+Do not invoke CAP for a single-process cache or as a generic explanation for every database trade-off. Do not say “eventual consistency solves CAP” without explaining conflicts, repair, and the product invariant. Do not promise a CP design can always serve both sides of a partition.
+
+## Common Misconceptions
+
+- **“CAP means choose any two forever.”** The trade-off appears when a partition occurs.
+- **“P is optional.”** In a distributed network, message delay and loss are an operating reality; P is a model assumption.
+- **“A means uptime.”** CAP availability is a response guarantee for requests to non-failing nodes.
+- **“C means ACID consistency.”** CAP's C is usually linearizability for replicated operations, not all ACID properties.
+- **“AP means incorrect forever.”** It can converge with repair, but the application must handle stale/conflicting state.
+- **“A database is simply CP or AP.”** Behavior can vary by operation, quorum, topology, and configuration.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> CAP is about a replicated system during a network partition. If replicas cannot communicate, a design either preserves linearizable consistency by rejecting or delaying some operations, or keeps responding on both sides and accepts stale or conflicting state that must be repaired. I would classify each business operation, explain its partition behavior, and avoid treating CAP as a permanent “pick two” label or as a statement about ACID.
+
+### When to Introduce It
+
+Introduce CAP after replication and fault domains, when the prompt asks for multi-region writes, always-on behavior, or strong consistency. Draw the partition before naming CP or AP.
+
+### Common Follow-Ups
+
+- What exactly is the partition and which nodes can still communicate?
+- Which operations must reject during the partition?
+- What does a client observe on each side?
+- How are AP conflicts merged or surfaced?
+- What happens while the partition heals?
+
+### Common Candidate Mistakes
+
+- Saying “choose two” without showing the partition.
+- Calling a timeout “available.”
+- Treating CAP C as ACID consistency.
+- Choosing AP for non-mergeable inventory or payment state.
+- Ignoring repair, stale reads, and conflict observability.
+
+## Summary
+
+- CAP concerns consistency and response availability under a network partition.
+- Partition tolerance is an assumption about messages; the choice is whether to sacrifice C or A when the partition occurs.
+- CP-like paths reject or delay unsafe operations; AP-like paths accept local progress and reconcile later.
+- Apply the trade-off per operation and invariant, not as a permanent database label.
+- CAP does not replace reasoning about latency, durability, recovery, or normal-operation performance.
+
+## Quiz Seeds
+
+1. Why is “pick any two” an incomplete description of CAP?
+2. In CAP, what does availability guarantee during a partition?
+3. Why might an inventory write be CP-like while a like counter is AP-like?
+4. What happens to a CP-like write on a partitioned minority side?
+5. What new responsibilities does AP behavior create after a partition heals?
+6. Why is CAP consistency not identical to ACID consistency?
+7. Why can a fast stale response still violate a product's availability requirement?
+8. What information must be stated before calling a datastore CP or AP?
+
+## Related Topics
+
+- [Redundancy and Fault Tolerance](./redundancy-and-fault-tolerance.mdx) — place replicas and design failover before analyzing partitions.
+- [Consistency Models](./consistency-models.mdx) — choose the guarantee exposed to readers and writers.
+- [Functional and Non-Functional Requirements](../00-interview-method/requirements.mdx) — rank invariants and partition-time behavior.
+
+## References
+
+### Documentation / Articles
+
+- [CAP Twelve Years Later: How the Rules Have Changed — Eric Brewer](https://www.infoq.com/articles/cap-twelve-years-later-how-the-rules-have-changed/) — Brewer's retrospective clarifies that the trade-off is about behavior when partitions occur and warns against simplistic “two of three” phrasing.
+- [Perspectives on the CAP Theorem — Gilbert and Lynch](https://groups.csail.mit.edu/tds/papers/Gilbert/Brewer2.pdf) — a research perspective that frames CAP as a safety/liveness trade-off and discusses practical partition handling.
+- [Consistency in Distributed Systems — MIT 6.5830 Lecture 18](https://dsg.csail.mit.edu/6.5830/lectures/lec18.pdf) — course material that frames partition tolerance as an operating assumption and distinguishes CAP from broader consistency vocabulary.
+
+### Papers
+
+- [Brewer's Conjecture and the Feasibility of Consistent, Available, Partition-Tolerant Web Services — Gilbert and Lynch](https://sites.cs.ucsb.edu/~rich/class/cs293b-cloud/papers/cap-proof.pdf) — a direct copy of the formal proof of the impossibility result under the asynchronous network model.
+
+### Videos
+
+No video is included because the original paper, Brewer's clarification, and MIT lecture provide precise treatment of the partition condition.

@@ -1,0 +1,211 @@
+---
+type: lesson
+id: 01-08-redundancy-and-fault-tolerance
+slug: redundancy-and-fault-tolerance
+title: Redundancy and Fault Tolerance
+description: Use independent capacity, replicas, and failover to keep a system correct through component faults.
+module: foundations
+order: 8
+difficulty: core
+estimatedMinutes: 35
+prerequisites:
+  - 01-07-durability
+  - 01-05-availability
+tags:
+  - redundancy
+  - fault-tolerance
+  - failover
+  - replication
+  - failure-domains
+objectives:
+  - Distinguish redundancy as duplicated capability from fault tolerance as behavior during faults.
+  - Compare active-passive, active-active, and N-plus-one designs with their state and failover costs.
+  - Place replicas across meaningful failure domains and account for correlated faults.
+  - Explain how detection, promotion, routing, and capacity determine effective failover.
+  - Identify split brain, overload, stale state, and recovery hazards in redundant systems.
+relatedLessons:
+  - 01-07-durability
+  - 01-09-cap
+---
+
+# Redundancy and Fault Tolerance
+
+> Redundancy supplies alternatives; fault tolerance is the designed behavior that preserves an accepted service contract when one or more alternatives fail.
+
+## Why This Exists
+
+One server, one network path, or one database leader is a single point of failure. A second copy helps only if requests can reach it, it has the required state, and the copy is independent of the same fault. Otherwise the architecture has duplicated boxes but not fault tolerance.
+
+The naive design places two application replicas in one zone behind a load balancer and assumes the system is resilient. A zone outage, broken deployment, shared credential, or overloaded database can remove both. The improvement combines independent placement with health detection, traffic movement, state recovery, and enough capacity to serve the surviving load.
+
+## Mental Model
+
+| Pattern | Normal state | Fault behavior | Main cost |
+| --- | --- | --- | --- |
+| Active-passive | One serves, one is ready or catching up | Promote the standby | Failover time and possible lag |
+| Active-active | Multiple copies serve | Route around or rebalance | Conflict, coordination, and correlated load |
+| N-plus-one | N capacity needed, N+1 provisioned | Lose one without overload | Idle capacity |
+| Erasure/coded storage | Data split with recovery fragments | Reconstruct missing fragments | Compute, network, and repair complexity |
+
+Redundancy has layers: duplicate compute, network paths, storage media, replicas, zones, regions, and operational procedures. Fault tolerance must specify the fault model: crash, omission, corruption, delay, partition, overload, or operator error.
+
+## How It Works
+
+### The failover chain
+
+An effective redundant system needs every step:
+
+~~~text
+fault → detect → decide healthy owner → promote/recover state
+      → route traffic → serve within capacity → repair the spare
+~~~
+
+Detection can be too slow or too eager. Promotion can create a stale or conflicting owner. Routing can continue sending traffic to the failed node. The surviving fleet can be healthy but overloaded. Repair restores future tolerance; without it, a second fault can become an outage.
+
+### Independence matters
+
+Place copies across failure domains that are relevant to the requirement: processes, hosts, racks, zones, regions, or organizations. If a release bug, IAM policy, DNS provider, or operator can affect all copies, physical distance alone is not independence.
+
+State determines the pattern. Stateless compute can be active-active. A single-writer database may be active-passive with a promoted leader. Multi-writer state needs conflict resolution, ordering, or a consistency model.
+
+## Example
+
+Design a profile API that should remain usable after one host or zone failure.
+
+### Naive → failure → improvement
+
+1. **Naive:** run two application processes in one zone and store sessions locally.
+2. **Failure:** a zone outage removes both processes; even a host failure can route a returning user to a replica without the session. The database also has no failover capacity.
+3. **Improvement:** run stateless application replicas across three zones, externalize sessions, use a health-aware load balancer, and configure a database standby in another zone. Reserve N-plus-one capacity and test promotion.
+4. **New trade-off:** cross-zone traffic and shared session storage add latency and cost; promotion can expose replication lag; health checks and routing become critical dependencies.
+
+If each zone can handle only 40% of peak traffic, losing one of three zones overloads the other two. Three copies are redundant on paper but not fault tolerant at the required workload. Provision and test the failure state, not only the normal state.
+
+## Visualization We Eventually Want
+
+Create a failure-domain and failover simulator:
+
+- choose active-passive, active-active, or N-plus-one;
+- place compute and storage copies across hosts, zones, and regions;
+- inject crash, network partition, slow health check, bad release, and correlated dependency failures;
+- control detection time, promotion delay, replication lag, and failover traffic;
+- show usable capacity, correctness state, failover availability, and repair status.
+
+The visualization should make a same-zone duplicate look different from a cross-zone copy and should show the second-fault risk while a spare is being repaired.
+
+## Scaling Behavior
+
+More replicas increase read capacity and fault tolerance only until shared dependencies, coordination, or repair bandwidth saturate. Active-active systems multiply incoming work and may need conflict resolution. Active-passive systems keep normal coordination simpler but leave capacity idle and make promotion a critical path.
+
+At region scale, traffic steering and data placement become part of the redundant system. A failover region must have enough warm capacity, credentials, configuration, and current data to serve the contract. Cross-region replication can improve recovery while reducing write availability or increasing latency.
+
+## Failure Modes
+
+- **Split brain:** two leaders accept conflicting writes after a partition.
+- **False positive failure:** a slow but healthy node is removed, causing an avoidable load spike.
+- **False negative health:** traffic keeps reaching a node that cannot serve correctly.
+- **Stale standby:** promotion loses acknowledged or recent state.
+- **Thundering herd:** all clients reconnect or retry after failover.
+- **Survivor overload:** remaining replicas cannot carry peak traffic.
+- **Correlated fault:** common code, network, credentials, storage, or operator action defeats all copies.
+- **Unrepaired redundancy:** after one loss, a second fault has no spare to absorb it.
+
+Mitigate with fencing or single-owner leases, dependency-aware checks, bounded reconnection, capacity headroom, independent controls, lag monitoring, repair automation, and failure drills.
+
+## Trade-offs
+
+Redundancy costs hardware, storage, replication bandwidth, cross-zone or cross-region latency, observability, and operational complexity. Active-active can reduce failover time but introduces conflict semantics and can make debugging harder. Active-passive can preserve simple ownership but has idle cost and promotion risk.
+
+More replicas do not automatically improve reliability if the same bug or bad data is copied everywhere. Deliberate diversity and independent recovery paths can cost more but reduce correlated risk.
+
+## Alternatives
+
+- **Single instance with fast restore:** use when downtime and recovery loss are acceptable.
+- **Active-passive:** use for stateful ownership when one writer is simpler and promotion time fits the SLO.
+- **Active-active:** use for stateless or conflict-safe workloads needing low failover interruption.
+- **Quorum/majority ownership:** use when a leader or write must be acknowledged by independent members.
+- **Service degradation:** use when preserving a smaller core function is better than attempting full failover.
+
+## When to Use
+
+Introduce redundancy after naming the failure the design must survive and the capacity needed during that failure. Describe placement, state freshness, detection, promotion, routing, and repair together.
+
+## When Not to Use
+
+Do not add replicas for a recomputable cache whose source is cheaper and simpler. Do not claim fault tolerance without an independent failure domain and a tested failover path. Do not choose active-active writes when a single owner plus fast failover meets the requirement.
+
+## Common Misconceptions
+
+- **“Two copies mean two independent systems.”** Shared faults can remove both.
+- **“Failover is just a health check.”** Detection, state promotion, routing, capacity, and repair all matter.
+- **“Active-active has no downtime.”** Conflicts, routing lag, or survivor overload can still break the contract.
+- **“A standby is a backup.”** A standby can replicate corruption or deletion and may be too stale.
+- **“More replicas always improve availability.”** They can increase coordination, cost, and correlated failure surface.
+
+## Interview Lens
+
+### 30-Second Explanation
+
+> I use redundancy to remove a specific single point of failure, then design the failover behavior: detect the fault, establish one correct owner, route traffic, preserve the required state, carry the load, and repair the spare. I place copies across the relevant failure domains and account for lag, split brain, correlated failures, and survivor capacity. Active-passive is simpler for one writer; active-active fits stateless or conflict-safe work.
+
+### When to Introduce It
+
+Introduce redundancy when the availability or durability target includes host, zone, region, or operator failure. Name the fault model before choosing a replica count.
+
+### Common Follow-Ups
+
+- What happens if the health check is wrong?
+- How do you prevent split brain?
+- Is the standby current enough for acknowledged writes?
+- Can surviving replicas handle peak load?
+- How is a lost replica repaired and reintroduced?
+
+### Common Candidate Mistakes
+
+- Counting replicas without naming failure domains.
+- Ignoring state conflicts and stale promotion.
+- Assuming failover capacity equals normal capacity.
+- Failing to explain client retries and reconnection.
+- Treating a copied database as a tested backup.
+
+## Summary
+
+- Redundancy is duplicated capability; fault tolerance is correct behavior under a fault.
+- Effective failover includes detection, ownership, state, routing, capacity, and repair.
+- Independence is about shared fault modes, not just physical distance.
+- Active-passive and active-active trade simplicity, failover speed, capacity, and conflict risk.
+- Test the failure state and the second-fault state, not just healthy replicas.
+
+## Quiz Seeds
+
+1. Why can two replicas in one zone fail to improve zone-level availability?
+2. What steps besides health checking are required for failover?
+3. When is active-passive preferable to active-active?
+4. How can a healthy standby still lose acknowledged data?
+5. What is split brain and how might fencing prevent it?
+6. Why does survivor capacity matter after a replica failure?
+7. Which shared dependencies can create correlated failure across regions?
+8. Why must a failed replica be repaired promptly after failover?
+
+## Related Topics
+
+- [Durability](./durability.mdx) — define which replicated or backed-up state survives.
+- [Availability](./availability.mdx) — measure usable service through failover.
+- [CAP](./cap.mdx) — reason about consistency and availability choices during partitions.
+
+## References
+
+### Documentation / Articles
+
+- [Fault Tolerance — NIST CSRC Glossary](https://csrc.nist.gov/glossary/term/fault_tolerance) — standards-based definition of a system's ability to continue operating after faults.
+- [Reliability Pillar — AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/reliability-pillar/welcome.html) — official guidance on recovery, failure management, redundancy, and resilient workload design.
+- [Addressing Cascading Failures — Google SRE](https://sre.google/sre-book/addressing-cascading-failures/) — shows how overload and failover routing can spread a local fault and how to protect surviving capacity.
+- [Chaos Monkey](https://netflix.github.io/chaosmonkey/) — Netflix's open-source failure-injection tool and a concrete example of testing instance and service resilience.
+
+### Papers
+
+No paper is required for this operational foundation; the standards, SRE guidance, and failure-injection material cover the intended interview mechanisms.
+
+### Videos
+
+No video is included because failure-domain and failover behavior are more useful when practiced as explicit scenarios than watched as a generic overview.

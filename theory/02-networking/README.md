@@ -1,6 +1,6 @@
 # Module 02 — Networking and Communication
 
-**Status:** Scaffold only. Lesson content and interactive request-path visualizations remain to be authored.
+**Status:** Theory complete. Interactive request-path visualizations and structured quizzes remain future work; each lesson includes a behavior-focused visualization specification and quiz seeds.
 
 ## Purpose
 
@@ -17,13 +17,13 @@ The planned module is **Core**. HTTP/3/QUIC details and nuanced communication tr
 
 ## Intended lesson order
 
-1. `02-01-request-lifecycle` — Client → DNS → CDN → load balancer → gateway/proxy → application → cache → database, with the role and failure cost of each hop.
-2. `02-02-dns` — Recursive resolution, authoritative servers, TTL, caching, and geo-aware routing at a high level.
-3. `02-03-tcp-vs-udp` — Connection, reliability, ordering, retransmission, and latency implications; QUIC is introduced later without turning the lesson into a networking course.
-4. `02-04-http-evolution` — HTTP/1.1, HTTP/2 multiplexing, and HTTP/3/QUIC conceptually.
-5. `02-05-rest-rpc-grpc-graphql` — Compare coupling, schema, discoverability, payload, browser fit, internal service use, and streaming.
-6. `02-06-realtime-transports` — Short polling, long polling, server-sent events, and WebSockets for a large connected population.
-7. `02-07-api-design-interviews` — Resource modeling, pagination (cursor versus offset), filtering, versioning, idempotency keys, error semantics, request IDs, and compatibility.
+1. [`02-01-request-lifecycle`](./request-lifecycle.mdx) — Client → DNS → CDN → load balancer → gateway/proxy → application → cache → database, with the role and failure cost of each hop.
+2. [`02-02-dns`](./dns.mdx) — Recursive resolution, authoritative servers, TTL, caching, negative answers, and geo-aware routing at a high level.
+3. [`02-03-tcp-vs-udp`](./tcp-vs-udp.mdx) — Connection, reliability, ordering, retransmission, congestion, and latency implications; QUIC is introduced as a secure multiplexed transport over UDP.
+4. [`02-04-http-evolution`](./http-evolution.mdx) — HTTP/1.1, HTTP/2 framing/multiplexing, and HTTP/3/QUIC behavior, including fallback and head-of-line trade-offs.
+5. [`02-05-rest-rpc-grpc-graphql`](./rest-rpc-grpc-graphql.mdx) — Compare resource and operation contracts, schema/coupling, payload shape, browser fit, internal service use, streaming, and query cost.
+6. [`02-06-realtime-transports`](./realtime-transports.mdx) — Short polling, long polling, server-sent events, and WebSockets for connected populations, including reconnect, replay, fan-out, and backpressure.
+7. [`02-07-api-design-interviews`](./api-design-interviews.mdx) — Resource modeling, cursor versus offset pagination, filtering, versioning, compatibility, idempotency keys, error semantics, request IDs, and asynchronous status.
 
 ## Downstream connections
 
@@ -36,5 +36,4 @@ The planned module is **Core**. HTTP/3/QUIC details and nuanced communication tr
 
 ## Authoring boundary
 
-These entries are intended lesson boundaries and dependency hints, not prose. A future lesson should explain a mechanism through a concrete request path and its failure/trade-off behavior, with references validated before the lesson is considered complete.
-
+The seven indexed lessons follow the theory template, use stable curriculum IDs, link to their Module 00–02 prerequisites and related topics, and include verified protocol/API references. Future interactive work should preserve their requirement-first progression instead of presenting a finished request architecture before its constraints, failure behavior, and trade-offs are established.
