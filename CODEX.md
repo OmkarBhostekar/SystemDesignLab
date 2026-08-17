@@ -1369,17 +1369,17 @@ The application should grow only as curriculum needs it.
 
 ## Stage A — Repository and Content Foundation
 
-- [ ] Initialize Next.js project
-- [ ] Configure TypeScript strict mode
-- [ ] Configure linting / formatting
+- [x] Initialize Next.js project
+- [x] Configure TypeScript strict mode
+- [~] Configure linting / formatting — ESLint is configured; no standalone formatter is required yet
 - [x] Create `docs/`
 - [x] Add PRD
 - [x] Create `theory/`
 - [x] Add curriculum directory structure
 - [x] Add content authoring conventions
-- [ ] Add curriculum metadata/index mechanism
-- [ ] Add internal link validation
-- [ ] Add basic reference/link validation
+- [x] Add curriculum metadata/index mechanism
+- [x] Add internal link validation
+- [~] Add basic reference/link validation — local links and external URL formats are validated; network reachability remains a separate check
 
 Status: **In progress**
 
@@ -1387,22 +1387,22 @@ Status: **In progress**
 
 ## Stage B — Theory Reader
 
-- [ ] Application shell
-- [ ] Sidebar curriculum navigation
-- [ ] Theory lesson route
-- [ ] Markdown / MDX rendering
-- [ ] Syntax highlighting
-- [ ] Mermaid or equivalent static diagrams
-- [ ] Previous / Next navigation
-- [ ] Breadcrumbs
-- [ ] Topic metadata display
-- [ ] Reference section rendering
-- [ ] YouTube link/cards
+- [x] Application shell
+- [x] Sidebar curriculum navigation
+- [x] Theory lesson route
+- [x] Markdown / MDX rendering
+- [x] Syntax highlighting
+- [x] Mermaid or equivalent static diagrams
+- [x] Previous / Next navigation
+- [x] Breadcrumbs
+- [x] Topic metadata display
+- [x] Reference section rendering
+- [~] YouTube links render within references; richer cards are deferred
 - [ ] Search
-- [ ] Dark mode
-- [ ] Responsive reading layout
+- [x] Dark mode
+- [x] Responsive reading layout
 
-Status: **Not started**
+Status: **Theory-reader milestone complete; search and richer media presentation remain deferred**
 
 ---
 
@@ -1539,25 +1539,13 @@ Status: **Not started**
 
 Current milestone:
 
-> **M0 — Repository setup + complete theory curriculum authoring**
+> **M1 — Deterministic content pipeline + production-quality theory reader — Complete**
 
 Primary goal:
 
-Create the curriculum structure and begin writing high-quality theory content with verified references.
+Prove the content contract and reading experience against the 29 completed lessons in Modules 00–03. Build only the server-first theory reader, deterministic validation/indexing, and accessible reading shell described in ADR-002.
 
-Do not prioritize visualizations yet.
-
-Recommended immediate sequence:
-
-1. create repository structure,
-2. place PRD in `docs/PRD.md`,
-3. create `docs/content-guidelines.md`,
-4. create curriculum directory tree,
-5. write Module 00,
-6. write Module 01,
-7. validate lesson template,
-8. continue through remaining modules,
-9. only then build the minimal theory reader if useful during authoring.
+Do not add simulations, structured quizzes, progress persistence, knowledge maps, design labs, interview mode, authentication, a backend, or remote content storage during this milestone.
 
 ---
 
@@ -1571,17 +1559,24 @@ Update this section whenever Codex finishes a meaningful task.
 
 ## Active Milestone
 
-`M0 — Repository setup + complete theory curriculum authoring`
+`M1 — Deterministic content pipeline + production-quality theory reader — Complete`
 
 ## Currently Working On
 
-- [ ] Repository initialization
+- [x] Next.js application and theory-reader implementation
 - [x] Documentation setup
 - [x] Curriculum directory setup
-- [~] Theory authoring — Modules 00–03 complete; Module 04 next
+- [~] Theory authoring — Modules 00–03 complete; later modules remain planned
 
 ## Recently Completed
 
+- Accepted ADR-002 to begin the narrowly scoped theory-reader milestone after Modules 00–03 rather than waiting for the full curriculum.
+- Initialized Next.js 16 with React 19, strict TypeScript, Tailwind CSS, ESLint, and Vitest.
+- Implemented deterministic schema, relationship, dependency-cycle, path, and local-link validation for all 29 completed lessons.
+- Implemented `/learn`, all four module routes, and all 29 lesson routes as static server-rendered pages.
+- Added MDX/GFM rendering, highlighted code, responsive tables, strict Mermaid rendering with source fallback, metadata, references, prerequisites, breadcrumbs, and previous/next navigation.
+- Added a calm responsive reading shell with CSS light/dark themes, visible keyboard focus, a skip link, and narrow-screen overflow handling.
+- Verified content, tests, lint, strict types, production build, internal links, representative browser routes, responsive layout, keyboard focus, and useful not-found behavior.
 - Canonicalized the PRD path as `docs/PRD.md`.
 - Added project orientation, architecture, testing, content-authoring, and curriculum-map documentation.
 - Accepted the Markdown-compatible MDX and build-time content-indexing decision in ADR-001.
@@ -1595,11 +1590,10 @@ None known.
 
 ## Next Recommended Tasks
 
-1. Implement the smallest deterministic content-index and local-link validation command justified by the 29 real lessons.
-2. Author `04-databases` in dependency order, preserving its deeper subtopic boundaries.
-3. Continue with `05-caching` and `06-messaging` after validating the database lesson structure.
-4. Continue theory authoring through the remaining modules before prioritizing interactive visualizations.
-5. Initialize the strict TypeScript Next.js theory reader only after the content schema and index have been proven by real lessons.
+1. Begin **M2 — Module 04 database theory authoring through the validated content pipeline**.
+2. Use the reader during authoring to catch metadata, relationship, rendering, and readability regressions early.
+3. Consider search only after more curriculum exists; keep progress, structured quizzes, and simulations in their later planned stages.
+4. Do not begin a simulation framework until a real interactive lesson is selected and its model can drive the abstraction.
 
 ---
 
@@ -1613,6 +1607,7 @@ Record major decisions here in concise form.
 | 2026-08-18 | Local-first core product | Personal learning app does not need backend complexity initially. |
 | 2026-08-18 | Incremental visualization infrastructure | Real simulations should drive abstractions instead of speculative frameworks. |
 | 2026-08-18 | Markdown-compatible MDX lessons with a build-time index | Content remains readable outside the app while supporting validated metadata and later interactive enhancement; see ADR-001. |
+| 2026-08-18 | Begin the theory reader after Modules 00–03 | Twenty-nine real lessons are sufficient to validate the schema and reading experience before more curriculum depends on them; see ADR-002. |
 
 For decisions needing deeper context, create an ADR under `docs/decisions/`.
 

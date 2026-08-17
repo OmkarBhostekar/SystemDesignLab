@@ -8,7 +8,9 @@ The project is intentionally being built in increments. The theory curriculum is
 
 ## Current status
 
-The project is at **M0 — repository setup and theory curriculum authoring**. The repository contains the product and technical foundation, the complete dependency scaffold, and 29 completed theory lessons across Modules 00–03. The application and test harness will be introduced in later stages.
+The project has completed **M1 — deterministic content pipeline and production-quality theory reader**. The repository contains 29 completed theory lessons across Modules 00–03, a validated deterministic lesson index, and a server-rendered Next.js reader at `/learn`.
+
+The current reader includes module and lesson routes, curriculum navigation, breadcrumbs, metadata, previous/next links, GFM tables, highlighted code, Mermaid diagrams, references, responsive light/dark reading styles, and explicit theory-only states. Progress persistence, structured quizzes, simulations, search, knowledge maps, design labs, and interview mode remain deliberately deferred.
 
 Read the [product requirements](docs/PRD.md) for the learning goals, the [curriculum map](docs/curriculum-map.md) for stable lesson IDs and dependencies, the [content guidelines](docs/content-guidelines.md) for authoring conventions, the [architecture plan](docs/architecture.md) for technical boundaries, and the [testing strategy](docs/testing-strategy.md) for risk-based verification.
 
@@ -36,8 +38,9 @@ Read the [product requirements](docs/PRD.md) for the learning goals, the [curric
 │   ├── testing-strategy.md   # Verification plan
 │   └── decisions/            # Durable architecture decisions
 ├── theory/                   # Human-authored curriculum source
-├── src/                      # Next.js application and domain code (when introduced)
-└── tests/                    # Automated tests and fixtures (when introduced)
+├── scripts/                  # Content validation commands
+├── src/                      # Next.js application and deterministic content pipeline
+└── tests/                    # Content, route, and reading-shell tests
 ```
 
 The exact source layout can evolve, but responsibilities should remain clear: theory is the source of educational prose, `src/` is the application, and `tests/` verifies content, domain behavior, persistence, and interactive lessons.
@@ -71,6 +74,46 @@ This sequence keeps theory valuable before all interactive features exist and ke
 
 The first product version should work without authentication. Structured progress belongs in IndexedDB through a `ProgressRepository` abstraction; lightweight preferences may use `localStorage`. Export and import use a versioned JSON format. A future remote repository may be added without changing lesson, quiz, or simulation components.
 
-## Development guidance
+## Development
 
-Before a substantial change, read `CODEX.md` and the relevant PRD section. Implement the smallest coherent slice, keep content and application concerns separate, and verify behavior at the appropriate test layer. Record an ADR for a decision that constrains several future features or would be expensive to reverse.
+Requirements: Node.js 20.9 or newer and npm.
+
+Install dependencies:
+
+```bash
+npm install
+```
+
+Run the local development server at `http://localhost:3000`:
+
+```bash
+npm run dev
+```
+
+Validate all indexed lesson metadata, relationships, dependency cycles, and local links:
+
+```bash
+npm run validate:content
+```
+
+Run the automated tests:
+
+```bash
+npm test
+```
+
+Run strict TypeScript and ESLint checks:
+
+```bash
+npm run typecheck
+npm run lint
+```
+
+Create and serve a production build:
+
+```bash
+npm run build
+npm start
+```
+
+Before a substantial change, read `CODEX.md` and the relevant PRD section. Keep theory prose in `theory/`, preserve Server Components as the default, and record an ADR for decisions that constrain several future features or would be expensive to reverse.
