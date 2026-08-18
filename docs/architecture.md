@@ -128,10 +128,17 @@ The directories may be introduced gradually. The boundary is more important than
 2. Frontmatter and links are validated during the content build/check step.
 3. The loader parses metadata and source content into a deterministic index.
 4. Server-rendered routes use the index to resolve module and lesson navigation.
-5. The lesson renderer displays the authored theory directly and passes only serializable configuration to client enhancements.
-6. Optional `visualizationId` and `quizId` values resolve through registries; absent registrations do not make the theory lesson unusable.
+5. The lesson renderer displays the authored theory directly, except for explicitly authoring-only sections, and passes only serializable configuration to client enhancements.
+6. The authoring-only `Visualization We Eventually Want` section marks the intended insertion point. It is removed from learner-facing prose; a registered visualization replaces it at that position.
+7. Optional `visualizationId` and `quizId` values resolve through registries; absent registrations do not make the theory lesson unusable.
 
-This last rule is important during the theory-first period: a lesson can ship with theory and quiz seeds before its interactive implementation exists. The page should describe the future visualization or show a clearly labelled unavailable state rather than silently dropping the theory.
+This last rule is important during the theory-first period: a lesson can ship with theory and quiz seeds before its interactive implementation exists. Keep the surrounding theory continuous and place any compact unavailable state at the relevant stage; do not expose authoring roadmap prose or interrupt the theory with a blocking warning.
+
+### Lesson composition contract
+
+The desktop route uses a broad two-column learning shell: curriculum navigation plus the remaining lesson canvas. Context such as prerequisites and progress belongs in the lesson header rather than a generic third rail that compresses the content. Prose keeps a readable measure while tables, diagrams, code, and simulations may use the full lesson-content width.
+
+The visible sequence is motivation/theory → visualization → deeper analysis → practice. Stage navigation links to real semantic sections and does not imply completion. Detailed layout, ordering, responsive, availability, and review rules live in [`lesson-page-guidelines.md`](lesson-page-guidelines.md).
 
 ### Content/index invariants
 

@@ -2,7 +2,7 @@
 
 The System Design Visual Learning Lab is a theory-first, local-first learning application for backend and software-engineering system-design interviews. It teaches the reasoning behind an architecture through a repeatable loop:
 
-> **Theory → Visualization → Quiz → Interview Lens → Applied Design**
+> **Theory → Visualization → Interview Lens → Quiz → Applied Design**
 
 > [!IMPORTANT]
 > This is an in-progress project. The complete theory curriculum, reader, local progress workflow, two representative structured quiz slices, and two interactive simulation experiences are usable today. Broader quiz and visualization coverage, search, and other learning tools are still under development. APIs, content organization, and UI details may change between releases.
@@ -13,9 +13,9 @@ The project is intentionally being built in increments. The theory curriculum is
 
 The project has completed **M5 — the visualization foundation and first simulations**. The repository contains 135 completed theory lessons across all 14 modules, including 20 Markdown-first design labs, a validated deterministic lesson index, a server-rendered Next.js reader at `/learn`, local progress backed by IndexedDB, structured quizzes for Back-of-the-Envelope Estimation and Consistent Hashing, and interactive simulations for Horizontal vs Vertical Scaling and Consistent Hashing.
 
-The current reader includes routes for all modules and lessons, curriculum navigation, breadcrumbs, metadata, previous/next links, GFM tables, highlighted code, Mermaid diagrams, references, responsive light/dark reading styles, and explicit theory-only states. Learners can mark theory complete, explore deterministic scenarios with keyboard-accessible simulation controls, inject and recover failures, inspect metrics and a bounded event timeline, save completed scenarios, answer typed quizzes where registered, receive explanations and concept feedback, retry weak questions, persist attempts, advance progress, export/import versioned JSON, and reset local progress. Additional structured quizzes and simulations, search, knowledge maps, the interactive design-lab workspace, and interview mode remain deliberately deferred.
+The current reader includes routes for all modules and lessons, curriculum navigation, breadcrumbs, metadata, previous/next links, GFM tables, highlighted code, Mermaid diagrams, references, responsive light/dark reading styles, a persistent no-layout-shift Focus Mode, and explicit theory-only states. Learners can mark theory complete, explore deterministic scenarios with keyboard-accessible simulation controls, inject and recover failures, inspect metrics and a bounded event timeline, save completed scenarios, answer typed quizzes where registered, receive explanations and concept feedback, retry weak questions, persist attempts, advance progress, export/import versioned JSON, and reset local progress. Additional structured quizzes and simulations, search, knowledge maps, the interactive design-lab workspace, and interview mode remain deliberately deferred.
 
-Read the [product requirements](docs/PRD.md) for the learning goals, the [curriculum map](docs/curriculum-map.md) for stable lesson IDs and dependencies, the [content guidelines](docs/content-guidelines.md) for authoring conventions, the [architecture plan](docs/architecture.md) for technical boundaries, and the [testing strategy](docs/testing-strategy.md) for risk-based verification.
+Read the [product requirements](docs/PRD.md) for the learning goals, the [curriculum map](docs/curriculum-map.md) for stable lesson IDs and dependencies, the [content guidelines](docs/content-guidelines.md) for authoring conventions, the [lesson page guidelines](docs/lesson-page-guidelines.md) for desktop composition and learning order, the [architecture plan](docs/architecture.md) for technical boundaries, and the [testing strategy](docs/testing-strategy.md) for risk-based verification.
 
 ## Product principles
 
@@ -37,6 +37,7 @@ Read the [product requirements](docs/PRD.md) for the learning goals, the [curric
 │   ├── PRD.md                # Product requirements and curriculum scope
 │   ├── curriculum-map.md     # Canonical modules, lesson IDs, and dependencies
 │   ├── content-guidelines.md # MDX schema, lesson template, and reference rules
+│   ├── lesson-page-guidelines.md # Desktop lesson composition and stage ordering
 │   ├── architecture.md       # Technical boundaries and implementation stages
 │   ├── testing-strategy.md   # Verification plan
 │   └── decisions/            # Durable architecture decisions
@@ -154,6 +155,7 @@ Before opening a pull request:
 
 - read [`CODEX.md`](CODEX.md) and the relevant section of the [`PRD`](docs/PRD.md);
 - follow the [`content guidelines`](docs/content-guidelines.md) for curriculum changes;
+- follow the [`lesson page guidelines`](docs/lesson-page-guidelines.md) for lesson-shell or visualization placement changes;
 - preserve the stable lesson IDs and dependencies in the [`curriculum map`](docs/curriculum-map.md);
 - keep theory prose in `theory/` and application code in `src/`;
 - run `npm run validate:content`, `npm test`, `npm run typecheck`, `npm run lint`, and `npm run build`;

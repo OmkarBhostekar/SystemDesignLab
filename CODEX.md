@@ -21,7 +21,7 @@ Build a local-first interactive system-design learning application for backend/s
 
 The learning loop is:
 
-> **Theory → Visualization → Quiz → Interview Lens → Applied Design**
+> **Theory → Visualization → Interview Lens → Quiz → Applied Design**
 
 The project must prioritize:
 
@@ -235,7 +235,7 @@ Use a concrete backend/system-design scenario.
 
 ## Visualization We Eventually Want
 
-Describe the future interactive visualization or simulation.
+Describe the future interactive visualization or simulation. This is an authoring-only specification and insertion marker; the learner-facing route must not render it as lesson prose.
 
 Do not implement it merely because this section exists.
 
@@ -590,6 +590,8 @@ Interactive components can enhance theory but should not replace it.
 
 Visualizations exist to demonstrate behavior.
 
+Follow [`docs/lesson-page-guidelines.md`](docs/lesson-page-guidelines.md) for learner-facing order and desktop composition. A registered visualization replaces the authoring-only specification at its authored position after the motivating theory and example.
+
 Do not build animations that are merely decorative.
 
 A visualization should answer at least one of:
@@ -843,6 +845,10 @@ A theory lesson is considered complete when:
 An interactive lesson is considered complete when:
 
 - [ ] theory renders correctly
+- [ ] learner order is theory foundation → visualization → deeper analysis → practice
+- [ ] authoring-only visualization specification is not rendered
+- [ ] desktop composition is verified at 1440 × 1000 and 1366 × 768
+- [ ] stage navigation links to real sections without implying completion
 - [ ] visualization teaches a real behavior
 - [ ] visualization has appropriate controls
 - [ ] failure/scenario behavior is included where useful
@@ -909,7 +915,7 @@ When creating or substantially revising theory:
 6. synthesize the concept in original language,
 7. create the lesson using the standard lesson structure,
 8. add links to prerequisite and next concepts,
-9. add future visualization specification,
+9. add the authoring-only future visualization specification at the intended learner insertion point,
 10. add quiz seeds,
 11. validate links,
 12. update curriculum progress below.

@@ -1,6 +1,6 @@
 # Theory Content Guidelines
 
-This document defines how lessons are authored, indexed, linked, and reviewed for the System Design Visual Learning Lab. It complements the curriculum and product requirements in [`docs/PRD.md`](PRD.md) and the operating rules in [`CODEX.md`](../CODEX.md).
+This document defines how lessons are authored, indexed, linked, and reviewed for the System Design Visual Learning Lab. It complements the curriculum and product requirements in [`docs/PRD.md`](PRD.md), the learner-facing composition rules in [`lesson-page-guidelines.md`](lesson-page-guidelines.md), and the operating rules in [`CODEX.md`](../CODEX.md).
 
 ## Source and format
 
@@ -150,7 +150,7 @@ Work through a concrete backend or system-design scenario.
 
 ## Visualization We Eventually Want
 
-Describe the behavior an interactive visualization should expose. Include meaningful controls, metrics, and failure/scenario changes. This is a specification, not a request to implement the visualization in the lesson.
+Describe the behavior an interactive visualization should expose. Include meaningful controls, metrics, and failure/scenario changes. This is an authoring-only specification and insertion marker, not learner-facing prose and not a request to implement the visualization in the lesson.
 
 ## Scaling Behavior
 
@@ -227,6 +227,8 @@ Add 5–10 question ideas covering recall, trade-offs, failure behavior, archite
 ```
 
 The core body should normally contain **motivation, mental model, mechanics, example, trade-offs, use/non-use guidance, interview lens, quiz seeds, related topics, and references**. Scaling, failure, alternatives, misconceptions, summary, and visualization details are expected whenever the concept has those dimensions; do not add filler headings to meet a checklist.
+
+The renderer removes `Visualization We Eventually Want` from learner-facing prose. When `visualizationId` is registered, the interactive experience replaces that section at the same teaching position. Without a registered visualization, the surrounding theory remains continuous; roadmap specifications must never appear as a substitute learner experience. See [`lesson-page-guidelines.md`](lesson-page-guidelines.md) for the complete ordering and availability contract.
 
 Follow the PRD's progressive-reveal style when teaching architecture: `naive design → failure or limitation → improvement → new trade-off`. A component should appear because a demonstrated requirement or failure motivates it.
 

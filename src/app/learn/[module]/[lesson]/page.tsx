@@ -70,46 +70,67 @@ export default async function LessonPage({ params }: LessonPageProps) {
   const visualizationAvailable = visualization?.lessonId === lesson.id;
   const quiz = getQuiz(lesson.quizId);
   const quizAvailable = quiz?.lessonId === lesson.id;
+  const lessonContent = splitSourceAroundVisualization(source);
 
   return (
     <ReadingFrame
       className="lesson-page"
       sidebar={<CurriculumSidebar modules={navigation} activeLessonId={lesson.id} activeModuleId={moduleRecord.id} />}
       breadcrumbs={<Breadcrumbs items={breadcrumbsForLesson(moduleRecord, lesson)} />}
-      rail={<LessonRail lesson={summary} prerequisites={prerequisites} />}
     >
       <article className="lesson-article">
         <header className="lesson-article__header">
-          <p className="eyebrow">{moduleRecord.title}</p>
-          <h1>{lesson.title}</h1>
-          <p className="lesson-article__description">{lesson.description}</p>
-          <LessonMetadata lesson={summary} />
+          <div className="lesson-article__heading">
+            <p className="eyebrow">{moduleRecord.title}</p>
+            <h1>{lesson.title}</h1>
+            <p className="lesson-article__description">{lesson.description}</p>
+            <LessonMetadata lesson={summary} />
+          </div>
+          <aside className="lesson-article__setup" aria-label="Lesson setup">
+            <LessonPrerequisites prerequisites={prerequisites} />
+            <LessonProgressControl lessonId={lesson.id} />
+          </aside>
           <LessonStepper
             visualizationAvailable={visualizationAvailable}
             quizAvailable={quizAvailable}
           />
-          <LessonProgressControl lessonId={lesson.id} />
         </header>
 
-        <TheoryOnlyState
-          visualizationId={lesson.visualizationId}
-          quizId={lesson.quizId}
-          visualizationAvailable={visualizationAvailable}
-          quizAvailable={quizAvailable}
-        />
+        <section id="theory" className="lesson-stage lesson-stage--theory" aria-label="Theory">
+          <MdxContent
+            source={lessonContent.beforeVisualization}
+            title={lesson.title}
+            sourcePath={sourceRecord.sourcePath}
+            lessons={lessonSummaries}
+          />
+        </section>
 
         {visualizationAvailable && visualization ? (
-          <VisualizationPanel visualization={visualization} />
+          <section id="visualization" className="lesson-stage lesson-stage--visualization" aria-label="Visualization">
+            <VisualizationPanel visualization={visualization} />
+          </section>
         ) : null}
 
-        <MdxContent
-          source={source}
-          title={lesson.title}
-          sourcePath={sourceRecord.sourcePath}
-          lessons={lessonSummaries}
-        />
+        {lessonContent.afterVisualization ? (
+          <section className="lesson-stage lesson-stage--deep-dive" aria-label="Theory continued">
+            <MdxContent
+              source={lessonContent.afterVisualization}
+              sourcePath={sourceRecord.sourcePath}
+              lessons={lessonSummaries}
+            />
+          </section>
+        ) : null}
 
-        {quizAvailable && quiz ? <QuizPanel quiz={quiz} /> : null}
+        <section id="practice" className="lesson-stage lesson-stage--practice" aria-label="Practice">
+          {quizAvailable && quiz ? <QuizPanel quiz={quiz} /> : (
+            <TheoryOnlyState
+              visualizationId={lesson.visualizationId}
+              quizId={lesson.quizId}
+              visualizationAvailable={visualizationAvailable}
+              quizAvailable={quizAvailable}
+            />
+          )}
+        </section>
 
         <GenericLessonNavigation
           previous={adjacent.previous ? toNavigationItem(adjacent.previous) : undefined}
@@ -120,35 +141,48 @@ export default async function LessonPage({ params }: LessonPageProps) {
   );
 }
 
-function LessonRail({
-  lesson,
+function LessonPrerequisites({
   prerequisites,
 }: {
-  lesson: ReturnType<typeof toLessonSummary>;
   prerequisites: ReturnType<typeof getPrerequisiteLessons>;
 }) {
+  if (prerequisites.length === 0) return null;
+
   return (
-    <div className="lesson-rail">
-      <section aria-labelledby="lesson-takeaway-title">
-        <p className="eyebrow">Keep in mind</p>
-        <h2 id="lesson-takeaway-title">Why this exists</h2>
-        <p>{lesson.description}</p>
-      </section>
-      {prerequisites.length > 0 ? (
-        <section aria-labelledby="lesson-prerequisites-title">
-          <p className="eyebrow">Build from here</p>
-          <h2 id="lesson-prerequisites-title">Prerequisites</h2>
-          <ul>
-            {prerequisites.map((prerequisite) => (
-              <li key={prerequisite.id}>
-                <Link href={lessonRoute(prerequisite.module, prerequisite.slug)}>{prerequisite.title}</Link>
-              </li>
-            ))}
-          </ul>
-        </section>
-      ) : null}
-    </div>
+    <section className="lesson-prerequisites" aria-labelledby="lesson-prerequisites-title">
+      <p className="eyebrow">Before you start</p>
+      <h2 id="lesson-prerequisites-title">Prerequisites</h2>
+      <ul>
+        {prerequisites.map((prerequisite) => (
+          <li key={prerequisite.id}>
+            <Link href={lessonRoute(prerequisite.module, prerequisite.slug)}>{prerequisite.title}</Link>
+          </li>
+        ))}
+      </ul>
+    </section>
   );
+}
+
+function splitSourceAroundVisualization(source: string): {
+  beforeVisualization: string;
+  afterVisualization: string;
+} {
+  const marker = /^## Visualization We Eventually Want\s*$/m;
+  const markerMatch = marker.exec(source);
+  if (!markerMatch || markerMatch.index === undefined) {
+    return { beforeVisualization: source, afterVisualization: "" };
+  }
+
+  const afterMarkerStart = markerMatch.index + markerMatch[0].length;
+  const nextHeading = /^##\s+/m.exec(source.slice(afterMarkerStart));
+  const afterVisualization = nextHeading
+    ? source.slice(afterMarkerStart + nextHeading.index)
+    : "";
+
+  return {
+    beforeVisualization: source.slice(0, markerMatch.index).trimEnd(),
+    afterVisualization: afterVisualization.trimStart(),
+  };
 }
 
 function toNavigationItem(lesson: ReturnType<typeof getReaderModules>[number]["lessons"][number]): LessonNavigationItem {

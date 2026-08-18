@@ -2173,31 +2173,33 @@ Clicking a topic opens a preview card:
 
 # 10. Lesson Page UX
 
-Desktop layout:
+Desktop layout (conceptual; the durable implementation contract is in [`lesson-page-guidelines.md`](lesson-page-guidelines.md)):
 
 ```text
 ┌─────────────────────────────────────────────────────────────────┐
 │ Header / Search / Progress                                      │
-├───────────────┬────────────────────────────────┬────────────────┤
-│ Curriculum    │ Lesson                         │ Mental Model   │
-│               │                                │                │
-│ Foundations   │  Consistent Hashing            │ Key takeaway   │
-│ Networking    │                                │                │
-│ Database      │  [Theory] [Visual] [Quiz]      │ Interview tip  │
-│ Caching       │                                │                │
-│ ...           │                                │ Prerequisites  │
-└───────────────┴────────────────────────────────┴────────────────┘
+├───────────────┬─────────────────────────────────────────────────┤
+│ Curriculum    │ Lesson canvas                                   │
+│               │                                                 │
+│ Foundations   │ Consistent Hashing        Prerequisites/Progress│
+│ Networking    │                                                 │
+│ Database      │ [Theory] [Visual] [Quiz]                        │
+│ Caching       │                                                 │
+│ ...           │ Readable prose + full-width learning stages     │
+└───────────────┴─────────────────────────────────────────────────┘
 ```
 
 The main lesson should have a prominent stepper:
 
 ```text
-1 Theory → 2 Visualize → 3 Quiz → 4 Interview Lens
+1 Theory → 2 Visualize → 3 Interview Lens → 4 Practice
 ```
 
-Do not hide visualization underneath a long article.
+Do not hide the visualization after the entire article or place it before the theory needed to understand it. Introduce the problem, mental model, mechanics, and example first; insert the visualization at the authored teaching point; then continue into failures, trade-offs, and interview analysis.
 
 Visualization should feel like an equal part of the lesson.
+
+The desktop shell must not squeeze that equal part into a narrow center column. Prefer curriculum navigation plus a broad lesson canvas; keep contextual prerequisites/progress in the header instead of a generic third rail. Prose may use a readable measure while diagrams and simulations use the wider canvas.
 
 ---
 

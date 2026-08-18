@@ -1,5 +1,6 @@
 import Link from "next/link";
 
+import { FocusModeToggle } from "@/components/layout/FocusModeToggle";
 import type { PrimaryNavigationItem } from "@/components/navigation/types";
 
 const DEFAULT_NAVIGATION: readonly PrimaryNavigationItem[] = [
@@ -59,6 +60,8 @@ export function SiteHeader({
             <kbd aria-hidden="true">⌘K</kbd>
           </Link>
         ) : null}
+
+        <FocusModeToggle />
       </div>
     </header>
   );
