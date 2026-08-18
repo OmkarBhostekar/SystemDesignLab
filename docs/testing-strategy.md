@@ -137,13 +137,17 @@ Use small fixed fixtures for readable assertions and property-based or randomize
 Focus component tests on behavior visible to a learner:
 
 - lesson navigation preserves the active lesson and step,
-- a theory-only lesson still renders its prose and an appropriate unavailable state,
+- stage navigation links to the real theory, visualization, practice, and interview sections that exist,
+- a theory-only lesson still renders continuous prose and a compact unavailable state at the relevant stage,
+- a registered visualization replaces its authoring-only specification at the authored position,
+- the visible route order is theory foundation → visualization → deeper analysis → practice,
 - quiz controls work by keyboard and expose feedback after submission,
 - progress actions show pending, success, and failure states,
 - simulation controls update the accessible status text as well as the visual model,
 - reset returns controls and explanation state to the initial scenario,
 - reduced-motion mode removes or shortens animation without removing state changes,
 - client-only storage is not touched during server rendering.
+- focus mode persists across reloads, keeps its exit control available, and restores hidden navigation when disabled.
 
 Integration tests should exercise the seams that are easy to get wrong:
 
@@ -154,6 +158,8 @@ Integration tests should exercise the seams that are easy to get wrong:
 5. export/import restores a learner's state across a fresh repository instance.
 
 Prefer accessible queries and user-level events. Avoid asserting implementation-specific class names or internal React state.
+
+For lesson-shell changes, add route or integration coverage for composition semantics rather than CSS class snapshots. At minimum, protect removal of the authoring-only visualization section, the simulation insertion point, real step anchors, and theory-only fallback behavior.
 
 ## Critical end-to-end journeys
 
@@ -216,6 +222,10 @@ Performance checks should protect the desktop-first reading experience:
 - a high-QPS scenario should aggregate or sample entities rather than render thousands of DOM nodes,
 - roadmap rendering should remain responsive with the full planned topic graph,
 - play/step controls should not leak timers or continue updating after unmount/reset.
+
+Substantial lesson-layout changes also require visual QA at 1440 × 1000 and 1366 × 768. Check that the curriculum sidebar does not squeeze the lesson, prose retains a readable measure, the visualization can use the wider canvas, controls and metrics remain legible, and no duplicate right rail or horizontal page overflow appears. Capture before/after screenshots when changing the overall composition.
+
+For Focus Mode, compare the lesson-content bounds before and after toggling. The surrounding chrome may fade and become non-interactive, but its reserved space and the lesson canvas dimensions must remain unchanged.
 
 Measure representative scenarios instead of setting an arbitrary global score. Record regressions when a visualization changes its rendering strategy or logical entity count.
 

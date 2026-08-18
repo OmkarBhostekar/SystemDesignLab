@@ -2,6 +2,14 @@
 
 These conventions govern interactive curriculum visualizations. They exist to keep behavior, explanations, and accessibility consistent without forcing lesson-specific engines into a generic simulation language.
 
+For where a visualization appears and how much page width it receives, follow the canonical [`lesson-page-guidelines.md`](lesson-page-guidelines.md).
+
+## Lesson placement and desktop composition
+
+Insert a registered visualization at the lesson's authoring-only `Visualization We Eventually Want` marker, after the motivating theory and concrete example. Never render the specification beside the finished simulation, place the simulation before its conceptual setup, or move every simulation to a generic page-bottom slot.
+
+On desktop, the visualization stage may use the full lesson-content width even when prose uses a narrower readable measure. Avoid a third page rail that squeezes the experience. Group playback and scenario controls by task, then give the diagram, synchronized explanation, exact metrics, bounded timeline, and checkpoint enough room to form a clear hierarchy. Validate the composed lesson at 1440 × 1000 and 1366 × 768, not only the visualization component in isolation.
+
 ## Model before renderer
 
 Every visualization starts with a deterministic, serializable model. Lesson-specific engines accept validated state plus an action and return the next state, events, and derived metrics. Engines must not read browser APIs, current time, or ambient randomness. If randomness is educationally necessary, the seed is explicit and test fixtures fix it.
@@ -73,4 +81,4 @@ At `prefers-reduced-motion: reduce`, autoplay is disabled and CSS transitions ar
 
 ## Verification checklist
 
-For each interactive lesson, test deterministic engine transitions and invariants separately from renderer behavior. Then verify native keyboard operation, Play/Pause/Step/Reset, scenario loading, failure and recovery, reduced motion, timer cleanup, text alternatives, storage success/failure, refresh persistence, narrow-width overflow, and a theory-only lesson without a registry entry.
+For each interactive lesson, test deterministic engine transitions and invariants separately from renderer behavior. Then verify native keyboard operation, Play/Pause/Step/Reset, scenario loading, failure and recovery, reduced motion, timer cleanup, text alternatives, storage success/failure, refresh persistence, narrow-width overflow, desktop composition at the required viewports, correct theory/visualization/practice order, removal of the authoring-only specification, and a theory-only lesson without a registry entry.

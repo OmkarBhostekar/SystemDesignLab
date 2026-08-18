@@ -1,8 +1,8 @@
 /** @vitest-environment jsdom */
 
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import "@testing-library/jest-dom/vitest";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { AppShell } from "@/components/layout/AppShell";
 import { SkipLink } from "@/components/layout/SkipLink";
@@ -35,7 +35,28 @@ const modules = [
 ];
 
 describe("reading shell", () => {
-  afterEach(() => cleanup());
+  beforeEach(() => {
+    const values = new Map<string, string>();
+    Object.defineProperty(window, "localStorage", {
+      configurable: true,
+      value: {
+        clear: () => values.clear(),
+        getItem: (key: string) => values.get(key) ?? null,
+        key: (index: number) => [...values.keys()][index] ?? null,
+        get length() {
+          return values.size;
+        },
+        removeItem: (key: string) => values.delete(key),
+        setItem: (key: string, value: string) => values.set(key, value),
+      } satisfies Storage,
+    });
+  });
+
+  afterEach(() => {
+    cleanup();
+    window.localStorage.clear();
+    delete document.documentElement.dataset.focusMode;
+  });
 
   it("exposes the skip target and a named primary navigation landmark", () => {
     render(
@@ -50,6 +71,27 @@ describe("reading shell", () => {
     expect(screen.getByRole("link", { name: "Skip to main content" })).toHaveAttribute("href", "#main-content");
     expect(screen.getByRole("main")).toHaveAttribute("id", "main-content");
     expect(screen.getByRole("navigation", { name: "Primary navigation" })).toBeInTheDocument();
+  });
+
+  it("toggles and persists focus mode without removing the surrounding layout", async () => {
+    render(
+      <AppShell>
+        <p>Lesson content</p>
+      </AppShell>,
+    );
+
+    const toggle = screen.getByRole("button", { name: "Focus mode" });
+    fireEvent.click(toggle);
+
+    expect(screen.getByRole("button", { name: "Exit focus mode" })).toHaveAttribute("aria-pressed", "true");
+    expect(document.documentElement).toHaveAttribute("data-focus-mode", "true");
+    expect(window.localStorage.getItem("system-design-lab:focus-mode")).toBe("true");
+
+    fireEvent.click(screen.getByRole("button", { name: "Exit focus mode" }));
+
+    await waitFor(() => expect(document.documentElement).toHaveAttribute("data-focus-mode", "false"));
+    expect(screen.getByRole("button", { name: "Focus mode" })).toHaveAttribute("aria-pressed", "false");
+    expect(window.localStorage.getItem("system-design-lab:focus-mode")).toBe("false");
   });
 
   it("marks the active lesson and keeps locked lessons out of the tab order", () => {
