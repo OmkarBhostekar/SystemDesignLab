@@ -9,6 +9,10 @@ import {
 } from "@/content/pipeline";
 import type { ContentIndex, LessonRecord, ModuleRecord } from "@/content/types";
 import { assertQuizRegistryLessonIds, listQuizIds } from "@/content/quizzes";
+import {
+  assertVisualizationRegistryLessonIds,
+  listVisualizationIds,
+} from "@/content/visualizations";
 
 import {
   findLesson,
@@ -24,8 +28,12 @@ import {
  * same production records while preserving a synchronous, testable loader contract.
  */
 export const getReaderIndex = cache((): ContentIndex => {
-  const index = loadContentIndex({ quizIds: listQuizIds() });
+  const index = loadContentIndex({
+    quizIds: listQuizIds(),
+    visualizationIds: listVisualizationIds(),
+  });
   assertQuizRegistryLessonIds(index.lessons.map((lesson) => lesson.id));
+  assertVisualizationRegistryLessonIds(index.lessons.map((lesson) => lesson.id));
   return index;
 });
 

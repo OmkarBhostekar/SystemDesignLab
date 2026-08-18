@@ -1,5 +1,9 @@
 import { ContentValidationError, validateContent } from "../src/content/index";
 import { assertQuizRegistryLessonIds, listQuizIds } from "../src/content/quizzes";
+import {
+  assertVisualizationRegistryLessonIds,
+  listVisualizationIds,
+} from "../src/content/visualizations";
 
 function main(): void {
   const args = new Set(process.argv.slice(2));
@@ -7,6 +11,7 @@ function main(): void {
     validateLocalLinks: !args.has("--no-links"),
     includeEmptyModules: args.has("--include-empty-modules"),
     quizIds: listQuizIds(),
+    visualizationIds: listVisualizationIds(),
   });
 
   if (!result.ok || !result.index) {
@@ -26,6 +31,7 @@ function main(): void {
 
   const { index } = result;
   assertQuizRegistryLessonIds(index.lessons.map((lesson) => lesson.id));
+  assertVisualizationRegistryLessonIds(index.lessons.map((lesson) => lesson.id));
   const lessonSummary = index.modules
     .map((module) => `${module.id} (${module.lessons.length})`)
     .join(", ");
