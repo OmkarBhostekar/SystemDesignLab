@@ -53,15 +53,22 @@ The learning domain must not depend on a remote API in the first version. Persis
 ```ts
 interface ProgressRepository {
   getLessonProgress(lessonId: string): Promise<LessonProgress | null>;
-  saveLessonProgress(progress: LessonProgress): Promise<void>;
-  recordQuizAttempt(attempt: QuizAttempt): Promise<void>;
+  listLessonProgress(): Promise<LessonProgress[]>;
+  saveLessonProgress(progress: LessonProgress): Promise<LessonProgress>;
+  applyLessonMilestone(lessonId, milestone): Promise<LessonProgress>;
+  getQuizAttempt(attemptId: string): Promise<QuizAttempt | null>;
+  listQuizAttempts(): Promise<QuizAttempt[]>;
+  saveQuizAttempt(attempt: QuizAttempt): Promise<QuizAttempt>;
+  getSimulationCompletion(completionId: string): Promise<SimulationCompletion | null>;
+  listSimulationCompletions(): Promise<SimulationCompletion[]>;
+  saveSimulationCompletion(completion: SimulationCompletion): Promise<SimulationCompletion>;
   exportProgress(): Promise<ProgressExport>;
-  importProgress(data: ProgressExport): Promise<void>;
-  resetProgress(): Promise<void>;
+  importProgress(data: unknown): Promise<void>;
+  resetProgress(scope: ProgressResetScope): Promise<void>;
 }
 ```
 
-The initial adapter is an IndexedDB-backed repository. An in-memory adapter is useful for tests. A future remote-sync adapter should satisfy the same domain contract rather than forcing a rewrite of learning components.
+The initial adapters are an IndexedDB-backed repository and a deterministic in-memory repository. M4 extends the shared contract with immutable quiz attempts: the caller creates one stable attempt ID per logical submission, identical re-saves are idempotent, conflicting ID reuse fails, and each retry uses a fresh ID. M5 adds immutable simulation completions identified by visualization and scenario. Saving a completion atomically advances the lesson monotonically to `visualization-complete`; only an explicitly completed engine scenario is saved. A future remote-sync adapter should satisfy the same domain behavior rather than forcing a rewrite of learning components. See ADR-003, ADR-004, and ADR-005.
 
 ### Simulations are models first and renderers second
 
@@ -79,7 +86,7 @@ The engine owns rules, transitions, failure injection, and metrics. React Flow, 
 
 ### Abstractions follow evidence
 
-The first simulation should be implemented as a real lesson. After two or three simulations reveal genuinely shared controls or event semantics, extract small primitives such as play/pause/step/reset, scenario presets, event timelines, and metric panels. Do not create a generic simulation DSL, large global store, or broad plugin system in anticipation of every future visualization.
+M5 implements the first two simulations as real lessons and extracts only the shared controls they proved useful: play/pause/step/reset, speed, scenario presets, a bounded event timeline, metrics, failure actions, completion state, and storage feedback. It deliberately does not create a generic simulation DSL, large global store, or broad plugin system in anticipation of every future visualization.
 
 ## System shape
 
@@ -159,6 +166,8 @@ Not Started → Theory Complete → Visualization Complete → Quiz Passed → M
 
 The domain may also record quiz attempts, incorrect concept tags, completed scenarios, review dates, and design-lab attempts. State transitions should be explicit and idempotent. A reset is an intentional operation, not an accidental consequence of a failed read or a missing browser store.
 
+M3 persists one compact record per stable lesson ID. Absence means not started. Ordinary saves and milestone commands take the later stage, so repeated commands are idempotent and stale callers cannot regress a lesson. Curriculum summaries count theory or any later stage as theory complete; continue learning selects the first lesson in deterministic curriculum order that has not reached theory complete.
+
 ### Storage
 
 - IndexedDB stores structured progress, attempts, review data, and design-lab state when those features exist.
@@ -166,6 +175,8 @@ The domain may also record quiz attempts, incorrect concept tags, completed scen
 - Store names and serialized records are versioned so migrations can be introduced before schema changes reach users.
 - Exported JSON includes a schema version and enough data to restore progress without a server account.
 - Import validates the envelope before writing. Invalid or unsupported exports must not partially replace existing progress.
+
+The concrete browser database is `system-design-visual-learning-lab-progress`, database version 4. `lesson-progress` is keyed by `lessonId`, `quiz-attempts` by `attemptId`, and M5's `simulation-completions` by `completionId`. The adapter opens and closes the database lazily for each operation, never at module evaluation. Version-4 exports contain `format`, `schemaVersion`, stable-ID-sorted lessons, quiz attempts, and simulation completions. Versions 1, 2, and 3 migrate in memory with collections introduced later left empty. Import is replace-not-merge and clears plus writes all three stores in one read/write transaction after full validation. Reset targets all learning progress or selected lesson IDs and clears matching attempts and completions without touching preferences. IndexedDB request, transaction, open, migration, and availability failures surface as `ProgressStorageError` rather than empty or successful results.
 
 No authentication, hosted database, analytics pipeline, or remote synchronization is required for the first version. These can be added as adapters and explicit product decisions later.
 
@@ -181,7 +192,7 @@ Question data is structured and addressable by lesson and concept tags. Evaluati
 type QuizQuestion = {
   id: string;
   lessonId: string;
-  type: "single-choice" | "multi-choice" | "numeric" | "architecture";
+  type: "single-choice" | "multiple-choice" | "numeric-estimation";
   prompt: string;
   options?: string[];
   correctAnswer: unknown;
@@ -190,7 +201,7 @@ type QuizQuestion = {
 };
 ```
 
-During theory authoring, `Quiz Seeds` may remain in the lesson until a quiz implementation exists. The seed is not a substitute for answer data and evaluation rules.
+Every question is worth one point. Single choice requires an exact option, multiple choice uses order-independent exact-set matching with no partial credit, and numeric estimates use an inclusive absolute tolerance plus a case-insensitive exact unit. Evaluation returns explanations and incorrect concept tags, and a score of at least 80% passes the shipped quizzes. During theory authoring, `Quiz Seeds` remain readable in every lesson; only selected seeds move into the separate typed registry. The seed is not a substitute for answer data and evaluation rules.
 
 ### Simulations
 
@@ -261,7 +272,7 @@ Exit when theory can be read comfortably on a fresh session without client-side 
 
 ### Stage 2 — Local progress
 
-Deliver:
+Delivered in M3:
 
 - progress domain types and transitions,
 - `ProgressRepository` contract,
@@ -269,28 +280,33 @@ Deliver:
 - mark theory complete, continue-learning display, export/import/reset,
 - persistence tests.
 
-Exit when a learner can close and reopen the browser and retain progress without a server.
+The learner can close and reopen the browser and retain progress without a server. The reader keeps its Server Component routes; only the overview and lesson progress controls are client boundaries.
 
 ### Stage 3 — Quiz system
 
-Deliver:
+Delivered in M4:
 
 - structured question schema and registry,
 - pure evaluation for initial question types,
 - answer explanations, scoring, concept tags, retries, and attempt persistence,
 - an end-to-end theory → quiz → progress path for one or two lessons.
 
-Exit when quiz behavior is testable without React and a learner can identify weak concepts from an attempt.
+The `00-03-estimation` and `04-10-consistent-hashing` lessons now complete real theory → quiz → progress slices. Quiz behavior is testable without React, and persisted failed attempts identify weak concepts without storing hidden answer keys.
 
 ### Stage 4 — First simulation experiences
 
-Start with one simple and one more stateful visualization from the PRD (for example, horizontal scaling and consistent hashing). Keep engines separate from renderers. Extract shared controls only after the implementations expose true duplication.
+Delivered in M5:
+
+- a shared accessible simulation shell and narrow dynamically loaded client boundary,
+- deterministic model/renderer separation for Horizontal Scaling and Consistent Hashing,
+- scenario presets, failure injection, metrics, bounded event timelines, and reduced-motion support,
+- explicit per-scenario completion persistence and a complete theory → visualization → quiz → progress slice for Consistent Hashing.
 
 Exit when simulation state transitions are deterministic and tested, controls are keyboard accessible, reduced motion is supported, and a lesson remains understandable with the visual disabled.
 
 ### Stage 5 — Reuse and design labs
 
-Add the simulation shell, event timeline, metric panel, scenario presets, knowledge-map connections, review mode, and design-lab workspace in response to validated curriculum needs. Reuse registered lessons and domains; avoid a second set of rules for standalone tools or labs.
+Extend the proven simulation shell, event timeline, metric panel, and scenario presets only as new topics require. Add knowledge-map connections, review mode, and the design-lab workspace in response to validated curriculum needs. Reuse registered lessons and domains; avoid a second set of rules for standalone tools or labs.
 
 ## Explicitly deferred
 

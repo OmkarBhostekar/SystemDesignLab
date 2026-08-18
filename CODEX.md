@@ -1408,34 +1408,34 @@ Status: **Theory-reader milestone complete; search and richer media presentation
 
 ## Stage C — Progress
 
-- [ ] Local progress model
-- [ ] Progress repository abstraction
-- [ ] IndexedDB persistence
-- [ ] Mark theory complete
-- [ ] Curriculum progress display
-- [ ] Continue learning
-- [ ] Export progress
-- [ ] Import progress
-- [ ] Reset progress
+- [x] Local progress model
+- [x] Progress repository abstraction
+- [x] IndexedDB persistence
+- [x] Mark theory complete
+- [x] Curriculum progress display
+- [x] Continue learning
+- [x] Export progress
+- [x] Import progress
+- [x] Reset progress
 
-Status: **Not started**
+Status: **M3 complete**
 
 ---
 
 ## Stage D — Quiz System
 
-- [ ] Quiz schema
-- [ ] Single choice
-- [ ] Multi-choice
-- [ ] Numeric estimation
-- [ ] Answer explanations
-- [ ] Concept tags
-- [ ] Quiz scoring
-- [ ] Retry weak concepts
-- [ ] Persist attempts
-- [ ] Weak-concept tracking
+- [x] Quiz schema
+- [x] Single choice
+- [x] Multi-choice
+- [x] Numeric estimation
+- [x] Answer explanations
+- [x] Concept tags
+- [x] Quiz scoring
+- [x] Retry weak concepts
+- [x] Persist attempts
+- [x] Weak-concept tracking through persisted incorrect concept tags
 
-Status: **Not started**
+Status: **M4 complete for two representative lessons; broader seed conversion intentionally deferred**
 
 ---
 
@@ -1443,18 +1443,18 @@ Status: **Not started**
 
 Do not start until at least one real curriculum topic requires it.
 
-- [ ] Simulation shell
-- [ ] Play / pause / step / reset primitives
-- [ ] Scenario presets
-- [ ] Metric panel
-- [ ] Event timeline
-- [ ] Failure injection pattern
-- [ ] SVG visualization conventions
-- [ ] React Flow conventions
-- [ ] Chart conventions
-- [ ] Reduced motion support
+- [x] Simulation shell
+- [x] Play / pause / step / reset primitives
+- [x] Scenario presets
+- [x] Metric panel
+- [x] Event timeline
+- [x] Failure injection pattern
+- [x] SVG visualization conventions
+- [x] React Flow conventions
+- [x] Chart conventions
+- [x] Reduced motion support
 
-Status: **Not started**
+Status: **M5 complete; renderer conventions are documented and applied where relevant**
 
 ---
 
@@ -1462,18 +1462,18 @@ Status: **Not started**
 
 Recommended order:
 
-- [ ] Horizontal Scaling
+- [x] Horizontal Scaling
 - [ ] Tail Latency
 - [ ] CAP
 - [ ] Load Balancing
-- [ ] Consistent Hashing
+- [x] Consistent Hashing
 - [ ] Transaction Isolation
 - [ ] Cache Stampede
 - [ ] Queue + Backpressure
 - [ ] Retry + Jitter
 - [ ] Token Bucket
 
-Status: **Not started**
+Status: **2 of 10 representative topics complete in M5**
 
 ---
 
@@ -1539,13 +1539,13 @@ Status: **Not started**
 
 Current milestone:
 
-> **M2 — Complete theory curriculum for Modules 04–13 — Complete**
+> **M5 — Visualization foundation and first simulations — Complete**
 
 Primary goal:
 
-Complete the dependency-ordered theory curriculum through all 135 lessons in Modules 00–13, including 20 Markdown-first design labs, while preserving the deterministic content contract and production theory reader.
+Provide deterministic model-first simulations, a small accessible shared shell, responsive renderers, scenario and failure controls, reduced-motion behavior, and explicit local-first scenario completion persistence on one simple and one stateful lesson.
 
-Do not add simulations, structured quizzes, progress persistence, knowledge maps, design labs, interview mode, authentication, a backend, or remote content storage during this milestone.
+Interactive simulations now ship for Horizontal vs Vertical Scaling and Consistent Hashing. Consistent Hashing forms a complete theory → visualization → quiz → progress slice. Broader visualization coverage, authentication, a backend, and remote synchronization remain deferred to later milestones.
 
 ---
 
@@ -1559,7 +1559,7 @@ Update this section whenever Codex finishes a meaningful task.
 
 ## Active Milestone
 
-`M2 — Complete theory curriculum for Modules 04–13 — Complete`
+`M5 — Visualization foundation and first simulations — Complete`
 
 ## Currently Working On
 
@@ -1567,9 +1567,29 @@ Update this section whenever Codex finishes a meaningful task.
 - [x] Documentation setup
 - [x] Curriculum directory setup
 - [x] Theory authoring — all 135 lessons across Modules 00–13 complete
+- [x] Local progress domain, persistence, portable backup, and minimal reader controls
+- [x] Typed quiz domain, two representative quiz slices, accessible quiz UI, and local attempt persistence
+- [x] Shared simulation shell, two deterministic interactive lessons, and local scenario completion persistence
 
 ## Recently Completed
 
+- Completed M5 with deterministic model/renderer separation and interactive Horizontal Scaling and Consistent Hashing lessons.
+- Added an accessible shared shell with play, pause, step, reset, speed, presets, metrics, bounded events, failure actions, explicit completion, storage feedback, responsive SVG state, and reduced-motion behavior.
+- Modeled capacity, queueing, rejection, warm-up, scale-up downtime, shared dependencies, failures, recovery, session skew, and hot keys for horizontal scaling without one DOM entity per request.
+- Modeled modulo hashing, one-token rings, virtual nodes, replicas, membership remapping, copy/verify migration, cutover, node failure, hot keys, and aggregated 10,000-key scenarios with fixed deterministic placement.
+- Registered stable visualization IDs through validated lesson metadata and a narrow dynamic client boundary while keeping lesson routes server rendered and theory-only lessons usable.
+- Extended `ProgressRepository` with immutable scenario completions, atomic advancement to `visualization-complete`, IndexedDB version 4's third store, version-4 exports, migrations from versions 1–3, atomic three-store import, and scoped reset.
+- Accepted ADR-005 for deterministic simulation boundaries, explicit completion persistence, storage migration, accessibility, reduced motion, and rendering conventions.
+- Completed M4 with a separate typed quiz registry, strict question/answer validation, pure deterministic scoring, explanations, concept tags, and structured quizzes for `00-03-estimation` and `04-10-consistent-hashing`.
+- Defined single-choice exact matching, order-independent all-or-nothing multiple choice, inclusive absolute numeric tolerance with explicit units, and the PRD's exact 80% pass threshold.
+- Extended `ProgressRepository` with immutable caller-identified attempts, idempotent duplicate saves, atomic pass-to-`quiz-passed` transitions, deterministic weak-concept tags, and scoped reset semantics.
+- Migrated IndexedDB from version 2 to 3 with a separate `quiz-attempts` store and portable exports from version 2 to version 3 while preserving fully validated atomic replace-on-import behavior.
+- Added a narrow accessible QuizPanel client boundary with native controls, explanations, pending/error announcements, weak-question retry, and no conversion of the server-rendered lesson route.
+- Accepted ADR-004 for quiz scoring, attempt identity, persistence, migration, and reset decisions.
+- Completed M3 with pure monotonic lesson transitions, deterministic curriculum summaries, explicit reset scopes, and a repository boundary independent of React and browser APIs.
+- Added in-memory and IndexedDB adapters, a shared repository contract, fake-IndexedDB persistence/failure coverage, version-2 JSON exports, and a defined version-1 migration.
+- Added narrow client controls for marking theory complete, curriculum progress, continue learning, export/import/reset, and visible storage failures while preserving static Server Component routes.
+- Accepted ADR-003 for local progress ownership, timestamp-free deterministic records, atomic replace-on-import behavior, lazy IndexedDB access, and intentional deferral of quiz-attempt persistence to M4.
 - Completed all 106 planned lessons in Modules 04–13, bringing the curriculum to 135 indexed lessons across all 14 modules.
 - Completed all 20 Markdown-first design labs with requirements, checked estimates, APIs, data models, progressive architectures, failure/security/observability analysis, and reference rationale.
 - Expanded production-index coverage to all modules and routes and added automated local-link/heading validation for Markdown documentation and module READMEs.
@@ -1594,10 +1614,11 @@ None known.
 
 ## Next Recommended Tasks
 
-1. Begin **M3 — Local progress model and `ProgressRepository` abstraction** from Stage C.
-2. Add in-memory and IndexedDB adapters, explicit idempotent transitions, export/import/reset, and repository contract tests before wiring broad UI state.
-3. Keep structured quizzes and simulations in their later stages; when visualization work begins, start with one simple and one stateful flagship lesson so real models drive shared controls.
-4. Consider search after progress or alongside a focused reader improvement, now that the complete 135-lesson corpus exists.
+1. Add Tail Latency as the next simulation, reusing the proven shell while introducing time-series/chart behavior only where the lesson requires it.
+2. Follow with CAP or Load Balancing to validate architecture-graph conventions against another real engine.
+3. Add more structured quizzes only in response to focused lesson work; do not bulk-convert all remaining seeds.
+4. Use persisted incorrect concept tags when a later review-mode milestone defines prioritization and scheduling.
+5. Consider search alongside a focused reader improvement now that the complete corpus and local progress model exist.
 
 ---
 
@@ -1612,6 +1633,9 @@ Record major decisions here in concise form.
 | 2026-08-18 | Incremental visualization infrastructure | Real simulations should drive abstractions instead of speculative frameworks. |
 | 2026-08-18 | Markdown-compatible MDX lessons with a build-time index | Content remains readable outside the app while supporting validated metadata and later interactive enhancement; see ADR-001. |
 | 2026-08-18 | Begin the theory reader after Modules 00–03 | Twenty-nine real lessons are sufficient to validate the schema and reading experience before more curriculum depends on them; see ADR-002. |
+| 2026-08-18 | Versioned local progress behind a repository boundary | Monotonic domain rules, lazy IndexedDB, atomic replacement imports, and explicit migrations keep local learner data deterministic and portable; see ADR-003. |
+| 2026-08-18 | Deterministic structured quizzes with immutable attempts | Exact scoring rules, caller-generated attempt identity, separate attempt storage, and versioned atomic migration keep quiz behavior testable and local-first; see ADR-004. |
+| 2026-08-18 | Deterministic simulations with explicit scenario completion | Pure engines, narrow client renderers, bounded presentation state, and immutable completion records keep visual learning testable, accessible, and local-first; see ADR-005. |
 
 For decisions needing deeper context, create an ADR under `docs/decisions/`.
 
