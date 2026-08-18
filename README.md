@@ -4,7 +4,10 @@ The System Design Visual Learning Lab is a theory-first, local-first learning ap
 
 > **Theory → Visualization → Quiz → Interview Lens → Applied Design**
 
-The project is intentionally being built in increments. The theory curriculum is useful on its own; the application shell, local progress, quizzes, simulations, and design labs are added as the curriculum gives each capability a real use case.
+> [!IMPORTANT]
+> This is an in-progress project. The complete theory curriculum and reader are usable today, while progress tracking, structured quizzes, interactive simulations, search, and other learning tools are still under development. APIs, content organization, and UI details may change between releases.
+
+The project is intentionally being built in increments. The theory curriculum is useful on its own; the application shell, local progress, quizzes, simulations, and design-lab workspaces are added as the curriculum gives each capability a real use case.
 
 ## Current status
 
@@ -74,46 +77,96 @@ This sequence keeps theory valuable before all interactive features exist and ke
 
 The first product version should work without authentication. Structured progress belongs in IndexedDB through a `ProgressRepository` abstraction; lightweight preferences may use `localStorage`. Export and import use a versioned JSON format. A future remote repository may be added without changing lesson, quiz, or simulation components.
 
-## Development
+## Run the project locally
 
-Requirements: Node.js 20.9 or newer and npm.
+### Prerequisites
 
-Install dependencies:
+- [Git](https://git-scm.com/) for cloning the repository.
+- [Node.js](https://nodejs.org/) **20.9.0 or newer**.
+- npm, which is included with Node.js. The committed `package-lock.json` is the canonical dependency lockfile.
+
+No database, container runtime, external service, account, API key, or environment-variable setup is required for the current theory reader.
+
+### Clone and install
 
 ```bash
-npm install
+git clone <repository-url>
+cd <cloned-directory>
+npm ci
 ```
 
-Run the local development server at `http://localhost:3000`:
+Replace `<repository-url>` with the HTTPS or SSH URL of your fork or the published repository. Use `npm ci` for a reproducible install from the lockfile; use `npm install` only when intentionally changing dependencies.
+
+### Start the development server
 
 ```bash
 npm run dev
 ```
 
-Validate all indexed lesson metadata, relationships, dependency cycles, and local links:
+Open [http://localhost:3000/learn](http://localhost:3000/learn) in a browser. Next.js will reload the application as local source or curriculum files change.
+
+### Run the verification suite
+
+Validate lesson metadata, prerequisites, relationships, dependency cycles, paths, and local documentation links:
 
 ```bash
 npm run validate:content
 ```
 
-Run the automated tests:
+Run the automated tests, strict TypeScript checks, and ESLint:
 
 ```bash
 npm test
-```
-
-Run strict TypeScript and ESLint checks:
-
-```bash
 npm run typecheck
 npm run lint
 ```
 
-Create and serve a production build:
+Create and serve an optimized production build:
 
 ```bash
 npm run build
 npm start
 ```
 
-Before a substantial change, read `CODEX.md` and the relevant PRD section. Keep theory prose in `theory/`, preserve Server Components as the default, and record an ADR for decisions that constrain several future features or would be expensive to reverse.
+The production server also uses [http://localhost:3000](http://localhost:3000) by default.
+
+## Environment variables and local data
+
+The current application does not require a `.env` file and does not persist accounts or server-side learner data. Files matching `.env*` are ignored by Git, except for a future sanitized `.env.example` template.
+
+If a future contribution introduces configuration:
+
+- document every required variable in a committed `.env.example` using placeholder values;
+- keep real credentials in an ignored local environment file;
+- never place secrets, access tokens, personal data, or machine-specific absolute paths in source, fixtures, lesson content, screenshots, or logs.
+
+## Contributing
+
+Contributions are welcome while the project evolves. A suggested workflow is:
+
+```bash
+git checkout -b <short-feature-name>
+# make and verify the change
+git commit
+```
+
+Before opening a pull request:
+
+- read [`CODEX.md`](CODEX.md) and the relevant section of the [`PRD`](docs/PRD.md);
+- follow the [`content guidelines`](docs/content-guidelines.md) for curriculum changes;
+- preserve the stable lesson IDs and dependencies in the [`curriculum map`](docs/curriculum-map.md);
+- keep theory prose in `theory/` and application code in `src/`;
+- run `npm run validate:content`, `npm test`, `npm run typecheck`, `npm run lint`, and `npm run build`;
+- explain the problem, scope, verification, and any intentionally deferred work in the pull request.
+
+For larger architectural changes, open a discussion or issue first and add an ADR when the decision constrains several future features or would be expensive to reverse.
+
+## Project maturity and roadmap
+
+The theory milestone is complete, but the broader learning product is not. The next planned milestone is a local progress model behind a `ProgressRepository` abstraction. Later milestones cover structured quizzes, simulation engines and renderers, review tools, knowledge-map connections, and interactive design-lab workspaces. See [`CODEX.md`](CODEX.md) for the active tracker and [`docs/architecture.md`](docs/architecture.md) for the staged implementation plan.
+
+Bug reports and focused improvements are useful now; consumers should not yet rely on undocumented internal APIs or a stable release cadence.
+
+## License
+
+An open-source license has not yet been added. Until a `LICENSE` file is committed, copyright law reserves reuse and redistribution rights even if the repository is publicly visible. Choose and add an appropriate license before announcing the project as generally reusable open-source software.
