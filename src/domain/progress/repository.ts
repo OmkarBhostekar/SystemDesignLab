@@ -1,0 +1,19 @@
+import type {
+  LessonProgress,
+  LessonProgressMilestone,
+  ProgressExport,
+  ProgressResetScope,
+} from "./model";
+
+export interface ProgressRepository {
+  getLessonProgress(lessonId: string): Promise<LessonProgress | null>;
+  listLessonProgress(): Promise<LessonProgress[]>;
+  saveLessonProgress(progress: LessonProgress): Promise<LessonProgress>;
+  applyLessonMilestone(
+    lessonId: string,
+    milestone: LessonProgressMilestone,
+  ): Promise<LessonProgress>;
+  exportProgress(): Promise<ProgressExport>;
+  importProgress(data: unknown): Promise<void>;
+  resetProgress(scope: ProgressResetScope): Promise<void>;
+}
