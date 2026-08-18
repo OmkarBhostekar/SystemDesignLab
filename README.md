@@ -5,15 +5,15 @@ The System Design Visual Learning Lab is a theory-first, local-first learning ap
 > **Theory → Visualization → Quiz → Interview Lens → Applied Design**
 
 > [!IMPORTANT]
-> This is an in-progress project. The complete theory curriculum, reader, and local lesson-progress workflow are usable today, while structured quizzes, interactive simulations, search, and other learning tools are still under development. APIs, content organization, and UI details may change between releases.
+> This is an in-progress project. The complete theory curriculum, reader, local progress workflow, and two representative structured quiz slices are usable today, while broader quiz coverage, interactive simulations, search, and other learning tools are still under development. APIs, content organization, and UI details may change between releases.
 
 The project is intentionally being built in increments. The theory curriculum is useful on its own; the application shell, local progress, quizzes, simulations, and design-lab workspaces are added as the curriculum gives each capability a real use case.
 
 ## Current status
 
-The project has completed **M3 — the local progress model and `ProgressRepository` abstraction**. The repository contains 135 completed theory lessons across all 14 modules, including 20 Markdown-first design labs, a validated deterministic lesson index, a server-rendered Next.js reader at `/learn`, and local progress backed by IndexedDB.
+The project has completed **M4 — the structured quiz system**. The repository contains 135 completed theory lessons across all 14 modules, including 20 Markdown-first design labs, a validated deterministic lesson index, a server-rendered Next.js reader at `/learn`, local progress backed by IndexedDB, and structured quizzes for Back-of-the-Envelope Estimation and Consistent Hashing.
 
-The current reader includes routes for all modules and lessons, curriculum navigation, breadcrumbs, metadata, previous/next links, GFM tables, highlighted code, Mermaid diagrams, references, responsive light/dark reading styles, and explicit theory-only states. Learners can mark theory complete, see a curriculum summary, continue with the first incomplete lesson, export/import versioned JSON, and reset local progress. Structured quizzes, simulations, search, knowledge maps, the interactive design-lab workspace, and interview mode remain deliberately deferred.
+The current reader includes routes for all modules and lessons, curriculum navigation, breadcrumbs, metadata, previous/next links, GFM tables, highlighted code, Mermaid diagrams, references, responsive light/dark reading styles, and explicit theory-only states. Learners can mark theory complete, answer typed quizzes where registered, receive explanations and concept feedback, retry weak questions, persist attempts, advance progress after passing, export/import versioned JSON, and reset local progress. Additional structured quizzes, simulations, search, knowledge maps, the interactive design-lab workspace, and interview mode remain deliberately deferred.
 
 Read the [product requirements](docs/PRD.md) for the learning goals, the [curriculum map](docs/curriculum-map.md) for stable lesson IDs and dependencies, the [content guidelines](docs/content-guidelines.md) for authoring conventions, the [architecture plan](docs/architecture.md) for technical boundaries, and the [testing strategy](docs/testing-strategy.md) for risk-based verification.
 
@@ -75,7 +75,7 @@ This sequence keeps theory valuable before all interactive features exist and ke
 
 ## Local-first expectations
 
-The first product version works without authentication. Structured progress belongs in IndexedDB through a `ProgressRepository` abstraction; lightweight preferences may use `localStorage`. Exports use a deterministic version-2 JSON format, imports validate fully and atomically replace the saved progress set, and compatible version-1 exports migrate on import. Invalid or unsupported data leaves existing progress unchanged. A future remote repository may be added without coupling lesson, quiz, or simulation components to browser storage.
+The first product version works without authentication. Structured progress belongs in IndexedDB through a `ProgressRepository` abstraction; lightweight preferences may use `localStorage`. Exports use a deterministic version-3 JSON format containing lesson progress and normalized quiz attempts. Imports validate fully and atomically replace both record sets; compatible version-1 and M3 version-2 exports migrate with an empty attempt list. Invalid or unsupported data leaves existing progress unchanged. A future remote repository may be added without coupling lesson, quiz, or simulation components to browser storage.
 
 ## Run the project locally
 
@@ -163,7 +163,7 @@ For larger architectural changes, open a discussion or issue first and add an AD
 
 ## Project maturity and roadmap
 
-The theory and local-progress milestones are complete, but the broader learning product is not. The next planned milestone is the structured quiz system: validated question data, pure evaluation, explanations, attempts, and one complete theory-to-quiz learning slice. Later milestones cover simulation engines and renderers, review tools, knowledge-map connections, and interactive design-lab workspaces. See [`CODEX.md`](CODEX.md) for the active tracker and [`docs/architecture.md`](docs/architecture.md) for the staged implementation plan.
+The theory, local-progress, and structured-quiz milestones are complete, but the broader learning product is not. M4 proves typed validation, pure evaluation, accessible interactions, explanations, retries, and local attempt persistence on two real lessons rather than bulk-converting all quiz seeds. Later milestones cover simulation engines and renderers, broader quiz coverage and review tools, knowledge-map connections, and interactive design-lab workspaces. See [`CODEX.md`](CODEX.md) for the active tracker and [`docs/architecture.md`](docs/architecture.md) for the staged implementation plan.
 
 Bug reports and focused improvements are useful now; consumers should not yet rely on undocumented internal APIs or a stable release cadence.
 

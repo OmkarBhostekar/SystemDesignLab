@@ -1424,18 +1424,18 @@ Status: **M3 complete**
 
 ## Stage D — Quiz System
 
-- [ ] Quiz schema
-- [ ] Single choice
-- [ ] Multi-choice
-- [ ] Numeric estimation
-- [ ] Answer explanations
-- [ ] Concept tags
-- [ ] Quiz scoring
-- [ ] Retry weak concepts
-- [ ] Persist attempts
-- [ ] Weak-concept tracking
+- [x] Quiz schema
+- [x] Single choice
+- [x] Multi-choice
+- [x] Numeric estimation
+- [x] Answer explanations
+- [x] Concept tags
+- [x] Quiz scoring
+- [x] Retry weak concepts
+- [x] Persist attempts
+- [x] Weak-concept tracking through persisted incorrect concept tags
 
-Status: **Not started**
+Status: **M4 complete for two representative lessons; broader seed conversion intentionally deferred**
 
 ---
 
@@ -1539,13 +1539,13 @@ Status: **Not started**
 
 Current milestone:
 
-> **M3 — Local progress model and `ProgressRepository` abstraction — Complete**
+> **M4 — Structured quiz system — Complete**
 
 Primary goal:
 
-Provide framework-independent, idempotent lesson-progress rules; interchangeable memory and IndexedDB repositories; migration-ready export/import/reset behavior; repository contract tests; and the smallest client boundaries needed to prove local progress survives refresh.
+Provide typed and validated quiz data, deterministic framework-independent evaluation, accessible answer/feedback/retry interactions, immutable attempt identity, local-first attempt persistence, and one or two real theory → quiz → progress slices.
 
-Structured quizzes, simulations, authentication, a backend, and remote synchronization remain deferred to later milestones.
+Structured quizzes now ship for Back-of-the-Envelope Estimation and Consistent Hashing. Bulk seed conversion, simulations, authentication, a backend, and remote synchronization remain deferred to later milestones.
 
 ---
 
@@ -1559,7 +1559,7 @@ Update this section whenever Codex finishes a meaningful task.
 
 ## Active Milestone
 
-`M3 — Local progress model and ProgressRepository abstraction — Complete`
+`M4 — Structured quiz system — Complete`
 
 ## Currently Working On
 
@@ -1568,9 +1568,16 @@ Update this section whenever Codex finishes a meaningful task.
 - [x] Curriculum directory setup
 - [x] Theory authoring — all 135 lessons across Modules 00–13 complete
 - [x] Local progress domain, persistence, portable backup, and minimal reader controls
+- [x] Typed quiz domain, two representative quiz slices, accessible quiz UI, and local attempt persistence
 
 ## Recently Completed
 
+- Completed M4 with a separate typed quiz registry, strict question/answer validation, pure deterministic scoring, explanations, concept tags, and structured quizzes for `00-03-estimation` and `04-10-consistent-hashing`.
+- Defined single-choice exact matching, order-independent all-or-nothing multiple choice, inclusive absolute numeric tolerance with explicit units, and the PRD's exact 80% pass threshold.
+- Extended `ProgressRepository` with immutable caller-identified attempts, idempotent duplicate saves, atomic pass-to-`quiz-passed` transitions, deterministic weak-concept tags, and scoped reset semantics.
+- Migrated IndexedDB from version 2 to 3 with a separate `quiz-attempts` store and portable exports from version 2 to version 3 while preserving fully validated atomic replace-on-import behavior.
+- Added a narrow accessible QuizPanel client boundary with native controls, explanations, pending/error announcements, weak-question retry, and no conversion of the server-rendered lesson route.
+- Accepted ADR-004 for quiz scoring, attempt identity, persistence, migration, and reset decisions.
 - Completed M3 with pure monotonic lesson transitions, deterministic curriculum summaries, explicit reset scopes, and a repository boundary independent of React and browser APIs.
 - Added in-memory and IndexedDB adapters, a shared repository contract, fake-IndexedDB persistence/failure coverage, version-2 JSON exports, and a defined version-1 migration.
 - Added narrow client controls for marking theory complete, curriculum progress, continue learning, export/import/reset, and visible storage failures while preserving static Server Component routes.
@@ -1599,9 +1606,9 @@ None known.
 
 ## Next Recommended Tasks
 
-1. Begin **M4 — Structured quiz system** from Stage D with validated question data, pure evaluation, explanations, and attempt identity before persistence is extended.
-2. Complete one or two real theory → quiz → progress slices and use them to define weak-concept and retry behavior.
-3. Keep simulations in their later stage; when visualization work begins, start with one simple and one stateful flagship lesson so real models drive shared controls.
+1. Begin Stage E/F visualization work with one simple and one stateful flagship lesson so real models drive shared controls.
+2. Add more structured quizzes only in response to focused lesson work; do not bulk-convert all remaining seeds.
+3. Use persisted incorrect concept tags when a later review-mode milestone defines prioritization and scheduling.
 4. Consider search alongside a focused reader improvement now that the complete corpus and local progress model exist.
 
 ---
@@ -1618,6 +1625,7 @@ Record major decisions here in concise form.
 | 2026-08-18 | Markdown-compatible MDX lessons with a build-time index | Content remains readable outside the app while supporting validated metadata and later interactive enhancement; see ADR-001. |
 | 2026-08-18 | Begin the theory reader after Modules 00–03 | Twenty-nine real lessons are sufficient to validate the schema and reading experience before more curriculum depends on them; see ADR-002. |
 | 2026-08-18 | Versioned local progress behind a repository boundary | Monotonic domain rules, lazy IndexedDB, atomic replacement imports, and explicit migrations keep local learner data deterministic and portable; see ADR-003. |
+| 2026-08-18 | Deterministic structured quizzes with immutable attempts | Exact scoring rules, caller-generated attempt identity, separate attempt storage, and versioned atomic migration keep quiz behavior testable and local-first; see ADR-004. |
 
 For decisions needing deeper context, create an ADR under `docs/decisions/`.
 

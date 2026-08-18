@@ -56,13 +56,16 @@ interface ProgressRepository {
   listLessonProgress(): Promise<LessonProgress[]>;
   saveLessonProgress(progress: LessonProgress): Promise<LessonProgress>;
   applyLessonMilestone(lessonId, milestone): Promise<LessonProgress>;
+  getQuizAttempt(attemptId: string): Promise<QuizAttempt | null>;
+  listQuizAttempts(): Promise<QuizAttempt[]>;
+  saveQuizAttempt(attempt: QuizAttempt): Promise<QuizAttempt>;
   exportProgress(): Promise<ProgressExport>;
   importProgress(data: unknown): Promise<void>;
   resetProgress(scope: ProgressResetScope): Promise<void>;
 }
 ```
 
-The initial adapters are an IndexedDB-backed repository and a deterministic in-memory repository. The M3 contract deliberately covers lesson progress only; quiz attempts join the persistence boundary when Stage 3 defines their identity and retry behavior. A future remote-sync adapter should satisfy the same domain behavior rather than forcing a rewrite of learning components. See ADR-003.
+The initial adapters are an IndexedDB-backed repository and a deterministic in-memory repository. M4 extends the shared contract with immutable quiz attempts: the caller creates one stable attempt ID per logical submission, identical re-saves are idempotent, conflicting ID reuse fails, and each retry uses a fresh ID. Saving a passing attempt advances the lesson monotonically to `quiz-passed`; a failed attempt never advances it. A future remote-sync adapter should satisfy the same domain behavior rather than forcing a rewrite of learning components. See ADR-003 and ADR-004.
 
 ### Simulations are models first and renderers second
 
@@ -170,7 +173,7 @@ M3 persists one compact record per stable lesson ID. Absence means not started. 
 - Exported JSON includes a schema version and enough data to restore progress without a server account.
 - Import validates the envelope before writing. Invalid or unsupported exports must not partially replace existing progress.
 
-The concrete browser database is `system-design-visual-learning-lab-progress`, database version 2, with a `lesson-progress` object store keyed by `lessonId`. The adapter opens and closes the database lazily for each operation, never at module evaluation. Version-2 exports contain `format`, `schemaVersion`, and a stable-ID-sorted lesson array. The documented version-1 lesson map migrates in memory. Import is replace-not-merge and performs its clear plus writes in one read/write transaction after full validation. Reset explicitly targets all progress or selected lesson IDs and does not touch preferences. IndexedDB request, transaction, open, and availability failures surface as `ProgressStorageError` rather than empty or successful results.
+The concrete browser database is `system-design-visual-learning-lab-progress`, database version 3. `lesson-progress` remains keyed by `lessonId`; M4 adds `quiz-attempts` keyed by `attemptId`. The adapter opens and closes the database lazily for each operation, never at module evaluation. Version-3 exports contain `format`, `schemaVersion`, stable-ID-sorted lessons, and stable-attempt-ID-sorted quiz attempts. Version 1 and M3 version 2 migrate in memory with no attempts. Import is replace-not-merge and clears plus writes both stores in one read/write transaction after full validation. Reset targets all learning progress or selected lesson IDs and clears matching attempts without touching preferences. IndexedDB request, transaction, open, migration, and availability failures surface as `ProgressStorageError` rather than empty or successful results.
 
 No authentication, hosted database, analytics pipeline, or remote synchronization is required for the first version. These can be added as adapters and explicit product decisions later.
 
@@ -186,7 +189,7 @@ Question data is structured and addressable by lesson and concept tags. Evaluati
 type QuizQuestion = {
   id: string;
   lessonId: string;
-  type: "single-choice" | "multi-choice" | "numeric" | "architecture";
+  type: "single-choice" | "multiple-choice" | "numeric-estimation";
   prompt: string;
   options?: string[];
   correctAnswer: unknown;
@@ -195,7 +198,7 @@ type QuizQuestion = {
 };
 ```
 
-During theory authoring, `Quiz Seeds` may remain in the lesson until a quiz implementation exists. The seed is not a substitute for answer data and evaluation rules.
+Every question is worth one point. Single choice requires an exact option, multiple choice uses order-independent exact-set matching with no partial credit, and numeric estimates use an inclusive absolute tolerance plus a case-insensitive exact unit. Evaluation returns explanations and incorrect concept tags, and a score of at least 80% passes the shipped quizzes. During theory authoring, `Quiz Seeds` remain readable in every lesson; only selected seeds move into the separate typed registry. The seed is not a substitute for answer data and evaluation rules.
 
 ### Simulations
 
@@ -278,14 +281,14 @@ The learner can close and reopen the browser and retain progress without a serve
 
 ### Stage 3 — Quiz system
 
-Deliver:
+Delivered in M4:
 
 - structured question schema and registry,
 - pure evaluation for initial question types,
 - answer explanations, scoring, concept tags, retries, and attempt persistence,
 - an end-to-end theory → quiz → progress path for one or two lessons.
 
-Exit when quiz behavior is testable without React and a learner can identify weak concepts from an attempt.
+The `00-03-estimation` and `04-10-consistent-hashing` lessons now complete real theory → quiz → progress slices. Quiz behavior is testable without React, and persisted failed attempts identify weak concepts without storing hidden answer keys.
 
 ### Stage 4 — First simulation experiences
 

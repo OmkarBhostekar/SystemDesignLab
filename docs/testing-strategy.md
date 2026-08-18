@@ -86,7 +86,7 @@ Run the same contract suite against an in-memory repository and the IndexedDB ad
 
 Use a fake IndexedDB implementation or browser-capable test environment for adapter tests. Do not let component tests mock away the repository contract so thoroughly that serialization and migration behavior are never exercised.
 
-M3 runs the shared contract against `InMemoryProgressRepository` and `IndexedDbProgressRepository`. Adapter tests use the standards-compatible `fake-indexeddb` development dependency and isolated database names to verify cross-instance persistence, database upgrades, lazy browser access, and surfaced open failures. Pure serialization tests cover the version-1-to-version-2 migration and strict rejection of partial, duplicate, malformed, and unsupported exports. Client-boundary tests use the in-memory adapter so learner-visible loading, completion, summary, continue, and reset states stay deterministic; serialization and persistence remain covered separately rather than mocked away.
+M4 runs the shared contract against `InMemoryProgressRepository` and `IndexedDbProgressRepository` for both lessons and immutable quiz attempts. Adapter tests use the standards-compatible `fake-indexeddb` development dependency and isolated database names to verify cross-instance persistence, the M3 database-version-2 to version-3 migration, corrupted records, lazy browser access, surfaced failures, two-store rollback, and scoped reset. Pure serialization tests cover version-1 and M3 version-2 imports into version 3 plus strict rejection of partial, duplicate, malformed, and unsupported exports. Client-boundary tests inject repositories so learner-visible pending, success, failure, retry, and reset states stay deterministic; serialization and persistence remain covered separately rather than mocked away.
 
 ## Quiz evaluation tests
 
@@ -95,10 +95,11 @@ Quiz scoring is independent of answer-selection UI. Test each supported question
 - single choice with correct, incorrect, and missing answers,
 - multi-choice with order independence and partial-selection rules,
 - numeric estimates with the documented tolerance and unit handling,
-- architecture-choice questions with explanation output,
 - malformed questions that fail validation before presentation.
 
 Every result should identify why an answer is correct or incorrect and expose concept tags for review. Tests should catch mismatches between `correctAnswer`, displayed options, score, and explanation. A question with no explanation should be rejected if the UI promises explanatory feedback.
+
+M4 intentionally excludes architecture-choice grading. Its focused evaluator suite covers exact single choice, order-independent all-or-nothing multiple choice, inclusive numeric tolerance and exact normalized units, missing answers, the exact 80% boundary, malformed definitions and answers, zero-question rejection, explanations, deterministic output, and deduplicated incorrect tags. Component tests cover native keyboard-operable controls, pending and storage-error announcements, feedback, scoring, and weak-concept retry.
 
 ## Simulation engine tests
 
