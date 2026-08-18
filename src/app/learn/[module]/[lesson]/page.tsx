@@ -10,6 +10,8 @@ import type { LessonNavigationItem } from "@/components/navigation/types";
 import { LessonMetadata, LessonStepper, TheoryOnlyState } from "@/components/lesson";
 import { MdxContent } from "@/components/mdx";
 import { LessonProgressControl } from "@/components/progress";
+import { QuizPanel } from "@/components/quiz";
+import { getQuiz } from "@/content/quizzes";
 
 import {
   getAdjacentLessons,
@@ -62,11 +64,9 @@ export default async function LessonPage({ params }: LessonPageProps) {
   const navigation = getReaderModules(index).map(toSidebarModule);
   const lessonSummaries = index.lessons.map(toLessonSummary);
 
-  // Registries are intentionally not part of this milestone. A future route
-  // can pass true here once it has a real enhancement without changing MDX or
-  // lesson composition.
   const visualizationAvailable = false;
-  const quizAvailable = false;
+  const quiz = getQuiz(lesson.quizId);
+  const quizAvailable = quiz?.lessonId === lesson.id;
 
   return (
     <ReadingFrame
@@ -101,6 +101,8 @@ export default async function LessonPage({ params }: LessonPageProps) {
           sourcePath={sourceRecord.sourcePath}
           lessons={lessonSummaries}
         />
+
+        {quizAvailable && quiz ? <QuizPanel quiz={quiz} /> : null}
 
         <GenericLessonNavigation
           previous={adjacent.previous ? toNavigationItem(adjacent.previous) : undefined}
