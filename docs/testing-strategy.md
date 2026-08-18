@@ -86,6 +86,8 @@ Run the same contract suite against an in-memory repository and the IndexedDB ad
 
 Use a fake IndexedDB implementation or browser-capable test environment for adapter tests. Do not let component tests mock away the repository contract so thoroughly that serialization and migration behavior are never exercised.
 
+M3 runs the shared contract against `InMemoryProgressRepository` and `IndexedDbProgressRepository`. Adapter tests use the standards-compatible `fake-indexeddb` development dependency and isolated database names to verify cross-instance persistence, database upgrades, lazy browser access, and surfaced open failures. Pure serialization tests cover the version-1-to-version-2 migration and strict rejection of partial, duplicate, malformed, and unsupported exports. Client-boundary tests use the in-memory adapter so learner-visible loading, completion, summary, continue, and reset states stay deterministic; serialization and persistence remain covered separately rather than mocked away.
+
 ## Quiz evaluation tests
 
 Quiz scoring is independent of answer-selection UI. Test each supported question type:
@@ -276,4 +278,3 @@ Do not use production learner data in tests. If examples include large numbers o
 When project scripts exist, CI should run the smallest complete set of checks for every change: formatting/linting, type checking, content validation, unit/domain tests, repository contract tests, component/integration tests, and a focused end-to-end/accessibility smoke suite. Full browser and performance suites may run on a broader cadence, but failures in content/index validation or domain tests should block merges.
 
 The exact commands and tooling should be chosen when the Next.js project is initialized; this document intentionally does not assume a package manager or test runner that does not yet exist.
-

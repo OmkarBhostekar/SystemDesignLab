@@ -53,15 +53,16 @@ The learning domain must not depend on a remote API in the first version. Persis
 ```ts
 interface ProgressRepository {
   getLessonProgress(lessonId: string): Promise<LessonProgress | null>;
-  saveLessonProgress(progress: LessonProgress): Promise<void>;
-  recordQuizAttempt(attempt: QuizAttempt): Promise<void>;
+  listLessonProgress(): Promise<LessonProgress[]>;
+  saveLessonProgress(progress: LessonProgress): Promise<LessonProgress>;
+  applyLessonMilestone(lessonId, milestone): Promise<LessonProgress>;
   exportProgress(): Promise<ProgressExport>;
-  importProgress(data: ProgressExport): Promise<void>;
-  resetProgress(): Promise<void>;
+  importProgress(data: unknown): Promise<void>;
+  resetProgress(scope: ProgressResetScope): Promise<void>;
 }
 ```
 
-The initial adapter is an IndexedDB-backed repository. An in-memory adapter is useful for tests. A future remote-sync adapter should satisfy the same domain contract rather than forcing a rewrite of learning components.
+The initial adapters are an IndexedDB-backed repository and a deterministic in-memory repository. The M3 contract deliberately covers lesson progress only; quiz attempts join the persistence boundary when Stage 3 defines their identity and retry behavior. A future remote-sync adapter should satisfy the same domain behavior rather than forcing a rewrite of learning components. See ADR-003.
 
 ### Simulations are models first and renderers second
 
@@ -159,6 +160,8 @@ Not Started → Theory Complete → Visualization Complete → Quiz Passed → M
 
 The domain may also record quiz attempts, incorrect concept tags, completed scenarios, review dates, and design-lab attempts. State transitions should be explicit and idempotent. A reset is an intentional operation, not an accidental consequence of a failed read or a missing browser store.
 
+M3 persists one compact record per stable lesson ID. Absence means not started. Ordinary saves and milestone commands take the later stage, so repeated commands are idempotent and stale callers cannot regress a lesson. Curriculum summaries count theory or any later stage as theory complete; continue learning selects the first lesson in deterministic curriculum order that has not reached theory complete.
+
 ### Storage
 
 - IndexedDB stores structured progress, attempts, review data, and design-lab state when those features exist.
@@ -166,6 +169,8 @@ The domain may also record quiz attempts, incorrect concept tags, completed scen
 - Store names and serialized records are versioned so migrations can be introduced before schema changes reach users.
 - Exported JSON includes a schema version and enough data to restore progress without a server account.
 - Import validates the envelope before writing. Invalid or unsupported exports must not partially replace existing progress.
+
+The concrete browser database is `system-design-visual-learning-lab-progress`, database version 2, with a `lesson-progress` object store keyed by `lessonId`. The adapter opens and closes the database lazily for each operation, never at module evaluation. Version-2 exports contain `format`, `schemaVersion`, and a stable-ID-sorted lesson array. The documented version-1 lesson map migrates in memory. Import is replace-not-merge and performs its clear plus writes in one read/write transaction after full validation. Reset explicitly targets all progress or selected lesson IDs and does not touch preferences. IndexedDB request, transaction, open, and availability failures surface as `ProgressStorageError` rather than empty or successful results.
 
 No authentication, hosted database, analytics pipeline, or remote synchronization is required for the first version. These can be added as adapters and explicit product decisions later.
 
@@ -261,7 +266,7 @@ Exit when theory can be read comfortably on a fresh session without client-side 
 
 ### Stage 2 — Local progress
 
-Deliver:
+Delivered in M3:
 
 - progress domain types and transitions,
 - `ProgressRepository` contract,
@@ -269,7 +274,7 @@ Deliver:
 - mark theory complete, continue-learning display, export/import/reset,
 - persistence tests.
 
-Exit when a learner can close and reopen the browser and retain progress without a server.
+The learner can close and reopen the browser and retain progress without a server. The reader keeps its Server Component routes; only the overview and lesson progress controls are client boundaries.
 
 ### Stage 3 — Quiz system
 

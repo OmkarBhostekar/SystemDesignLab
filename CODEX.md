@@ -1408,17 +1408,17 @@ Status: **Theory-reader milestone complete; search and richer media presentation
 
 ## Stage C — Progress
 
-- [ ] Local progress model
-- [ ] Progress repository abstraction
-- [ ] IndexedDB persistence
-- [ ] Mark theory complete
-- [ ] Curriculum progress display
-- [ ] Continue learning
-- [ ] Export progress
-- [ ] Import progress
-- [ ] Reset progress
+- [x] Local progress model
+- [x] Progress repository abstraction
+- [x] IndexedDB persistence
+- [x] Mark theory complete
+- [x] Curriculum progress display
+- [x] Continue learning
+- [x] Export progress
+- [x] Import progress
+- [x] Reset progress
 
-Status: **Not started**
+Status: **M3 complete**
 
 ---
 
@@ -1539,13 +1539,13 @@ Status: **Not started**
 
 Current milestone:
 
-> **M2 — Complete theory curriculum for Modules 04–13 — Complete**
+> **M3 — Local progress model and `ProgressRepository` abstraction — Complete**
 
 Primary goal:
 
-Complete the dependency-ordered theory curriculum through all 135 lessons in Modules 00–13, including 20 Markdown-first design labs, while preserving the deterministic content contract and production theory reader.
+Provide framework-independent, idempotent lesson-progress rules; interchangeable memory and IndexedDB repositories; migration-ready export/import/reset behavior; repository contract tests; and the smallest client boundaries needed to prove local progress survives refresh.
 
-Do not add simulations, structured quizzes, progress persistence, knowledge maps, design labs, interview mode, authentication, a backend, or remote content storage during this milestone.
+Structured quizzes, simulations, authentication, a backend, and remote synchronization remain deferred to later milestones.
 
 ---
 
@@ -1559,7 +1559,7 @@ Update this section whenever Codex finishes a meaningful task.
 
 ## Active Milestone
 
-`M2 — Complete theory curriculum for Modules 04–13 — Complete`
+`M3 — Local progress model and ProgressRepository abstraction — Complete`
 
 ## Currently Working On
 
@@ -1567,9 +1567,14 @@ Update this section whenever Codex finishes a meaningful task.
 - [x] Documentation setup
 - [x] Curriculum directory setup
 - [x] Theory authoring — all 135 lessons across Modules 00–13 complete
+- [x] Local progress domain, persistence, portable backup, and minimal reader controls
 
 ## Recently Completed
 
+- Completed M3 with pure monotonic lesson transitions, deterministic curriculum summaries, explicit reset scopes, and a repository boundary independent of React and browser APIs.
+- Added in-memory and IndexedDB adapters, a shared repository contract, fake-IndexedDB persistence/failure coverage, version-2 JSON exports, and a defined version-1 migration.
+- Added narrow client controls for marking theory complete, curriculum progress, continue learning, export/import/reset, and visible storage failures while preserving static Server Component routes.
+- Accepted ADR-003 for local progress ownership, timestamp-free deterministic records, atomic replace-on-import behavior, lazy IndexedDB access, and intentional deferral of quiz-attempt persistence to M4.
 - Completed all 106 planned lessons in Modules 04–13, bringing the curriculum to 135 indexed lessons across all 14 modules.
 - Completed all 20 Markdown-first design labs with requirements, checked estimates, APIs, data models, progressive architectures, failure/security/observability analysis, and reference rationale.
 - Expanded production-index coverage to all modules and routes and added automated local-link/heading validation for Markdown documentation and module READMEs.
@@ -1594,10 +1599,10 @@ None known.
 
 ## Next Recommended Tasks
 
-1. Begin **M3 — Local progress model and `ProgressRepository` abstraction** from Stage C.
-2. Add in-memory and IndexedDB adapters, explicit idempotent transitions, export/import/reset, and repository contract tests before wiring broad UI state.
-3. Keep structured quizzes and simulations in their later stages; when visualization work begins, start with one simple and one stateful flagship lesson so real models drive shared controls.
-4. Consider search after progress or alongside a focused reader improvement, now that the complete 135-lesson corpus exists.
+1. Begin **M4 — Structured quiz system** from Stage D with validated question data, pure evaluation, explanations, and attempt identity before persistence is extended.
+2. Complete one or two real theory → quiz → progress slices and use them to define weak-concept and retry behavior.
+3. Keep simulations in their later stage; when visualization work begins, start with one simple and one stateful flagship lesson so real models drive shared controls.
+4. Consider search alongside a focused reader improvement now that the complete corpus and local progress model exist.
 
 ---
 
@@ -1612,6 +1617,7 @@ Record major decisions here in concise form.
 | 2026-08-18 | Incremental visualization infrastructure | Real simulations should drive abstractions instead of speculative frameworks. |
 | 2026-08-18 | Markdown-compatible MDX lessons with a build-time index | Content remains readable outside the app while supporting validated metadata and later interactive enhancement; see ADR-001. |
 | 2026-08-18 | Begin the theory reader after Modules 00–03 | Twenty-nine real lessons are sufficient to validate the schema and reading experience before more curriculum depends on them; see ADR-002. |
+| 2026-08-18 | Versioned local progress behind a repository boundary | Monotonic domain rules, lazy IndexedDB, atomic replacement imports, and explicit migrations keep local learner data deterministic and portable; see ADR-003. |
 
 For decisions needing deeper context, create an ADR under `docs/decisions/`.
 

@@ -5,15 +5,15 @@ The System Design Visual Learning Lab is a theory-first, local-first learning ap
 > **Theory → Visualization → Quiz → Interview Lens → Applied Design**
 
 > [!IMPORTANT]
-> This is an in-progress project. The complete theory curriculum and reader are usable today, while progress tracking, structured quizzes, interactive simulations, search, and other learning tools are still under development. APIs, content organization, and UI details may change between releases.
+> This is an in-progress project. The complete theory curriculum, reader, and local lesson-progress workflow are usable today, while structured quizzes, interactive simulations, search, and other learning tools are still under development. APIs, content organization, and UI details may change between releases.
 
 The project is intentionally being built in increments. The theory curriculum is useful on its own; the application shell, local progress, quizzes, simulations, and design-lab workspaces are added as the curriculum gives each capability a real use case.
 
 ## Current status
 
-The project has completed **M2 — the full theory curriculum for Modules 00–13**. The repository contains 135 completed theory lessons across all 14 modules, including 20 Markdown-first design labs, a validated deterministic lesson index, and a server-rendered Next.js reader at `/learn`.
+The project has completed **M3 — the local progress model and `ProgressRepository` abstraction**. The repository contains 135 completed theory lessons across all 14 modules, including 20 Markdown-first design labs, a validated deterministic lesson index, a server-rendered Next.js reader at `/learn`, and local progress backed by IndexedDB.
 
-The current reader includes routes for all modules and lessons, curriculum navigation, breadcrumbs, metadata, previous/next links, GFM tables, highlighted code, Mermaid diagrams, references, responsive light/dark reading styles, and explicit theory-only states. Progress persistence, structured quizzes, simulations, search, knowledge maps, the interactive design-lab workspace, and interview mode remain deliberately deferred.
+The current reader includes routes for all modules and lessons, curriculum navigation, breadcrumbs, metadata, previous/next links, GFM tables, highlighted code, Mermaid diagrams, references, responsive light/dark reading styles, and explicit theory-only states. Learners can mark theory complete, see a curriculum summary, continue with the first incomplete lesson, export/import versioned JSON, and reset local progress. Structured quizzes, simulations, search, knowledge maps, the interactive design-lab workspace, and interview mode remain deliberately deferred.
 
 Read the [product requirements](docs/PRD.md) for the learning goals, the [curriculum map](docs/curriculum-map.md) for stable lesson IDs and dependencies, the [content guidelines](docs/content-guidelines.md) for authoring conventions, the [architecture plan](docs/architecture.md) for technical boundaries, and the [testing strategy](docs/testing-strategy.md) for risk-based verification.
 
@@ -75,7 +75,7 @@ This sequence keeps theory valuable before all interactive features exist and ke
 
 ## Local-first expectations
 
-The first product version should work without authentication. Structured progress belongs in IndexedDB through a `ProgressRepository` abstraction; lightweight preferences may use `localStorage`. Export and import use a versioned JSON format. A future remote repository may be added without changing lesson, quiz, or simulation components.
+The first product version works without authentication. Structured progress belongs in IndexedDB through a `ProgressRepository` abstraction; lightweight preferences may use `localStorage`. Exports use a deterministic version-2 JSON format, imports validate fully and atomically replace the saved progress set, and compatible version-1 exports migrate on import. Invalid or unsupported data leaves existing progress unchanged. A future remote repository may be added without coupling lesson, quiz, or simulation components to browser storage.
 
 ## Run the project locally
 
@@ -163,7 +163,7 @@ For larger architectural changes, open a discussion or issue first and add an AD
 
 ## Project maturity and roadmap
 
-The theory milestone is complete, but the broader learning product is not. The next planned milestone is a local progress model behind a `ProgressRepository` abstraction. Later milestones cover structured quizzes, simulation engines and renderers, review tools, knowledge-map connections, and interactive design-lab workspaces. See [`CODEX.md`](CODEX.md) for the active tracker and [`docs/architecture.md`](docs/architecture.md) for the staged implementation plan.
+The theory and local-progress milestones are complete, but the broader learning product is not. The next planned milestone is the structured quiz system: validated question data, pure evaluation, explanations, attempts, and one complete theory-to-quiz learning slice. Later milestones cover simulation engines and renderers, review tools, knowledge-map connections, and interactive design-lab workspaces. See [`CODEX.md`](CODEX.md) for the active tracker and [`docs/architecture.md`](docs/architecture.md) for the staged implementation plan.
 
 Bug reports and focused improvements are useful now; consumers should not yet rely on undocumented internal APIs or a stable release cadence.
 
