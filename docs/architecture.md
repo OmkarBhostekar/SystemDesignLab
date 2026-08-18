@@ -59,13 +59,16 @@ interface ProgressRepository {
   getQuizAttempt(attemptId: string): Promise<QuizAttempt | null>;
   listQuizAttempts(): Promise<QuizAttempt[]>;
   saveQuizAttempt(attempt: QuizAttempt): Promise<QuizAttempt>;
+  getSimulationCompletion(completionId: string): Promise<SimulationCompletion | null>;
+  listSimulationCompletions(): Promise<SimulationCompletion[]>;
+  saveSimulationCompletion(completion: SimulationCompletion): Promise<SimulationCompletion>;
   exportProgress(): Promise<ProgressExport>;
   importProgress(data: unknown): Promise<void>;
   resetProgress(scope: ProgressResetScope): Promise<void>;
 }
 ```
 
-The initial adapters are an IndexedDB-backed repository and a deterministic in-memory repository. M4 extends the shared contract with immutable quiz attempts: the caller creates one stable attempt ID per logical submission, identical re-saves are idempotent, conflicting ID reuse fails, and each retry uses a fresh ID. Saving a passing attempt advances the lesson monotonically to `quiz-passed`; a failed attempt never advances it. A future remote-sync adapter should satisfy the same domain behavior rather than forcing a rewrite of learning components. See ADR-003 and ADR-004.
+The initial adapters are an IndexedDB-backed repository and a deterministic in-memory repository. M4 extends the shared contract with immutable quiz attempts: the caller creates one stable attempt ID per logical submission, identical re-saves are idempotent, conflicting ID reuse fails, and each retry uses a fresh ID. M5 adds immutable simulation completions identified by visualization and scenario. Saving a completion atomically advances the lesson monotonically to `visualization-complete`; only an explicitly completed engine scenario is saved. A future remote-sync adapter should satisfy the same domain behavior rather than forcing a rewrite of learning components. See ADR-003, ADR-004, and ADR-005.
 
 ### Simulations are models first and renderers second
 
@@ -83,7 +86,7 @@ The engine owns rules, transitions, failure injection, and metrics. React Flow, 
 
 ### Abstractions follow evidence
 
-The first simulation should be implemented as a real lesson. After two or three simulations reveal genuinely shared controls or event semantics, extract small primitives such as play/pause/step/reset, scenario presets, event timelines, and metric panels. Do not create a generic simulation DSL, large global store, or broad plugin system in anticipation of every future visualization.
+M5 implements the first two simulations as real lessons and extracts only the shared controls they proved useful: play/pause/step/reset, speed, scenario presets, a bounded event timeline, metrics, failure actions, completion state, and storage feedback. It deliberately does not create a generic simulation DSL, large global store, or broad plugin system in anticipation of every future visualization.
 
 ## System shape
 
@@ -173,7 +176,7 @@ M3 persists one compact record per stable lesson ID. Absence means not started. 
 - Exported JSON includes a schema version and enough data to restore progress without a server account.
 - Import validates the envelope before writing. Invalid or unsupported exports must not partially replace existing progress.
 
-The concrete browser database is `system-design-visual-learning-lab-progress`, database version 3. `lesson-progress` remains keyed by `lessonId`; M4 adds `quiz-attempts` keyed by `attemptId`. The adapter opens and closes the database lazily for each operation, never at module evaluation. Version-3 exports contain `format`, `schemaVersion`, stable-ID-sorted lessons, and stable-attempt-ID-sorted quiz attempts. Version 1 and M3 version 2 migrate in memory with no attempts. Import is replace-not-merge and clears plus writes both stores in one read/write transaction after full validation. Reset targets all learning progress or selected lesson IDs and clears matching attempts without touching preferences. IndexedDB request, transaction, open, migration, and availability failures surface as `ProgressStorageError` rather than empty or successful results.
+The concrete browser database is `system-design-visual-learning-lab-progress`, database version 4. `lesson-progress` is keyed by `lessonId`, `quiz-attempts` by `attemptId`, and M5's `simulation-completions` by `completionId`. The adapter opens and closes the database lazily for each operation, never at module evaluation. Version-4 exports contain `format`, `schemaVersion`, stable-ID-sorted lessons, quiz attempts, and simulation completions. Versions 1, 2, and 3 migrate in memory with collections introduced later left empty. Import is replace-not-merge and clears plus writes all three stores in one read/write transaction after full validation. Reset targets all learning progress or selected lesson IDs and clears matching attempts and completions without touching preferences. IndexedDB request, transaction, open, migration, and availability failures surface as `ProgressStorageError` rather than empty or successful results.
 
 No authentication, hosted database, analytics pipeline, or remote synchronization is required for the first version. These can be added as adapters and explicit product decisions later.
 
@@ -292,13 +295,18 @@ The `00-03-estimation` and `04-10-consistent-hashing` lessons now complete real 
 
 ### Stage 4 — First simulation experiences
 
-Start with one simple and one more stateful visualization from the PRD (for example, horizontal scaling and consistent hashing). Keep engines separate from renderers. Extract shared controls only after the implementations expose true duplication.
+Delivered in M5:
+
+- a shared accessible simulation shell and narrow dynamically loaded client boundary,
+- deterministic model/renderer separation for Horizontal Scaling and Consistent Hashing,
+- scenario presets, failure injection, metrics, bounded event timelines, and reduced-motion support,
+- explicit per-scenario completion persistence and a complete theory → visualization → quiz → progress slice for Consistent Hashing.
 
 Exit when simulation state transitions are deterministic and tested, controls are keyboard accessible, reduced motion is supported, and a lesson remains understandable with the visual disabled.
 
 ### Stage 5 — Reuse and design labs
 
-Add the simulation shell, event timeline, metric panel, scenario presets, knowledge-map connections, review mode, and design-lab workspace in response to validated curriculum needs. Reuse registered lessons and domains; avoid a second set of rules for standalone tools or labs.
+Extend the proven simulation shell, event timeline, metric panel, and scenario presets only as new topics require. Add knowledge-map connections, review mode, and the design-lab workspace in response to validated curriculum needs. Reuse registered lessons and domains; avoid a second set of rules for standalone tools or labs.
 
 ## Explicitly deferred
 

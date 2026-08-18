@@ -1443,18 +1443,18 @@ Status: **M4 complete for two representative lessons; broader seed conversion in
 
 Do not start until at least one real curriculum topic requires it.
 
-- [ ] Simulation shell
-- [ ] Play / pause / step / reset primitives
-- [ ] Scenario presets
-- [ ] Metric panel
-- [ ] Event timeline
-- [ ] Failure injection pattern
-- [ ] SVG visualization conventions
-- [ ] React Flow conventions
-- [ ] Chart conventions
-- [ ] Reduced motion support
+- [x] Simulation shell
+- [x] Play / pause / step / reset primitives
+- [x] Scenario presets
+- [x] Metric panel
+- [x] Event timeline
+- [x] Failure injection pattern
+- [x] SVG visualization conventions
+- [x] React Flow conventions
+- [x] Chart conventions
+- [x] Reduced motion support
 
-Status: **Not started**
+Status: **M5 complete; renderer conventions are documented and applied where relevant**
 
 ---
 
@@ -1462,18 +1462,18 @@ Status: **Not started**
 
 Recommended order:
 
-- [ ] Horizontal Scaling
+- [x] Horizontal Scaling
 - [ ] Tail Latency
 - [ ] CAP
 - [ ] Load Balancing
-- [ ] Consistent Hashing
+- [x] Consistent Hashing
 - [ ] Transaction Isolation
 - [ ] Cache Stampede
 - [ ] Queue + Backpressure
 - [ ] Retry + Jitter
 - [ ] Token Bucket
 
-Status: **Not started**
+Status: **2 of 10 representative topics complete in M5**
 
 ---
 
@@ -1539,13 +1539,13 @@ Status: **Not started**
 
 Current milestone:
 
-> **M4 — Structured quiz system — Complete**
+> **M5 — Visualization foundation and first simulations — Complete**
 
 Primary goal:
 
-Provide typed and validated quiz data, deterministic framework-independent evaluation, accessible answer/feedback/retry interactions, immutable attempt identity, local-first attempt persistence, and one or two real theory → quiz → progress slices.
+Provide deterministic model-first simulations, a small accessible shared shell, responsive renderers, scenario and failure controls, reduced-motion behavior, and explicit local-first scenario completion persistence on one simple and one stateful lesson.
 
-Structured quizzes now ship for Back-of-the-Envelope Estimation and Consistent Hashing. Bulk seed conversion, simulations, authentication, a backend, and remote synchronization remain deferred to later milestones.
+Interactive simulations now ship for Horizontal vs Vertical Scaling and Consistent Hashing. Consistent Hashing forms a complete theory → visualization → quiz → progress slice. Broader visualization coverage, authentication, a backend, and remote synchronization remain deferred to later milestones.
 
 ---
 
@@ -1559,7 +1559,7 @@ Update this section whenever Codex finishes a meaningful task.
 
 ## Active Milestone
 
-`M4 — Structured quiz system — Complete`
+`M5 — Visualization foundation and first simulations — Complete`
 
 ## Currently Working On
 
@@ -1569,9 +1569,17 @@ Update this section whenever Codex finishes a meaningful task.
 - [x] Theory authoring — all 135 lessons across Modules 00–13 complete
 - [x] Local progress domain, persistence, portable backup, and minimal reader controls
 - [x] Typed quiz domain, two representative quiz slices, accessible quiz UI, and local attempt persistence
+- [x] Shared simulation shell, two deterministic interactive lessons, and local scenario completion persistence
 
 ## Recently Completed
 
+- Completed M5 with deterministic model/renderer separation and interactive Horizontal Scaling and Consistent Hashing lessons.
+- Added an accessible shared shell with play, pause, step, reset, speed, presets, metrics, bounded events, failure actions, explicit completion, storage feedback, responsive SVG state, and reduced-motion behavior.
+- Modeled capacity, queueing, rejection, warm-up, scale-up downtime, shared dependencies, failures, recovery, session skew, and hot keys for horizontal scaling without one DOM entity per request.
+- Modeled modulo hashing, one-token rings, virtual nodes, replicas, membership remapping, copy/verify migration, cutover, node failure, hot keys, and aggregated 10,000-key scenarios with fixed deterministic placement.
+- Registered stable visualization IDs through validated lesson metadata and a narrow dynamic client boundary while keeping lesson routes server rendered and theory-only lessons usable.
+- Extended `ProgressRepository` with immutable scenario completions, atomic advancement to `visualization-complete`, IndexedDB version 4's third store, version-4 exports, migrations from versions 1–3, atomic three-store import, and scoped reset.
+- Accepted ADR-005 for deterministic simulation boundaries, explicit completion persistence, storage migration, accessibility, reduced motion, and rendering conventions.
 - Completed M4 with a separate typed quiz registry, strict question/answer validation, pure deterministic scoring, explanations, concept tags, and structured quizzes for `00-03-estimation` and `04-10-consistent-hashing`.
 - Defined single-choice exact matching, order-independent all-or-nothing multiple choice, inclusive absolute numeric tolerance with explicit units, and the PRD's exact 80% pass threshold.
 - Extended `ProgressRepository` with immutable caller-identified attempts, idempotent duplicate saves, atomic pass-to-`quiz-passed` transitions, deterministic weak-concept tags, and scoped reset semantics.
@@ -1606,10 +1614,11 @@ None known.
 
 ## Next Recommended Tasks
 
-1. Begin Stage E/F visualization work with one simple and one stateful flagship lesson so real models drive shared controls.
-2. Add more structured quizzes only in response to focused lesson work; do not bulk-convert all remaining seeds.
-3. Use persisted incorrect concept tags when a later review-mode milestone defines prioritization and scheduling.
-4. Consider search alongside a focused reader improvement now that the complete corpus and local progress model exist.
+1. Add Tail Latency as the next simulation, reusing the proven shell while introducing time-series/chart behavior only where the lesson requires it.
+2. Follow with CAP or Load Balancing to validate architecture-graph conventions against another real engine.
+3. Add more structured quizzes only in response to focused lesson work; do not bulk-convert all remaining seeds.
+4. Use persisted incorrect concept tags when a later review-mode milestone defines prioritization and scheduling.
+5. Consider search alongside a focused reader improvement now that the complete corpus and local progress model exist.
 
 ---
 
@@ -1626,6 +1635,7 @@ Record major decisions here in concise form.
 | 2026-08-18 | Begin the theory reader after Modules 00–03 | Twenty-nine real lessons are sufficient to validate the schema and reading experience before more curriculum depends on them; see ADR-002. |
 | 2026-08-18 | Versioned local progress behind a repository boundary | Monotonic domain rules, lazy IndexedDB, atomic replacement imports, and explicit migrations keep local learner data deterministic and portable; see ADR-003. |
 | 2026-08-18 | Deterministic structured quizzes with immutable attempts | Exact scoring rules, caller-generated attempt identity, separate attempt storage, and versioned atomic migration keep quiz behavior testable and local-first; see ADR-004. |
+| 2026-08-18 | Deterministic simulations with explicit scenario completion | Pure engines, narrow client renderers, bounded presentation state, and immutable completion records keep visual learning testable, accessible, and local-first; see ADR-005. |
 
 For decisions needing deeper context, create an ADR under `docs/decisions/`.
 

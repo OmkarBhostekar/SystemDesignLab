@@ -1,6 +1,6 @@
 # Module 01 — Foundations
 
-**Status:** Theory complete. Interactive visualizations and structured quizzes remain future work; each lesson includes a visualization specification and quiz seeds.
+**Status:** Theory complete. Horizontal vs Vertical Scaling now includes an interactive simulation; other visualizations and structured quizzes remain incremental work, and every lesson retains its visualization specification and quiz seeds.
 
 ## Purpose
 

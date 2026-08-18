@@ -77,16 +77,17 @@ Run the same contract suite against an in-memory repository and the IndexedDB ad
 - save then read returns equivalent normalized data,
 - multiple lesson records remain isolated,
 - quiz attempts append or update according to the documented rule,
+- simulation completions are immutable, idempotent, and advance the matching lesson,
 - export contains a schema version and all required records,
 - an exported payload can be imported into an empty repository,
 - invalid or unsupported import data fails before partial replacement,
-- reset removes progress and attempts but does not silently change preferences,
+- reset removes progress, attempts, and completions but does not silently change preferences,
 - storage failures surface as actionable errors rather than being treated as success,
 - schema migrations preserve compatible data when a version is introduced.
 
 Use a fake IndexedDB implementation or browser-capable test environment for adapter tests. Do not let component tests mock away the repository contract so thoroughly that serialization and migration behavior are never exercised.
 
-M4 runs the shared contract against `InMemoryProgressRepository` and `IndexedDbProgressRepository` for both lessons and immutable quiz attempts. Adapter tests use the standards-compatible `fake-indexeddb` development dependency and isolated database names to verify cross-instance persistence, the M3 database-version-2 to version-3 migration, corrupted records, lazy browser access, surfaced failures, two-store rollback, and scoped reset. Pure serialization tests cover version-1 and M3 version-2 imports into version 3 plus strict rejection of partial, duplicate, malformed, and unsupported exports. Client-boundary tests inject repositories so learner-visible pending, success, failure, retry, and reset states stay deterministic; serialization and persistence remain covered separately rather than mocked away.
+M5 runs the shared contract against `InMemoryProgressRepository` and `IndexedDbProgressRepository` for lessons, immutable quiz attempts, and immutable simulation completions. Adapter tests use the standards-compatible `fake-indexeddb` development dependency and isolated database names to verify cross-instance persistence, database-version-2 and version-3 migrations into version 4, corrupted records, lazy browser access, surfaced failures, three-store rollback, and scoped reset. Pure serialization tests cover export versions 1–3 importing into version 4 plus strict rejection of partial, duplicate, malformed, and unsupported exports. Client-boundary tests inject repositories so learner-visible pending, success, failure, retry, reset, and completion states stay deterministic; serialization and persistence remain covered separately rather than mocked away.
 
 ## Quiz evaluation tests
 
@@ -113,6 +114,8 @@ Simulation tests should use the model/action API, not animation timing. For ever
 - failure injection and recovery paths,
 - metric updates and event ordering,
 - invalid or out-of-range controls,
+
+M5's model suites exercise horizontal capacity, overload, queueing, warm-up, shared dependencies, hot keys, failures, and recovery, plus modulo and ring placement, virtual nodes, replication, membership changes, durable migration, cutover, hot keys, and 10,000-key aggregation. UI tests cover native keyboard controls, fake-timer autoplay, automatic pause on completion, reduced-motion stepping, unmount cleanup, bounded timelines, scenario reset, renderer state, explicit persistence, and retryable storage errors. Registry and route tests verify stable lesson mappings, narrow client loading, server rendering without browser storage, and theory-only fallback behavior.
 - invariant preservation after long or repeated runs.
 
 Useful invariants include:
