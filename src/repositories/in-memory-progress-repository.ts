@@ -5,13 +5,17 @@ import {
   mergeLessonProgress,
   normalizeProgressResetScope,
   normalizeQuizAttempt,
+  normalizeSimulationCompletion,
+  normalizeSimulationCompletionId,
   quizAttemptsEqual,
+  simulationCompletionsEqual,
   ProgressValidationError,
   type LessonProgress,
   type LessonProgressMilestone,
   type ProgressRepository,
   type ProgressResetScope,
   type QuizAttempt,
+  type SimulationCompletion,
 } from "@/domain/progress";
 import { createProgressExport, normalizeProgressImport } from "./progress-serialization";
 
@@ -27,6 +31,12 @@ function cloneQuizAttempt(attempt: QuizAttempt): QuizAttempt {
   return normalizeQuizAttempt(attempt);
 }
 
+function cloneSimulationCompletion(
+  completion: SimulationCompletion,
+): SimulationCompletion {
+  return normalizeSimulationCompletion(completion);
+}
+
 /**
  * A deterministic, process-local ProgressRepository implementation.
  *
@@ -38,6 +48,7 @@ function cloneQuizAttempt(attempt: QuizAttempt): QuizAttempt {
 export class InMemoryProgressRepository implements ProgressRepository {
   private lessons = new Map<string, LessonProgress>();
   private quizAttempts = new Map<string, QuizAttempt>();
+  private simulationCompletions = new Map<string, SimulationCompletion>();
 
   async getLessonProgress(lessonId: string): Promise<LessonProgress | null> {
     assertLessonId(lessonId);
@@ -104,12 +115,51 @@ export class InMemoryProgressRepository implements ProgressRepository {
     return cloneQuizAttempt(normalized);
   }
 
+  async getSimulationCompletion(
+    completionId: string,
+  ): Promise<SimulationCompletion | null> {
+    const completion = this.simulationCompletions.get(
+      normalizeSimulationCompletionId(completionId),
+    );
+    return completion ? cloneSimulationCompletion(completion) : null;
+  }
+
+  async listSimulationCompletions(): Promise<SimulationCompletion[]> {
+    return [...this.simulationCompletions.values()]
+      .sort((left, right) => left.completionId.localeCompare(right.completionId))
+      .map(cloneSimulationCompletion);
+  }
+
+  async saveSimulationCompletion(
+    completion: SimulationCompletion,
+  ): Promise<SimulationCompletion> {
+    const normalized = normalizeSimulationCompletion(completion);
+    const existing = this.simulationCompletions.get(normalized.completionId);
+    if (existing) {
+      if (!simulationCompletionsEqual(existing, normalized)) {
+        throw new ProgressValidationError(
+          `Simulation completion ID ${normalized.completionId} is already used by different completion data.`,
+        );
+      }
+      return cloneSimulationCompletion(existing);
+    }
+    this.simulationCompletions.set(
+      normalized.completionId,
+      cloneSimulationCompletion(normalized),
+    );
+    const current = this.lessons.get(normalized.lessonId) ?? null;
+    const next = advanceLessonProgress(current, normalized.lessonId, "visualization-complete");
+    this.lessons.set(next.lessonId, cloneLessonProgress(next));
+    return cloneSimulationCompletion(normalized);
+  }
+
   async exportProgress() {
     // createProgressExport validates and sorts a fresh array, and therefore
     // never exposes the Map or any of its records.
     return createProgressExport(
       [...this.lessons.values()].map(cloneLessonProgress),
       [...this.quizAttempts.values()].map(cloneQuizAttempt),
+      [...this.simulationCompletions.values()].map(cloneSimulationCompletion),
     );
   }
 
@@ -126,8 +176,16 @@ export class InMemoryProgressRepository implements ProgressRepository {
     for (const attempt of normalized.quizAttempts) {
       replacementAttempts.set(attempt.attemptId, cloneQuizAttempt(attempt));
     }
+    const replacementCompletions = new Map<string, SimulationCompletion>();
+    for (const completion of normalized.simulationCompletions) {
+      replacementCompletions.set(
+        completion.completionId,
+        cloneSimulationCompletion(completion),
+      );
+    }
     this.lessons = replacement;
     this.quizAttempts = replacementAttempts;
+    this.simulationCompletions = replacementCompletions;
   }
 
   async resetProgress(scope: ProgressResetScope): Promise<void> {
@@ -136,6 +194,7 @@ export class InMemoryProgressRepository implements ProgressRepository {
     if (normalizedScope.kind === "all") {
       this.lessons.clear();
       this.quizAttempts.clear();
+      this.simulationCompletions.clear();
       return;
     }
 
@@ -143,6 +202,11 @@ export class InMemoryProgressRepository implements ProgressRepository {
     for (const lessonId of selected) this.lessons.delete(lessonId);
     for (const [attemptId, attempt] of this.quizAttempts) {
       if (selected.has(attempt.lessonId)) this.quizAttempts.delete(attemptId);
+    }
+    for (const [completionId, completion] of this.simulationCompletions) {
+      if (selected.has(completion.lessonId)) {
+        this.simulationCompletions.delete(completionId);
+      }
     }
   }
 }

@@ -6,7 +6,10 @@ import {
   mergeLessonProgress,
   normalizeProgressResetScope,
   normalizeQuizAttempt,
+  normalizeSimulationCompletion,
+  normalizeSimulationCompletionId,
   quizAttemptsEqual,
+  simulationCompletionsEqual,
   ProgressStorageError,
   ProgressValidationError,
   type LessonProgress,
@@ -14,6 +17,7 @@ import {
   type ProgressRepository,
   type ProgressResetScope,
   type QuizAttempt,
+  type SimulationCompletion,
 } from "@/domain/progress";
 import { createProgressExport, normalizeProgressImport } from "@/repositories/progress-serialization";
 
@@ -24,12 +28,14 @@ import { createProgressExport, normalizeProgressImport } from "@/repositories/pr
  * contract or the exported format.
  */
 export const INDEXED_DB_PROGRESS_DATABASE_NAME = "system-design-visual-learning-lab-progress";
-export const INDEXED_DB_PROGRESS_DATABASE_VERSION = 3;
+export const INDEXED_DB_PROGRESS_DATABASE_VERSION = 4;
 export const INDEXED_DB_PROGRESS_STORE_NAME = "lesson-progress";
 export const INDEXED_DB_QUIZ_ATTEMPT_STORE_NAME = "quiz-attempts";
+export const INDEXED_DB_SIMULATION_COMPLETION_STORE_NAME = "simulation-completions";
 
 const LESSON_PROGRESS_KEY_PATH = "lessonId";
 const QUIZ_ATTEMPT_KEY_PATH = "attemptId";
+const SIMULATION_COMPLETION_KEY_PATH = "completionId";
 
 export interface IndexedDbProgressRepositoryOptions {
   /** Inject a factory in tests or browser integrations. Resolution is lazy. */
@@ -97,6 +103,10 @@ function readStoredProgress(value: unknown): LessonProgress {
 
 function readStoredQuizAttempt(value: unknown): QuizAttempt {
   return normalizeQuizAttempt(value);
+}
+
+function readStoredSimulationCompletion(value: unknown): SimulationCompletion {
+  return normalizeSimulationCompletion(value);
 }
 
 /**
@@ -190,13 +200,46 @@ export class IndexedDbProgressRepository implements ProgressRepository {
     );
   }
 
+  async getSimulationCompletion(
+    completionId: string,
+  ): Promise<SimulationCompletion | null> {
+    const normalizedId = normalizeSimulationCompletionId(completionId);
+    return this.withDatabase("getSimulationCompletion", (database) =>
+      this.runGetCompletionTransaction(
+        database,
+        "getSimulationCompletion",
+        normalizedId,
+      ),
+    );
+  }
+
+  async listSimulationCompletions(): Promise<SimulationCompletion[]> {
+    return this.withDatabase("listSimulationCompletions", (database) =>
+      this.runListCompletionsTransaction(database, "listSimulationCompletions"),
+    );
+  }
+
+  async saveSimulationCompletion(
+    completion: SimulationCompletion,
+  ): Promise<SimulationCompletion> {
+    const normalized = normalizeSimulationCompletion(completion);
+    return this.withDatabase("saveSimulationCompletion", (database) =>
+      this.runSaveCompletionTransaction(
+        database,
+        "saveSimulationCompletion",
+        normalized,
+      ),
+    );
+  }
+
   async exportProgress(): Promise<ProgressExport> {
     return this.withDatabase("exportProgress", async (database) => {
-      const [lessons, quizAttempts] = await Promise.all([
+      const [lessons, quizAttempts, simulationCompletions] = await Promise.all([
         this.runListTransaction(database, "exportProgress"),
         this.runListAttemptsTransaction(database, "exportProgress"),
+        this.runListCompletionsTransaction(database, "exportProgress"),
       ]);
-      return createProgressExport(lessons, quizAttempts);
+      return createProgressExport(lessons, quizAttempts, simulationCompletions);
     });
   }
 
@@ -210,6 +253,7 @@ export class IndexedDbProgressRepository implements ProgressRepository {
         "importProgress",
         normalized.lessons,
         normalized.quizAttempts,
+        normalized.simulationCompletions,
       ),
     );
   }
@@ -291,6 +335,22 @@ export class IndexedDbProgressRepository implements ProgressRepository {
           if (attemptStore && attemptStore.keyPath !== QUIZ_ATTEMPT_KEY_PATH) {
             throw new Error(
               `The ${INDEXED_DB_QUIZ_ATTEMPT_STORE_NAME} store has an incompatible key path.`,
+            );
+          }
+          if (!database.objectStoreNames.contains(INDEXED_DB_SIMULATION_COMPLETION_STORE_NAME)) {
+            database.createObjectStore(INDEXED_DB_SIMULATION_COMPLETION_STORE_NAME, {
+              keyPath: SIMULATION_COMPLETION_KEY_PATH,
+            });
+          }
+          const completionStore = transaction?.objectStore(
+            INDEXED_DB_SIMULATION_COMPLETION_STORE_NAME,
+          );
+          if (
+            completionStore &&
+            completionStore.keyPath !== SIMULATION_COMPLETION_KEY_PATH
+          ) {
+            throw new Error(
+              `The ${INDEXED_DB_SIMULATION_COMPLETION_STORE_NAME} store has an incompatible key path.`,
             );
           }
         } catch (cause) {
@@ -658,11 +718,226 @@ export class IndexedDbProgressRepository implements ProgressRepository {
     });
   }
 
+  private runGetCompletionTransaction(
+    database: IDBDatabase,
+    operation: string,
+    completionId: string,
+  ): Promise<SimulationCompletion | null> {
+    return new Promise<SimulationCompletion | null>((resolve, reject) => {
+      let transaction: IDBTransaction | undefined;
+      let result: SimulationCompletion | null = null;
+      let settled = false;
+      const fail = (phase: string, cause: unknown) => {
+        if (settled) return;
+        settled = true;
+        try { transaction?.abort(); } catch { /* Keep the original failure. */ }
+        rejectFailure(reject, operation, phase, cause);
+      };
+      try {
+        transaction = database.transaction(
+          INDEXED_DB_SIMULATION_COMPLETION_STORE_NAME,
+          "readonly",
+        );
+        transaction.onerror = () => fail(
+          "the transaction",
+          transaction?.error ?? new Error("The transaction failed."),
+        );
+        transaction.onabort = () => fail(
+          "the transaction",
+          transaction?.error ?? new Error("The transaction was aborted."),
+        );
+        transaction.oncomplete = () => {
+          if (settled) return;
+          settled = true;
+          resolve(result ? normalizeSimulationCompletion(result) : null);
+        };
+        const request = transaction
+          .objectStore(INDEXED_DB_SIMULATION_COMPLETION_STORE_NAME)
+          .get(completionId);
+        request.onerror = () => fail(
+          "the read request",
+          request.error ?? new Error("The read request failed."),
+        );
+        request.onsuccess = () => {
+          try {
+            result = request.result == null
+              ? null
+              : readStoredSimulationCompletion(request.result);
+          } catch (cause) {
+            fail("reading the stored simulation completion", cause);
+          }
+        };
+      } catch (cause) {
+        fail("creating the transaction", cause);
+      }
+    });
+  }
+
+  private runListCompletionsTransaction(
+    database: IDBDatabase,
+    operation: string,
+  ): Promise<SimulationCompletion[]> {
+    return new Promise<SimulationCompletion[]>((resolve, reject) => {
+      let transaction: IDBTransaction | undefined;
+      let result: SimulationCompletion[] = [];
+      let settled = false;
+      const fail = (phase: string, cause: unknown) => {
+        if (settled) return;
+        settled = true;
+        try { transaction?.abort(); } catch { /* Keep the original failure. */ }
+        rejectFailure(reject, operation, phase, cause);
+      };
+      try {
+        transaction = database.transaction(
+          INDEXED_DB_SIMULATION_COMPLETION_STORE_NAME,
+          "readonly",
+        );
+        transaction.onerror = () => fail(
+          "the transaction",
+          transaction?.error ?? new Error("The transaction failed."),
+        );
+        transaction.onabort = () => fail(
+          "the transaction",
+          transaction?.error ?? new Error("The transaction was aborted."),
+        );
+        transaction.oncomplete = () => {
+          if (settled) return;
+          settled = true;
+          resolve(result
+            .map(normalizeSimulationCompletion)
+            .sort((left, right) => left.completionId.localeCompare(right.completionId)));
+        };
+        const request = transaction
+          .objectStore(INDEXED_DB_SIMULATION_COMPLETION_STORE_NAME)
+          .getAll();
+        request.onerror = () => fail(
+          "the read request",
+          request.error ?? new Error("The read request failed."),
+        );
+        request.onsuccess = () => {
+          try {
+            result = ((request.result as unknown[] | undefined) ?? [])
+              .map(readStoredSimulationCompletion);
+          } catch (cause) {
+            fail("reading stored simulation completions", cause);
+          }
+        };
+      } catch (cause) {
+        fail("creating the transaction", cause);
+      }
+    });
+  }
+
+  private runSaveCompletionTransaction(
+    database: IDBDatabase,
+    operation: string,
+    completion: SimulationCompletion,
+  ): Promise<SimulationCompletion> {
+    return new Promise<SimulationCompletion>((resolve, reject) => {
+      let transaction: IDBTransaction | undefined;
+      let result: SimulationCompletion | undefined;
+      let settled = false;
+      const fail = (phase: string, cause: unknown) => {
+        if (settled) return;
+        settled = true;
+        try { transaction?.abort(); } catch { /* Keep the original failure. */ }
+        rejectFailure(reject, operation, phase, cause);
+      };
+      try {
+        transaction = database.transaction(
+          [
+            INDEXED_DB_SIMULATION_COMPLETION_STORE_NAME,
+            INDEXED_DB_PROGRESS_STORE_NAME,
+          ],
+          "readwrite",
+        );
+        transaction.onerror = () => fail(
+          "the transaction",
+          transaction?.error ?? new Error("The transaction failed."),
+        );
+        transaction.onabort = () => fail(
+          "the transaction",
+          transaction?.error ?? new Error("The transaction was aborted."),
+        );
+        transaction.oncomplete = () => {
+          if (settled) return;
+          if (!result) {
+            fail("the transaction", new Error("The transaction completed without a result."));
+            return;
+          }
+          settled = true;
+          resolve(normalizeSimulationCompletion(result));
+        };
+
+        const completionStore = transaction.objectStore(
+          INDEXED_DB_SIMULATION_COMPLETION_STORE_NAME,
+        );
+        const getCompletion = completionStore.get(completion.completionId);
+        getCompletion.onerror = () => fail(
+          "the completion read request",
+          getCompletion.error ?? new Error("The read request failed."),
+        );
+        getCompletion.onsuccess = () => {
+          try {
+            if (getCompletion.result != null) {
+              const existing = readStoredSimulationCompletion(getCompletion.result);
+              if (!simulationCompletionsEqual(existing, completion)) {
+                throw new ProgressValidationError(
+                  `Simulation completion ID ${completion.completionId} is already used by different completion data.`,
+                );
+              }
+              result = existing;
+              return;
+            }
+            result = normalizeSimulationCompletion(completion);
+            const putCompletion = completionStore.put(result);
+            putCompletion.onerror = () => fail(
+              "the completion write request",
+              putCompletion.error ?? new Error("The write request failed."),
+            );
+
+            const lessonStore = transaction?.objectStore(INDEXED_DB_PROGRESS_STORE_NAME);
+            if (!lessonStore) throw new Error("Lesson progress store is unavailable.");
+            const getLesson = lessonStore.get(completion.lessonId);
+            getLesson.onerror = () => fail(
+              "the lesson read request",
+              getLesson.error ?? new Error("The read request failed."),
+            );
+            getLesson.onsuccess = () => {
+              try {
+                const current = getLesson.result == null
+                  ? null
+                  : readStoredProgress(getLesson.result);
+                const next = advanceLessonProgress(
+                  current,
+                  completion.lessonId,
+                  "visualization-complete",
+                );
+                const putLesson = lessonStore.put(next);
+                putLesson.onerror = () => fail(
+                  "the lesson write request",
+                  putLesson.error ?? new Error("The write request failed."),
+                );
+              } catch (cause) {
+                fail("advancing lesson progress", cause);
+              }
+            };
+          } catch (cause) {
+            fail("saving the simulation completion", cause);
+          }
+        };
+      } catch (cause) {
+        fail("creating the transaction", cause);
+      }
+    });
+  }
+
   private runReplaceTransaction(
     database: IDBDatabase,
     operation: string,
     lessons: readonly LessonProgress[],
     quizAttempts: readonly QuizAttempt[],
+    simulationCompletions: readonly SimulationCompletion[],
   ): Promise<void> {
     return new Promise<void>((resolve, reject) => {
       let transaction: IDBTransaction | undefined;
@@ -681,7 +956,11 @@ export class IndexedDbProgressRepository implements ProgressRepository {
 
       try {
         transaction = database.transaction(
-          [INDEXED_DB_PROGRESS_STORE_NAME, INDEXED_DB_QUIZ_ATTEMPT_STORE_NAME],
+          [
+            INDEXED_DB_PROGRESS_STORE_NAME,
+            INDEXED_DB_QUIZ_ATTEMPT_STORE_NAME,
+            INDEXED_DB_SIMULATION_COMPLETION_STORE_NAME,
+          ],
           "readwrite",
         );
         transaction.onerror = () => {
@@ -719,6 +998,27 @@ export class IndexedDbProgressRepository implements ProgressRepository {
             fail("the quiz-attempt write request", putAttempt.error ?? new Error("The write request failed."));
           };
         }
+        const completionStore = transaction.objectStore(
+          INDEXED_DB_SIMULATION_COMPLETION_STORE_NAME,
+        );
+        const clearCompletions = completionStore.clear();
+        clearCompletions.onerror = () => {
+          fail(
+            "the simulation-completion clear request",
+            clearCompletions.error ?? new Error("The clear request failed."),
+          );
+        };
+        for (const completion of simulationCompletions) {
+          const putCompletion = completionStore.put(
+            normalizeSimulationCompletion(completion),
+          );
+          putCompletion.onerror = () => {
+            fail(
+              "the simulation-completion write request",
+              putCompletion.error ?? new Error("The write request failed."),
+            );
+          };
+        }
       } catch (cause) {
         fail("creating the replacement transaction", cause);
       }
@@ -747,7 +1047,11 @@ export class IndexedDbProgressRepository implements ProgressRepository {
 
       try {
         transaction = database.transaction(
-          [INDEXED_DB_PROGRESS_STORE_NAME, INDEXED_DB_QUIZ_ATTEMPT_STORE_NAME],
+          [
+            INDEXED_DB_PROGRESS_STORE_NAME,
+            INDEXED_DB_QUIZ_ATTEMPT_STORE_NAME,
+            INDEXED_DB_SIMULATION_COMPLETION_STORE_NAME,
+          ],
           "readwrite",
         );
         transaction.onerror = () => {
@@ -764,6 +1068,9 @@ export class IndexedDbProgressRepository implements ProgressRepository {
 
         const store = transaction.objectStore(INDEXED_DB_PROGRESS_STORE_NAME);
         const attemptStore = transaction.objectStore(INDEXED_DB_QUIZ_ATTEMPT_STORE_NAME);
+        const completionStore = transaction.objectStore(
+          INDEXED_DB_SIMULATION_COMPLETION_STORE_NAME,
+        );
         if (scope.kind === "all") {
           const clearRequest = store.clear();
           clearRequest.onerror = () => {
@@ -772,6 +1079,13 @@ export class IndexedDbProgressRepository implements ProgressRepository {
           const clearAttempts = attemptStore.clear();
           clearAttempts.onerror = () => {
             fail("the quiz-attempt clear request", clearAttempts.error ?? new Error("The clear request failed."));
+          };
+          const clearCompletions = completionStore.clear();
+          clearCompletions.onerror = () => {
+            fail(
+              "the simulation-completion clear request",
+              clearCompletions.error ?? new Error("The clear request failed."),
+            );
           };
         } else {
           for (const lessonId of scope.lessonIds) {
@@ -800,6 +1114,30 @@ export class IndexedDbProgressRepository implements ProgressRepository {
               }
             } catch (cause) {
               fail("reading quiz attempts for reset", cause);
+            }
+          };
+          const getCompletions = completionStore.getAll();
+          getCompletions.onerror = () => {
+            fail(
+              "the simulation-completion read request",
+              getCompletions.error ?? new Error("The read request failed."),
+            );
+          };
+          getCompletions.onsuccess = () => {
+            try {
+              for (const raw of (getCompletions.result as unknown[] | undefined) ?? []) {
+                const completion = readStoredSimulationCompletion(raw);
+                if (!selected.has(completion.lessonId)) continue;
+                const deleteCompletion = completionStore.delete(completion.completionId);
+                deleteCompletion.onerror = () => {
+                  fail(
+                    "the simulation-completion delete request",
+                    deleteCompletion.error ?? new Error("The delete request failed."),
+                  );
+                };
+              }
+            } catch (cause) {
+              fail("reading simulation completions for reset", cause);
             }
           };
         }

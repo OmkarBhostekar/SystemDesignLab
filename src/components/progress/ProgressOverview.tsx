@@ -105,7 +105,7 @@ export function ProgressOverview({ lessons, repository, confirmReset }: Progress
     await runAction(async () => {
       await progressRepository.resetProgress({ kind: "all" });
       await refresh();
-      setMessage("All lesson progress and quiz attempts were reset. Display preferences were not changed.");
+      setMessage("All lesson progress, quiz attempts, and simulation completions were reset. Display preferences were not changed.");
     });
   }
 

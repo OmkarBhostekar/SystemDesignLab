@@ -6,6 +6,7 @@ import {
   type LessonProgress,
   type ProgressRepository,
   type QuizAttempt,
+  type SimulationCompletion,
 } from "@/domain/progress";
 
 function quizAttempt(overrides: Partial<QuizAttempt> = {}): QuizAttempt {
@@ -19,6 +20,18 @@ function quizAttempt(overrides: Partial<QuizAttempt> = {}): QuizAttempt {
     scorePercent: 100,
     passed: true,
     incorrectConceptTags: [],
+    ...overrides,
+  };
+}
+
+function simulationCompletion(
+  overrides: Partial<SimulationCompletion> = {},
+): SimulationCompletion {
+  return {
+    completionId: "consistent-hash-ring--vnode-ring",
+    visualizationId: "consistent-hash-ring",
+    lessonId: "04-10-consistent-hashing",
+    scenarioId: "vnode-ring",
     ...overrides,
   };
 }
@@ -157,6 +170,48 @@ export function defineProgressRepositoryContract(
       });
     });
 
+    it("saves, reads, lists, and idempotently deduplicates simulation completions", async () => {
+      const repository = await createRepository();
+      const later = simulationCompletion({
+        completionId: "horizontal-scaling--stateless-scale-out",
+        visualizationId: "horizontal-scaling",
+        lessonId: "01-02-horizontal-vs-vertical-scaling",
+        scenarioId: "stateless-scale-out",
+      });
+      const first = simulationCompletion();
+      await repository.saveSimulationCompletion(later);
+      const saved = await repository.saveSimulationCompletion(first);
+      saved.scenarioId = "mutated";
+
+      expect(await repository.getSimulationCompletion(first.completionId)).toEqual(first);
+      expect(await repository.listSimulationCompletions()).toEqual([first, later]);
+      await expect(repository.saveSimulationCompletion({ ...first })).resolves.toEqual(first);
+      await expect(repository.getSimulationCompletion("missing--scenario")).resolves.toBeNull();
+      await expect(repository.saveSimulationCompletion({
+        ...first,
+        lessonId: "01-02-horizontal-vs-vertical-scaling",
+      })).rejects.toThrow(ProgressValidationError);
+    });
+
+    it("atomically advances visualization completion without regressing later progress", async () => {
+      const repository = await createRepository();
+      const completion = simulationCompletion();
+      await repository.saveSimulationCompletion(completion);
+      await expect(repository.getLessonProgress(completion.lessonId)).resolves.toEqual({
+        lessonId: completion.lessonId,
+        stage: "visualization-complete",
+      });
+      await repository.applyLessonMilestone(completion.lessonId, "mastered");
+      await repository.saveSimulationCompletion(simulationCompletion({
+        completionId: "consistent-hash-ring--celebrity-key",
+        scenarioId: "celebrity-key",
+      }));
+      await expect(repository.getLessonProgress(completion.lessonId)).resolves.toEqual({
+        lessonId: completion.lessonId,
+        stage: "mastered",
+      });
+    });
+
     it("clones values at both input and output boundaries", async () => {
       const repository = await createRepository();
       const input: LessonProgress = {
@@ -194,6 +249,8 @@ export function defineProgressRepositoryContract(
       });
       const attempt = quizAttempt();
       await source.saveQuizAttempt(attempt);
+      const completion = simulationCompletion();
+      await source.saveSimulationCompletion(completion);
       const exportedWithAttempt = await source.exportProgress();
 
       await target.saveLessonProgress({
@@ -203,6 +260,7 @@ export function defineProgressRepositoryContract(
       await target.importProgress(exportedWithAttempt);
       expect(await target.listLessonProgress()).toEqual(exportedWithAttempt.lessons);
       expect(await target.listQuizAttempts()).toEqual([attempt]);
+      expect(await target.listSimulationCompletions()).toEqual([completion]);
 
       exportedWithAttempt.lessons[0]!.stage = "not-started";
       expect(await target.listLessonProgress()).toEqual([
@@ -224,11 +282,13 @@ export function defineProgressRepositoryContract(
         stage: "mastered",
       });
       await repository.saveQuizAttempt(quizAttempt({ attemptId: "attempt-before-import" }));
+      await repository.saveSimulationCompletion(simulationCompletion());
       await repository.importProgress(exported);
       const first = await repository.listLessonProgress();
       await repository.importProgress(exported);
       expect(await repository.listLessonProgress()).toEqual(first);
       await expect(repository.listQuizAttempts()).resolves.toEqual([]);
+      await expect(repository.listSimulationCompletions()).resolves.toEqual([]);
     });
 
     it("rejects invalid imports before changing existing state", async () => {
@@ -261,6 +321,7 @@ export function defineProgressRepositoryContract(
         stage: "mastered",
       });
       await repository.saveQuizAttempt(quizAttempt());
+      await repository.saveSimulationCompletion(simulationCompletion());
       await repository.saveLessonProgress({
         lessonId: "04-11-read-write-quorums",
         stage: "quiz-passed",
@@ -274,10 +335,12 @@ export function defineProgressRepositoryContract(
         { lessonId: "04-11-read-write-quorums", stage: "quiz-passed" },
       ]);
       await expect(repository.listQuizAttempts()).resolves.toEqual([]);
+      await expect(repository.listSimulationCompletions()).resolves.toEqual([]);
 
       await repository.resetProgress({ kind: "all" });
       await expect(repository.listLessonProgress()).resolves.toEqual([]);
       await expect(repository.listQuizAttempts()).resolves.toEqual([]);
+      await expect(repository.listSimulationCompletions()).resolves.toEqual([]);
     });
 
     it("validates the complete reset scope before changing records", async () => {

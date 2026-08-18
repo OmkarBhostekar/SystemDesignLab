@@ -29,7 +29,7 @@ export type ProgressResetScope =
   | { kind: "lessons"; lessonIds: readonly string[] };
 
 export const PROGRESS_EXPORT_FORMAT = "system-design-visual-learning-lab-progress";
-export const PROGRESS_EXPORT_VERSION = 3 as const;
+export const PROGRESS_EXPORT_VERSION = 4 as const;
 
 export interface QuizAttempt {
   attemptId: string;
@@ -43,9 +43,17 @@ export interface QuizAttempt {
   incorrectConceptTags: string[];
 }
 
+export interface SimulationCompletion {
+  completionId: string;
+  visualizationId: string;
+  lessonId: string;
+  scenarioId: string;
+}
+
 export interface ProgressExport {
   format: typeof PROGRESS_EXPORT_FORMAT;
   schemaVersion: typeof PROGRESS_EXPORT_VERSION;
   lessons: LessonProgress[];
   quizAttempts: QuizAttempt[];
+  simulationCompletions: SimulationCompletion[];
 }

@@ -5,11 +5,14 @@ import {
   UnsupportedProgressVersionError,
   assertLessonId,
   assertLessonProgress,
+  advanceLessonProgress,
   isLessonProgressStage,
   type LessonProgress,
   type ProgressExport,
   type QuizAttempt,
+  type SimulationCompletion,
   normalizeQuizAttempt,
+  normalizeSimulationCompletion,
 } from "@/domain/progress";
 
 interface LegacyProgressExportV1 {
@@ -23,9 +26,17 @@ interface LegacyProgressExportV2 {
   lessons: LessonProgress[];
 }
 
+interface LegacyProgressExportV3 {
+  format: typeof PROGRESS_EXPORT_FORMAT;
+  schemaVersion: 3;
+  lessons: LessonProgress[];
+  quizAttempts: QuizAttempt[];
+}
+
 export interface NormalizedProgressImport {
   lessons: LessonProgress[];
   quizAttempts: QuizAttempt[];
+  simulationCompletions: SimulationCompletion[];
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -106,15 +117,52 @@ function normalizeQuizAttempts(attempts: unknown): QuizAttempt[] {
   }).sort((left, right) => left.attemptId.localeCompare(right.attemptId));
 }
 
+function normalizeSimulationCompletions(completions: unknown): SimulationCompletion[] {
+  if (!Array.isArray(completions)) {
+    throw new ProgressValidationError(
+      "Progress export simulationCompletions must be an array.",
+    );
+  }
+  const seenCompletionIds = new Set<string>();
+  return completions.map((completion) => {
+    const normalized = normalizeSimulationCompletion(completion);
+    if (seenCompletionIds.has(normalized.completionId)) {
+      throw new ProgressValidationError(
+        `Progress export contains duplicate simulation completion ID: ${normalized.completionId}.`,
+      );
+    }
+    seenCompletionIds.add(normalized.completionId);
+    return normalized;
+  }).sort((left, right) => left.completionId.localeCompare(right.completionId));
+}
+
+function reconcileCompletionProgress(
+  lessons: readonly LessonProgress[],
+  completions: readonly SimulationCompletion[],
+): LessonProgress[] {
+  const byLesson = new Map(lessons.map((lesson) => [lesson.lessonId, { ...lesson }]));
+  for (const completion of completions) {
+    const current = byLesson.get(completion.lessonId) ?? null;
+    byLesson.set(
+      completion.lessonId,
+      advanceLessonProgress(current, completion.lessonId, "visualization-complete"),
+    );
+  }
+  return [...byLesson.values()].sort((left, right) => left.lessonId.localeCompare(right.lessonId));
+}
+
 export function createProgressExport(
   lessons: readonly LessonProgress[],
   quizAttempts: readonly QuizAttempt[],
+  simulationCompletions: readonly SimulationCompletion[] = [],
 ): ProgressExport {
+  const normalizedCompletions = normalizeSimulationCompletions(simulationCompletions);
   return {
     format: PROGRESS_EXPORT_FORMAT,
     schemaVersion: PROGRESS_EXPORT_VERSION,
-    lessons: normalizeLessons(lessons),
+    lessons: reconcileCompletionProgress(normalizeLessons(lessons), normalizedCompletions),
     quizAttempts: normalizeQuizAttempts(quizAttempts),
+    simulationCompletions: normalizedCompletions,
   };
 }
 
@@ -125,7 +173,7 @@ export function normalizeProgressImport(data: unknown): NormalizedProgressImport
   }
 
   if (parsed.schemaVersion === 1) {
-    return { lessons: migrateVersionOne(parsed), quizAttempts: [] };
+    return { lessons: migrateVersionOne(parsed), quizAttempts: [], simulationCompletions: [] };
   }
   if (parsed.schemaVersion === 2) {
     assertOnlyKeys(parsed, ["format", "schemaVersion", "lessons"]);
@@ -133,18 +181,47 @@ export function normalizeProgressImport(data: unknown): NormalizedProgressImport
     if (legacy.format !== PROGRESS_EXPORT_FORMAT) {
       throw new ProgressValidationError("Progress export format is not recognized.");
     }
-    return { lessons: normalizeLessons(legacy.lessons), quizAttempts: [] };
+    return {
+      lessons: normalizeLessons(legacy.lessons),
+      quizAttempts: [],
+      simulationCompletions: [],
+    };
+  }
+  if (parsed.schemaVersion === 3) {
+    assertOnlyKeys(parsed, ["format", "schemaVersion", "lessons", "quizAttempts"]);
+    const legacy = parsed as unknown as LegacyProgressExportV3;
+    if (legacy.format !== PROGRESS_EXPORT_FORMAT) {
+      throw new ProgressValidationError("Progress export format is not recognized.");
+    }
+    return {
+      lessons: normalizeLessons(legacy.lessons),
+      quizAttempts: normalizeQuizAttempts(legacy.quizAttempts),
+      simulationCompletions: [],
+    };
   }
   if (parsed.schemaVersion !== PROGRESS_EXPORT_VERSION) {
     throw new UnsupportedProgressVersionError(parsed.schemaVersion);
   }
 
-  assertOnlyKeys(parsed, ["format", "schemaVersion", "lessons", "quizAttempts"]);
+  assertOnlyKeys(parsed, [
+    "format",
+    "schemaVersion",
+    "lessons",
+    "quizAttempts",
+    "simulationCompletions",
+  ]);
   if (parsed.format !== PROGRESS_EXPORT_FORMAT) {
     throw new ProgressValidationError("Progress export format is not recognized.");
   }
+  const simulationCompletions = normalizeSimulationCompletions(
+    parsed.simulationCompletions,
+  );
   return {
-    lessons: normalizeLessons(parsed.lessons),
+    lessons: reconcileCompletionProgress(
+      normalizeLessons(parsed.lessons),
+      simulationCompletions,
+    ),
     quizAttempts: normalizeQuizAttempts(parsed.quizAttempts),
+    simulationCompletions,
   };
 }
