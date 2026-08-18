@@ -11,7 +11,9 @@ import { LessonMetadata, LessonStepper, TheoryOnlyState } from "@/components/les
 import { MdxContent } from "@/components/mdx";
 import { LessonProgressControl } from "@/components/progress";
 import { QuizPanel } from "@/components/quiz";
+import { VisualizationPanel } from "@/components/simulations";
 import { getQuiz } from "@/content/quizzes";
+import { getVisualization } from "@/content/visualizations";
 
 import {
   getAdjacentLessons,
@@ -64,7 +66,8 @@ export default async function LessonPage({ params }: LessonPageProps) {
   const navigation = getReaderModules(index).map(toSidebarModule);
   const lessonSummaries = index.lessons.map(toLessonSummary);
 
-  const visualizationAvailable = false;
+  const visualization = getVisualization(lesson.visualizationId);
+  const visualizationAvailable = visualization?.lessonId === lesson.id;
   const quiz = getQuiz(lesson.quizId);
   const quizAvailable = quiz?.lessonId === lesson.id;
 
@@ -94,6 +97,10 @@ export default async function LessonPage({ params }: LessonPageProps) {
           visualizationAvailable={visualizationAvailable}
           quizAvailable={quizAvailable}
         />
+
+        {visualizationAvailable && visualization ? (
+          <VisualizationPanel visualization={visualization} />
+        ) : null}
 
         <MdxContent
           source={source}
