@@ -9,6 +9,7 @@ import { LessonNavigation as GenericLessonNavigation } from "@/components/naviga
 import type { LessonNavigationItem } from "@/components/navigation/types";
 import { LessonMetadata, LessonStepper, TheoryOnlyState } from "@/components/lesson";
 import { MdxContent } from "@/components/mdx";
+import { LessonProgressControl } from "@/components/progress";
 
 import {
   getAdjacentLessons,
@@ -84,6 +85,7 @@ export default async function LessonPage({ params }: LessonPageProps) {
             visualizationAvailable={visualizationAvailable}
             quizAvailable={quizAvailable}
           />
+          <LessonProgressControl lessonId={lesson.id} />
         </header>
 
         <TheoryOnlyState

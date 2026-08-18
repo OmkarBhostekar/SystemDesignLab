@@ -793,6 +793,88 @@ summary {
   font-weight: 650;
 }
 
+.lesson-progress,
+.progress-overview {
+  display: grid;
+  gap: 1rem;
+  margin: 1.5rem 0 2rem;
+  padding: 1rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+}
+
+.lesson-progress {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+}
+
+.lesson-progress h2,
+.progress-overview h2 {
+  margin: 0.2rem 0 0;
+  color: var(--text-strong);
+  font-size: 1rem;
+}
+
+.lesson-progress p:not(.eyebrow),
+.progress-overview p:not(.eyebrow) {
+  margin: 0.25rem 0 0;
+  color: var(--text-muted);
+  font-size: 0.82rem;
+}
+
+.progress-overview {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+}
+
+.progress-overview__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  justify-content: flex-end;
+}
+
+.progress-overview__actions label {
+  cursor: pointer;
+}
+
+.progress-overview__actions label:focus-within {
+  outline: 3px solid var(--focus);
+  outline-offset: 3px;
+}
+
+.progress-overview__actions input[type="file"] {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+.progress-message,
+.progress-error {
+  grid-column: 1 / -1;
+}
+
+.progress-error {
+  color: var(--danger) !important;
+}
+
+@media (max-width: 48rem) {
+  .lesson-progress,
+  .progress-overview {
+    grid-template-columns: 1fr;
+    align-items: start;
+  }
+
+  .progress-overview__actions {
+    justify-content: flex-start;
+  }
+}
+
 .lesson-rail {
   display: grid;
   gap: 1.25rem;

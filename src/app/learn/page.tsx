@@ -4,6 +4,7 @@ import Link from "next/link";
 import { Breadcrumbs } from "@/components/navigation/Breadcrumbs";
 import { CurriculumSidebar } from "@/components/navigation/CurriculumSidebar";
 import { ReadingFrame } from "@/components/layout/AppShell";
+import { ProgressOverview } from "@/components/progress";
 
 import { getReaderIndex, getReaderModules, getReaderNavigation } from "./content";
 import { moduleNumber, moduleRoute } from "./route-helpers";
@@ -37,6 +38,14 @@ export default function LearnPage() {
           {index.lessons.length} lessons across {modules.length} modules
         </p>
       </header>
+
+      <ProgressOverview
+        lessons={index.lessons.map((lesson) => ({
+          id: lesson.id,
+          title: lesson.title,
+          href: lesson.route,
+        }))}
+      />
 
       <section className="module-grid" aria-labelledby="module-grid-title">
         <div className="section-heading">
