@@ -60,7 +60,7 @@ describe("local progress client boundaries", () => {
     await screen.findByText("1 of 1 lessons marked complete (100%).");
     fireEvent.click(screen.getByRole("button", { name: "Reset progress" }));
     expect(
-      await screen.findByText("All lesson progress was reset. Display preferences were not changed."),
+      await screen.findByText("All lesson progress and quiz attempts were reset. Display preferences were not changed."),
     ).toBeVisible();
     await waitFor(async () => expect(repository.listLessonProgress()).resolves.toEqual([]));
   });

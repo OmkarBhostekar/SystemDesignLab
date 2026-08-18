@@ -8,11 +8,24 @@ import {
   isLessonProgressStage,
   type LessonProgress,
   type ProgressExport,
+  type QuizAttempt,
+  normalizeQuizAttempt,
 } from "@/domain/progress";
 
 interface LegacyProgressExportV1 {
   schemaVersion: 1;
   lessons: Record<string, unknown>;
+}
+
+interface LegacyProgressExportV2 {
+  format: typeof PROGRESS_EXPORT_FORMAT;
+  schemaVersion: 2;
+  lessons: LessonProgress[];
+}
+
+export interface NormalizedProgressImport {
+  lessons: LessonProgress[];
+  quizAttempts: QuizAttempt[];
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -76,28 +89,62 @@ function migrateVersionOne(data: Record<string, unknown>): LessonProgress[] {
   return migrated.sort((left, right) => left.lessonId.localeCompare(right.lessonId));
 }
 
-export function createProgressExport(lessons: readonly LessonProgress[]): ProgressExport {
+function normalizeQuizAttempts(attempts: unknown): QuizAttempt[] {
+  if (!Array.isArray(attempts)) {
+    throw new ProgressValidationError("Progress export quizAttempts must be an array.");
+  }
+  const seenAttemptIds = new Set<string>();
+  return attempts.map((attempt) => {
+    const normalized = normalizeQuizAttempt(attempt);
+    if (seenAttemptIds.has(normalized.attemptId)) {
+      throw new ProgressValidationError(
+        `Progress export contains duplicate quiz attempt ID: ${normalized.attemptId}.`,
+      );
+    }
+    seenAttemptIds.add(normalized.attemptId);
+    return normalized;
+  }).sort((left, right) => left.attemptId.localeCompare(right.attemptId));
+}
+
+export function createProgressExport(
+  lessons: readonly LessonProgress[],
+  quizAttempts: readonly QuizAttempt[],
+): ProgressExport {
   return {
     format: PROGRESS_EXPORT_FORMAT,
     schemaVersion: PROGRESS_EXPORT_VERSION,
     lessons: normalizeLessons(lessons),
+    quizAttempts: normalizeQuizAttempts(quizAttempts),
   };
 }
 
-export function normalizeProgressImport(data: unknown): LessonProgress[] {
+export function normalizeProgressImport(data: unknown): NormalizedProgressImport {
   const parsed = parseJsonInput(data);
   if (!isRecord(parsed)) {
     throw new ProgressValidationError("Progress import must be a JSON object.");
   }
 
-  if (parsed.schemaVersion === 1) return migrateVersionOne(parsed);
+  if (parsed.schemaVersion === 1) {
+    return { lessons: migrateVersionOne(parsed), quizAttempts: [] };
+  }
+  if (parsed.schemaVersion === 2) {
+    assertOnlyKeys(parsed, ["format", "schemaVersion", "lessons"]);
+    const legacy = parsed as unknown as LegacyProgressExportV2;
+    if (legacy.format !== PROGRESS_EXPORT_FORMAT) {
+      throw new ProgressValidationError("Progress export format is not recognized.");
+    }
+    return { lessons: normalizeLessons(legacy.lessons), quizAttempts: [] };
+  }
   if (parsed.schemaVersion !== PROGRESS_EXPORT_VERSION) {
     throw new UnsupportedProgressVersionError(parsed.schemaVersion);
   }
 
-  assertOnlyKeys(parsed, ["format", "schemaVersion", "lessons"]);
+  assertOnlyKeys(parsed, ["format", "schemaVersion", "lessons", "quizAttempts"]);
   if (parsed.format !== PROGRESS_EXPORT_FORMAT) {
     throw new ProgressValidationError("Progress export format is not recognized.");
   }
-  return normalizeLessons(parsed.lessons);
+  return {
+    lessons: normalizeLessons(parsed.lessons),
+    quizAttempts: normalizeQuizAttempts(parsed.quizAttempts),
+  };
 }

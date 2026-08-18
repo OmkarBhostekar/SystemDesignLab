@@ -90,7 +90,7 @@ export function ProgressOverview({ lessons, repository, confirmReset }: Progress
     await runAction(async () => {
       const text = await file.text();
       const imported = normalizeProgressImport(text);
-      summarizeCurriculumProgress(lessonIds, imported);
+      summarizeCurriculumProgress(lessonIds, imported.lessons);
       await progressRepository.importProgress(text);
       await refresh();
       setMessage("Progress imported. The previous progress set was replaced.");
@@ -105,7 +105,7 @@ export function ProgressOverview({ lessons, repository, confirmReset }: Progress
     await runAction(async () => {
       await progressRepository.resetProgress({ kind: "all" });
       await refresh();
-      setMessage("All lesson progress was reset. Display preferences were not changed.");
+      setMessage("All lesson progress and quiz attempts were reset. Display preferences were not changed.");
     });
   }
 

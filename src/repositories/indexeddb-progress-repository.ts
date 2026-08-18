@@ -5,12 +5,15 @@ import {
   isLessonProgressMilestone,
   mergeLessonProgress,
   normalizeProgressResetScope,
+  normalizeQuizAttempt,
+  quizAttemptsEqual,
   ProgressStorageError,
   ProgressValidationError,
   type LessonProgress,
   type ProgressExport,
   type ProgressRepository,
   type ProgressResetScope,
+  type QuizAttempt,
 } from "@/domain/progress";
 import { createProgressExport, normalizeProgressImport } from "@/repositories/progress-serialization";
 
@@ -21,10 +24,12 @@ import { createProgressExport, normalizeProgressImport } from "@/repositories/pr
  * contract or the exported format.
  */
 export const INDEXED_DB_PROGRESS_DATABASE_NAME = "system-design-visual-learning-lab-progress";
-export const INDEXED_DB_PROGRESS_DATABASE_VERSION = 2;
+export const INDEXED_DB_PROGRESS_DATABASE_VERSION = 3;
 export const INDEXED_DB_PROGRESS_STORE_NAME = "lesson-progress";
+export const INDEXED_DB_QUIZ_ATTEMPT_STORE_NAME = "quiz-attempts";
 
 const LESSON_PROGRESS_KEY_PATH = "lessonId";
+const QUIZ_ATTEMPT_KEY_PATH = "attemptId";
 
 export interface IndexedDbProgressRepositoryOptions {
   /** Inject a factory in tests or browser integrations. Resolution is lazy. */
@@ -90,6 +95,10 @@ function readStoredProgress(value: unknown): LessonProgress {
   return cloneProgress(value);
 }
 
+function readStoredQuizAttempt(value: unknown): QuizAttempt {
+  return normalizeQuizAttempt(value);
+}
+
 /**
  * IndexedDB-backed implementation of the local progress contract.
  *
@@ -151,19 +160,57 @@ export class IndexedDbProgressRepository implements ProgressRepository {
     );
   }
 
+  async getQuizAttempt(attemptId: string): Promise<QuizAttempt | null> {
+    const normalizedId = normalizeQuizAttempt({
+      attemptId,
+      quizId: "attempt-id-probe",
+      lessonId: "attempt-id-probe",
+      answers: [],
+      earnedPoints: 0,
+      possiblePoints: 1,
+      scorePercent: 0,
+      passed: false,
+      incorrectConceptTags: [],
+    }).attemptId;
+    return this.withDatabase("getQuizAttempt", (database) =>
+      this.runGetAttemptTransaction(database, "getQuizAttempt", normalizedId),
+    );
+  }
+
+  async listQuizAttempts(): Promise<QuizAttempt[]> {
+    return this.withDatabase("listQuizAttempts", (database) =>
+      this.runListAttemptsTransaction(database, "listQuizAttempts"),
+    );
+  }
+
+  async saveQuizAttempt(attempt: QuizAttempt): Promise<QuizAttempt> {
+    const normalized = normalizeQuizAttempt(attempt);
+    return this.withDatabase("saveQuizAttempt", (database) =>
+      this.runSaveAttemptTransaction(database, "saveQuizAttempt", normalized),
+    );
+  }
+
   async exportProgress(): Promise<ProgressExport> {
     return this.withDatabase("exportProgress", async (database) => {
-      const lessons = await this.runListTransaction(database, "exportProgress");
-      return createProgressExport(lessons);
+      const [lessons, quizAttempts] = await Promise.all([
+        this.runListTransaction(database, "exportProgress"),
+        this.runListAttemptsTransaction(database, "exportProgress"),
+      ]);
+      return createProgressExport(lessons, quizAttempts);
     });
   }
 
   async importProgress(data: unknown): Promise<void> {
     // This must happen before opening IndexedDB or beginning a transaction.
     // Invalid data therefore cannot clear or partially replace existing data.
-    const lessons = normalizeProgressImport(data);
+    const normalized = normalizeProgressImport(data);
     await this.withDatabase("importProgress", (database) =>
-      this.runReplaceTransaction(database, "importProgress", lessons),
+      this.runReplaceTransaction(
+        database,
+        "importProgress",
+        normalized.lessons,
+        normalized.quizAttempts,
+      ),
     );
   }
 
@@ -227,14 +274,23 @@ export class IndexedDbProgressRepository implements ProgressRepository {
             database.createObjectStore(INDEXED_DB_PROGRESS_STORE_NAME, {
               keyPath: LESSON_PROGRESS_KEY_PATH,
             });
-            return;
           }
-
           const transaction = request.transaction;
-          const store = transaction?.objectStore(INDEXED_DB_PROGRESS_STORE_NAME);
-          if (store && store.keyPath !== LESSON_PROGRESS_KEY_PATH) {
+          const lessonStore = transaction?.objectStore(INDEXED_DB_PROGRESS_STORE_NAME);
+          if (lessonStore && lessonStore.keyPath !== LESSON_PROGRESS_KEY_PATH) {
             throw new Error(
               `The ${INDEXED_DB_PROGRESS_STORE_NAME} store has an incompatible key path.`,
+            );
+          }
+          if (!database.objectStoreNames.contains(INDEXED_DB_QUIZ_ATTEMPT_STORE_NAME)) {
+            database.createObjectStore(INDEXED_DB_QUIZ_ATTEMPT_STORE_NAME, {
+              keyPath: QUIZ_ATTEMPT_KEY_PATH,
+            });
+          }
+          const attemptStore = transaction?.objectStore(INDEXED_DB_QUIZ_ATTEMPT_STORE_NAME);
+          if (attemptStore && attemptStore.keyPath !== QUIZ_ATTEMPT_KEY_PATH) {
+            throw new Error(
+              `The ${INDEXED_DB_QUIZ_ATTEMPT_STORE_NAME} store has an incompatible key path.`,
             );
           }
         } catch (cause) {
@@ -449,10 +505,164 @@ export class IndexedDbProgressRepository implements ProgressRepository {
     });
   }
 
+  private runGetAttemptTransaction(
+    database: IDBDatabase,
+    operation: string,
+    attemptId: string,
+  ): Promise<QuizAttempt | null> {
+    return new Promise<QuizAttempt | null>((resolve, reject) => {
+      let transaction: IDBTransaction | undefined;
+      let result: QuizAttempt | null = null;
+      let settled = false;
+      const fail = (phase: string, cause: unknown) => {
+        if (settled) return;
+        settled = true;
+        try { transaction?.abort(); } catch { /* Keep the original failure. */ }
+        rejectFailure(reject, operation, phase, cause);
+      };
+      try {
+        transaction = database.transaction(INDEXED_DB_QUIZ_ATTEMPT_STORE_NAME, "readonly");
+        transaction.onerror = () => fail("the transaction", transaction?.error ?? new Error("The transaction failed."));
+        transaction.onabort = () => fail("the transaction", transaction?.error ?? new Error("The transaction was aborted."));
+        transaction.oncomplete = () => {
+          if (settled) return;
+          settled = true;
+          resolve(result ? normalizeQuizAttempt(result) : null);
+        };
+        const request = transaction.objectStore(INDEXED_DB_QUIZ_ATTEMPT_STORE_NAME).get(attemptId);
+        request.onerror = () => fail("the read request", request.error ?? new Error("The read request failed."));
+        request.onsuccess = () => {
+          try {
+            result = request.result == null ? null : readStoredQuizAttempt(request.result);
+          } catch (cause) {
+            fail("reading the stored quiz attempt", cause);
+          }
+        };
+      } catch (cause) {
+        fail("creating the transaction", cause);
+      }
+    });
+  }
+
+  private runListAttemptsTransaction(
+    database: IDBDatabase,
+    operation: string,
+  ): Promise<QuizAttempt[]> {
+    return new Promise<QuizAttempt[]>((resolve, reject) => {
+      let transaction: IDBTransaction | undefined;
+      let result: QuizAttempt[] = [];
+      let settled = false;
+      const fail = (phase: string, cause: unknown) => {
+        if (settled) return;
+        settled = true;
+        try { transaction?.abort(); } catch { /* Keep the original failure. */ }
+        rejectFailure(reject, operation, phase, cause);
+      };
+      try {
+        transaction = database.transaction(INDEXED_DB_QUIZ_ATTEMPT_STORE_NAME, "readonly");
+        transaction.onerror = () => fail("the transaction", transaction?.error ?? new Error("The transaction failed."));
+        transaction.onabort = () => fail("the transaction", transaction?.error ?? new Error("The transaction was aborted."));
+        transaction.oncomplete = () => {
+          if (settled) return;
+          settled = true;
+          resolve(result.map(normalizeQuizAttempt).sort((left, right) => left.attemptId.localeCompare(right.attemptId)));
+        };
+        const request = transaction.objectStore(INDEXED_DB_QUIZ_ATTEMPT_STORE_NAME).getAll();
+        request.onerror = () => fail("the read request", request.error ?? new Error("The read request failed."));
+        request.onsuccess = () => {
+          try {
+            result = ((request.result as unknown[] | undefined) ?? []).map(readStoredQuizAttempt);
+          } catch (cause) {
+            fail("reading stored quiz attempts", cause);
+          }
+        };
+      } catch (cause) {
+        fail("creating the transaction", cause);
+      }
+    });
+  }
+
+  private runSaveAttemptTransaction(
+    database: IDBDatabase,
+    operation: string,
+    attempt: QuizAttempt,
+  ): Promise<QuizAttempt> {
+    return new Promise<QuizAttempt>((resolve, reject) => {
+      let transaction: IDBTransaction | undefined;
+      let result: QuizAttempt | undefined;
+      let settled = false;
+      const fail = (phase: string, cause: unknown) => {
+        if (settled) return;
+        settled = true;
+        try { transaction?.abort(); } catch { /* Keep the original failure. */ }
+        rejectFailure(reject, operation, phase, cause);
+      };
+      try {
+        transaction = database.transaction(
+          [INDEXED_DB_QUIZ_ATTEMPT_STORE_NAME, INDEXED_DB_PROGRESS_STORE_NAME],
+          "readwrite",
+        );
+        transaction.onerror = () => fail("the transaction", transaction?.error ?? new Error("The transaction failed."));
+        transaction.onabort = () => fail("the transaction", transaction?.error ?? new Error("The transaction was aborted."));
+        transaction.oncomplete = () => {
+          if (settled) return;
+          if (!result) {
+            fail("the transaction", new Error("The transaction completed without a result."));
+            return;
+          }
+          settled = true;
+          resolve(normalizeQuizAttempt(result));
+        };
+
+        const attemptStore = transaction.objectStore(INDEXED_DB_QUIZ_ATTEMPT_STORE_NAME);
+        const getAttempt = attemptStore.get(attempt.attemptId);
+        getAttempt.onerror = () => fail("the attempt read request", getAttempt.error ?? new Error("The read request failed."));
+        getAttempt.onsuccess = () => {
+          try {
+            if (getAttempt.result != null) {
+              const existing = readStoredQuizAttempt(getAttempt.result);
+              if (!quizAttemptsEqual(existing, attempt)) {
+                throw new ProgressValidationError(
+                  `Quiz attempt ID ${attempt.attemptId} is already used by different attempt data.`,
+                );
+              }
+              result = existing;
+              return;
+            }
+            result = normalizeQuizAttempt(attempt);
+            const putAttempt = attemptStore.put(result);
+            putAttempt.onerror = () => fail("the attempt write request", putAttempt.error ?? new Error("The write request failed."));
+            if (!attempt.passed) return;
+
+            const lessonStore = transaction?.objectStore(INDEXED_DB_PROGRESS_STORE_NAME);
+            if (!lessonStore) throw new Error("Lesson progress store is unavailable.");
+            const getLesson = lessonStore.get(attempt.lessonId);
+            getLesson.onerror = () => fail("the lesson read request", getLesson.error ?? new Error("The read request failed."));
+            getLesson.onsuccess = () => {
+              try {
+                const current = getLesson.result == null ? null : readStoredProgress(getLesson.result);
+                const next = advanceLessonProgress(current, attempt.lessonId, "quiz-passed");
+                const putLesson = lessonStore.put(next);
+                putLesson.onerror = () => fail("the lesson write request", putLesson.error ?? new Error("The write request failed."));
+              } catch (cause) {
+                fail("advancing lesson progress", cause);
+              }
+            };
+          } catch (cause) {
+            fail("saving the quiz attempt", cause);
+          }
+        };
+      } catch (cause) {
+        fail("creating the transaction", cause);
+      }
+    });
+  }
+
   private runReplaceTransaction(
     database: IDBDatabase,
     operation: string,
     lessons: readonly LessonProgress[],
+    quizAttempts: readonly QuizAttempt[],
   ): Promise<void> {
     return new Promise<void>((resolve, reject) => {
       let transaction: IDBTransaction | undefined;
@@ -470,7 +680,10 @@ export class IndexedDbProgressRepository implements ProgressRepository {
       };
 
       try {
-        transaction = database.transaction(INDEXED_DB_PROGRESS_STORE_NAME, "readwrite");
+        transaction = database.transaction(
+          [INDEXED_DB_PROGRESS_STORE_NAME, INDEXED_DB_QUIZ_ATTEMPT_STORE_NAME],
+          "readwrite",
+        );
         transaction.onerror = () => {
           fail("the transaction", transaction?.error ?? new Error("The transaction failed."));
         };
@@ -493,6 +706,17 @@ export class IndexedDbProgressRepository implements ProgressRepository {
           const putRequest = store.put(cloneProgress(lesson));
           putRequest.onerror = () => {
             fail("the write request", putRequest.error ?? new Error("The write request failed."));
+          };
+        }
+        const attemptStore = transaction.objectStore(INDEXED_DB_QUIZ_ATTEMPT_STORE_NAME);
+        const clearAttempts = attemptStore.clear();
+        clearAttempts.onerror = () => {
+          fail("the quiz-attempt clear request", clearAttempts.error ?? new Error("The clear request failed."));
+        };
+        for (const attempt of quizAttempts) {
+          const putAttempt = attemptStore.put(normalizeQuizAttempt(attempt));
+          putAttempt.onerror = () => {
+            fail("the quiz-attempt write request", putAttempt.error ?? new Error("The write request failed."));
           };
         }
       } catch (cause) {
@@ -522,7 +746,10 @@ export class IndexedDbProgressRepository implements ProgressRepository {
       };
 
       try {
-        transaction = database.transaction(INDEXED_DB_PROGRESS_STORE_NAME, "readwrite");
+        transaction = database.transaction(
+          [INDEXED_DB_PROGRESS_STORE_NAME, INDEXED_DB_QUIZ_ATTEMPT_STORE_NAME],
+          "readwrite",
+        );
         transaction.onerror = () => {
           fail("the transaction", transaction?.error ?? new Error("The transaction failed."));
         };
@@ -536,10 +763,15 @@ export class IndexedDbProgressRepository implements ProgressRepository {
         };
 
         const store = transaction.objectStore(INDEXED_DB_PROGRESS_STORE_NAME);
+        const attemptStore = transaction.objectStore(INDEXED_DB_QUIZ_ATTEMPT_STORE_NAME);
         if (scope.kind === "all") {
           const clearRequest = store.clear();
           clearRequest.onerror = () => {
             fail("the clear request", clearRequest.error ?? new Error("The clear request failed."));
+          };
+          const clearAttempts = attemptStore.clear();
+          clearAttempts.onerror = () => {
+            fail("the quiz-attempt clear request", clearAttempts.error ?? new Error("The clear request failed."));
           };
         } else {
           for (const lessonId of scope.lessonIds) {
@@ -551,6 +783,25 @@ export class IndexedDbProgressRepository implements ProgressRepository {
               );
             };
           }
+          const selected = new Set(scope.lessonIds);
+          const getAttempts = attemptStore.getAll();
+          getAttempts.onerror = () => {
+            fail("the quiz-attempt read request", getAttempts.error ?? new Error("The read request failed."));
+          };
+          getAttempts.onsuccess = () => {
+            try {
+              for (const raw of (getAttempts.result as unknown[] | undefined) ?? []) {
+                const attempt = readStoredQuizAttempt(raw);
+                if (!selected.has(attempt.lessonId)) continue;
+                const deleteAttempt = attemptStore.delete(attempt.attemptId);
+                deleteAttempt.onerror = () => {
+                  fail("the quiz-attempt delete request", deleteAttempt.error ?? new Error("The delete request failed."));
+                };
+              }
+            } catch (cause) {
+              fail("reading quiz attempts for reset", cause);
+            }
+          };
         }
       } catch (cause) {
         fail("creating the reset transaction", cause);

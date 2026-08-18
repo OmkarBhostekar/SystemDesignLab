@@ -5,7 +5,23 @@ import {
   UnsupportedProgressVersionError,
   type LessonProgress,
   type ProgressRepository,
+  type QuizAttempt,
 } from "@/domain/progress";
+
+function quizAttempt(overrides: Partial<QuizAttempt> = {}): QuizAttempt {
+  return {
+    attemptId: "attempt-one",
+    quizId: "consistent-hashing-quiz",
+    lessonId: "04-10-consistent-hashing",
+    answers: [{ questionId: "consistent-hashing-guarantee", type: "single-choice", selectedOptionId: "bounded-remapping" }],
+    earnedPoints: 1,
+    possiblePoints: 1,
+    scorePercent: 100,
+    passed: true,
+    incorrectConceptTags: [],
+    ...overrides,
+  };
+}
 
 export type ProgressRepositoryFactory =
   () => ProgressRepository | Promise<ProgressRepository>;
@@ -89,6 +105,58 @@ export function defineProgressRepositoryContract(
       ]);
     });
 
+    it("saves, reads, lists, and clones isolated quiz attempts", async () => {
+      const repository = await createRepository();
+      const later = quizAttempt({ attemptId: "attempt-two", lessonId: "00-03-estimation", quizId: "estimation-quiz" });
+      const first = quizAttempt();
+      await repository.saveQuizAttempt(later);
+      const saved = await repository.saveQuizAttempt(first);
+      saved.answers.length = 0;
+
+      expect(await repository.getQuizAttempt(first.attemptId)).toEqual(first);
+      expect(await repository.listQuizAttempts()).toEqual([first, later]);
+      await expect(repository.getQuizAttempt("missing-attempt")).resolves.toBeNull();
+    });
+
+    it("makes repeated attempt saves idempotent and rejects conflicting ID reuse", async () => {
+      const repository = await createRepository();
+      const attempt = quizAttempt();
+      await expect(repository.saveQuizAttempt(attempt)).resolves.toEqual(attempt);
+      await expect(repository.saveQuizAttempt({ ...attempt })).resolves.toEqual(attempt);
+      await expect(repository.saveQuizAttempt({ ...attempt, passed: false })).rejects.toThrow(
+        ProgressValidationError,
+      );
+      await expect(repository.listQuizAttempts()).resolves.toEqual([attempt]);
+    });
+
+    it("advances only passed quiz attempts without regressing later progress", async () => {
+      const repository = await createRepository();
+      const failed = quizAttempt({
+        attemptId: "attempt-failed",
+        lessonId: "00-03-estimation",
+        quizId: "estimation-quiz",
+        earnedPoints: 0,
+        scorePercent: 0,
+        passed: false,
+        incorrectConceptTags: ["unit-conversion", "unit-conversion", "average-qps"],
+      });
+      const normalizedFailed = { ...failed, incorrectConceptTags: ["average-qps", "unit-conversion"] };
+      await expect(repository.saveQuizAttempt(failed)).resolves.toEqual(normalizedFailed);
+      await expect(repository.getLessonProgress(failed.lessonId)).resolves.toBeNull();
+
+      await repository.saveQuizAttempt(quizAttempt({ attemptId: "attempt-passed" }));
+      await expect(repository.getLessonProgress("04-10-consistent-hashing")).resolves.toEqual({
+        lessonId: "04-10-consistent-hashing",
+        stage: "quiz-passed",
+      });
+      await repository.applyLessonMilestone("04-10-consistent-hashing", "mastered");
+      await repository.saveQuizAttempt(quizAttempt({ attemptId: "attempt-passed-again" }));
+      await expect(repository.getLessonProgress("04-10-consistent-hashing")).resolves.toEqual({
+        lessonId: "04-10-consistent-hashing",
+        stage: "mastered",
+      });
+    });
+
     it("clones values at both input and output boundaries", async () => {
       const repository = await createRepository();
       const input: LessonProgress = {
@@ -124,16 +192,19 @@ export function defineProgressRepositoryContract(
         lessonId: "04-10-consistent-hashing",
         stage: "mastered",
       });
-      const exported = await source.exportProgress();
+      const attempt = quizAttempt();
+      await source.saveQuizAttempt(attempt);
+      const exportedWithAttempt = await source.exportProgress();
 
       await target.saveLessonProgress({
         lessonId: "04-12-replication",
         stage: "quiz-passed",
       });
-      await target.importProgress(exported);
-      expect(await target.listLessonProgress()).toEqual(exported.lessons);
+      await target.importProgress(exportedWithAttempt);
+      expect(await target.listLessonProgress()).toEqual(exportedWithAttempt.lessons);
+      expect(await target.listQuizAttempts()).toEqual([attempt]);
 
-      exported.lessons[0]!.stage = "not-started";
+      exportedWithAttempt.lessons[0]!.stage = "not-started";
       expect(await target.listLessonProgress()).toEqual([
         { lessonId: "04-10-consistent-hashing", stage: "mastered" },
         { lessonId: "04-11-read-write-quorums", stage: "theory-complete" },
@@ -152,10 +223,12 @@ export function defineProgressRepositoryContract(
         lessonId: "04-11-read-write-quorums",
         stage: "mastered",
       });
+      await repository.saveQuizAttempt(quizAttempt({ attemptId: "attempt-before-import" }));
       await repository.importProgress(exported);
       const first = await repository.listLessonProgress();
       await repository.importProgress(exported);
       expect(await repository.listLessonProgress()).toEqual(first);
+      await expect(repository.listQuizAttempts()).resolves.toEqual([]);
     });
 
     it("rejects invalid imports before changing existing state", async () => {
@@ -187,6 +260,7 @@ export function defineProgressRepositoryContract(
         lessonId: "04-10-consistent-hashing",
         stage: "mastered",
       });
+      await repository.saveQuizAttempt(quizAttempt());
       await repository.saveLessonProgress({
         lessonId: "04-11-read-write-quorums",
         stage: "quiz-passed",
@@ -199,9 +273,11 @@ export function defineProgressRepositoryContract(
       await expect(repository.listLessonProgress()).resolves.toEqual([
         { lessonId: "04-11-read-write-quorums", stage: "quiz-passed" },
       ]);
+      await expect(repository.listQuizAttempts()).resolves.toEqual([]);
 
       await repository.resetProgress({ kind: "all" });
       await expect(repository.listLessonProgress()).resolves.toEqual([]);
+      await expect(repository.listQuizAttempts()).resolves.toEqual([]);
     });
 
     it("validates the complete reset scope before changing records", async () => {

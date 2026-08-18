@@ -1,3 +1,5 @@
+import type { QuizAnswer } from "@/domain/quiz";
+
 export const LESSON_PROGRESS_STAGES = [
   "not-started",
   "theory-complete",
@@ -27,10 +29,23 @@ export type ProgressResetScope =
   | { kind: "lessons"; lessonIds: readonly string[] };
 
 export const PROGRESS_EXPORT_FORMAT = "system-design-visual-learning-lab-progress";
-export const PROGRESS_EXPORT_VERSION = 2 as const;
+export const PROGRESS_EXPORT_VERSION = 3 as const;
+
+export interface QuizAttempt {
+  attemptId: string;
+  quizId: string;
+  lessonId: string;
+  answers: QuizAnswer[];
+  earnedPoints: number;
+  possiblePoints: number;
+  scorePercent: number;
+  passed: boolean;
+  incorrectConceptTags: string[];
+}
 
 export interface ProgressExport {
   format: typeof PROGRESS_EXPORT_FORMAT;
   schemaVersion: typeof PROGRESS_EXPORT_VERSION;
   lessons: LessonProgress[];
+  quizAttempts: QuizAttempt[];
 }

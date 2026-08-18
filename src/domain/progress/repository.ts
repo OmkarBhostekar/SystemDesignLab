@@ -3,6 +3,7 @@ import type {
   LessonProgressMilestone,
   ProgressExport,
   ProgressResetScope,
+  QuizAttempt,
 } from "./model";
 
 export interface ProgressRepository {
@@ -13,6 +14,9 @@ export interface ProgressRepository {
     lessonId: string,
     milestone: LessonProgressMilestone,
   ): Promise<LessonProgress>;
+  getQuizAttempt(attemptId: string): Promise<QuizAttempt | null>;
+  listQuizAttempts(): Promise<QuizAttempt[]>;
+  saveQuizAttempt(attempt: QuizAttempt): Promise<QuizAttempt>;
   exportProgress(): Promise<ProgressExport>;
   importProgress(data: unknown): Promise<void>;
   resetProgress(scope: ProgressResetScope): Promise<void>;

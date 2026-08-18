@@ -6,7 +6,9 @@ import {
   type LessonProgress,
 } from "@/domain/progress";
 import {
+  INDEXED_DB_PROGRESS_DATABASE_VERSION,
   INDEXED_DB_PROGRESS_STORE_NAME,
+  INDEXED_DB_QUIZ_ATTEMPT_STORE_NAME,
   IndexedDbProgressRepository,
 } from "@/repositories/indexeddb-progress-repository";
 import { defineProgressRepositoryContract } from "./progress-repository.contract";
@@ -23,9 +25,9 @@ function deleteDatabase(databaseName: string): Promise<void> {
   });
 }
 
-function openLegacyDatabase(databaseName: string): Promise<void> {
+function openM3Database(databaseName: string): Promise<void> {
   return new Promise((resolve, reject) => {
-    const request = fakeIndexedDB.open(databaseName, 1);
+    const request = fakeIndexedDB.open(databaseName, 2);
     request.onupgradeneeded = () => {
       request.result.createObjectStore(INDEXED_DB_PROGRESS_STORE_NAME, { keyPath: "lessonId" });
     };
@@ -44,6 +46,38 @@ function openLegacyDatabase(databaseName: string): Promise<void> {
         database.close();
         resolve();
       };
+    };
+  });
+}
+
+function openBrokenM4Database(databaseName: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const request = fakeIndexedDB.open(databaseName, INDEXED_DB_PROGRESS_DATABASE_VERSION);
+    request.onupgradeneeded = () => {
+      request.result.createObjectStore(INDEXED_DB_PROGRESS_STORE_NAME, { keyPath: "lessonId" });
+      request.result.createObjectStore(INDEXED_DB_QUIZ_ATTEMPT_STORE_NAME, { keyPath: "wrongKey" });
+    };
+    request.onerror = () => reject(request.error ?? new Error("Failed to create broken database."));
+    request.onsuccess = () => {
+      const database = request.result;
+      const transaction = database.transaction(INDEXED_DB_PROGRESS_STORE_NAME, "readwrite");
+      transaction.objectStore(INDEXED_DB_PROGRESS_STORE_NAME).put({ lessonId: "04-10-consistent-hashing", stage: "mastered" });
+      transaction.oncomplete = () => { database.close(); resolve(); };
+      transaction.onerror = () => reject(transaction.error ?? new Error("Seed transaction failed."));
+    };
+  });
+}
+
+function putRaw(databaseName: string, storeName: string, value: unknown): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const request = fakeIndexedDB.open(databaseName, INDEXED_DB_PROGRESS_DATABASE_VERSION);
+    request.onerror = () => reject(request.error ?? new Error("Failed to open test database."));
+    request.onsuccess = () => {
+      const database = request.result;
+      const transaction = database.transaction(storeName, "readwrite");
+      transaction.objectStore(storeName).put(value);
+      transaction.oncomplete = () => { database.close(); resolve(); };
+      transaction.onerror = () => reject(transaction.error ?? new Error("Raw write failed."));
     };
   });
 }
@@ -122,11 +156,12 @@ describe("IndexedDbProgressRepository", () => {
     ]);
     expect(await repository.exportProgress()).toEqual({
       format: "system-design-visual-learning-lab-progress",
-      schemaVersion: 2,
+      schemaVersion: 3,
       lessons: [
         { lessonId: "04-10-consistent-hashing", stage: "visualization-complete" },
         { lessonId: "04-11-read-write-quorums", stage: "theory-complete" },
       ],
+      quizAttempts: [],
     });
   });
 
@@ -149,8 +184,9 @@ describe("IndexedDbProgressRepository", () => {
     ).rejects.toThrow(ProgressValidationError);
     expect(await repository.exportProgress()).toEqual({
       format: "system-design-visual-learning-lab-progress",
-      schemaVersion: 2,
+      schemaVersion: 3,
       lessons: [{ lessonId: "04-10-consistent-hashing", stage: "mastered" }],
+      quizAttempts: [],
     });
 
     await repository.importProgress({
@@ -184,14 +220,76 @@ describe("IndexedDbProgressRepository", () => {
     expect(await repository.listLessonProgress()).toEqual([]);
   });
 
-  it("reads compatible records from a previous IndexedDB database version", async () => {
-    await openLegacyDatabase(databaseName);
+  it("migrates the M3 database version while preserving lesson progress", async () => {
+    await openM3Database(databaseName);
 
     const repository = createRepository();
     expect(await repository.getLessonProgress("04-10-consistent-hashing")).toEqual({
       lessonId: "04-10-consistent-hashing",
       stage: "theory-complete",
     });
+    expect(await repository.listQuizAttempts()).toEqual([]);
+  });
+
+  it("persists quiz attempts across repository instances", async () => {
+    const first = createRepository();
+    await first.saveQuizAttempt({
+      attemptId: "attempt-persistent",
+      quizId: "consistent-hashing-quiz",
+      lessonId: "04-10-consistent-hashing",
+      answers: [{ questionId: "consistent-hashing-guarantee", type: "single-choice", selectedOptionId: "bounded-remapping" }],
+      earnedPoints: 1,
+      possiblePoints: 1,
+      scorePercent: 100,
+      passed: true,
+      incorrectConceptTags: [],
+    });
+
+    const second = createRepository();
+    expect(await second.listQuizAttempts()).toHaveLength(1);
+    expect(await second.getLessonProgress("04-10-consistent-hashing")).toEqual({
+      lessonId: "04-10-consistent-hashing",
+      stage: "quiz-passed",
+    });
+  });
+
+  it("surfaces corrupted stored lesson and attempt records", async () => {
+    const repository = createRepository();
+    await repository.listLessonProgress();
+    await putRaw(databaseName, INDEXED_DB_PROGRESS_STORE_NAME, {
+      lessonId: "04-10-consistent-hashing",
+      stage: "not-a-stage",
+    });
+    await expect(repository.listLessonProgress()).rejects.toThrow(ProgressValidationError);
+
+    await putRaw(databaseName, INDEXED_DB_QUIZ_ATTEMPT_STORE_NAME, {
+      attemptId: "broken-attempt",
+    });
+    await expect(repository.listQuizAttempts()).rejects.toThrow(ProgressValidationError);
+  });
+
+  it("aborts a two-store import transaction and preserves prior data on write failure", async () => {
+    await openBrokenM4Database(databaseName);
+    const repository = createRepository();
+    await expect(repository.importProgress({
+      format: "system-design-visual-learning-lab-progress",
+      schemaVersion: 3,
+      lessons: [{ lessonId: "00-03-estimation", stage: "theory-complete" }],
+      quizAttempts: [{
+        attemptId: "attempt-imported",
+        quizId: "estimation-quiz",
+        lessonId: "00-03-estimation",
+        answers: [],
+        earnedPoints: 0,
+        possiblePoints: 1,
+        scorePercent: 0,
+        passed: false,
+        incorrectConceptTags: [],
+      }],
+    })).rejects.toMatchObject({ name: "ProgressStorageError", operation: "importProgress" });
+    await expect(repository.listLessonProgress()).resolves.toEqual([
+      { lessonId: "04-10-consistent-hashing", stage: "mastered" },
+    ]);
   });
 
   it("does not touch the browser API until an operation is invoked", async () => {
