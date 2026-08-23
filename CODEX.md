@@ -1469,17 +1469,17 @@ Status: **M5 complete; renderer conventions are documented and applied where rel
 Recommended order:
 
 - [x] Horizontal Scaling
-- [ ] Tail Latency
-- [ ] CAP
-- [ ] Load Balancing
+- [x] Tail Latency
+- [x] CAP
+- [x] Load Balancing
 - [x] Consistent Hashing
-- [ ] Transaction Isolation
-- [ ] Cache Stampede
-- [ ] Queue + Backpressure
+- [x] Transaction Isolation
+- [x] Cache Stampede
+- [x] Backpressure
 - [ ] Retry + Jitter
 - [ ] Token Bucket
 
-Status: **2 of 10 representative topics complete in M5**
+Status: **8 of 10 representative topics complete in M7**
 
 ---
 
@@ -1545,13 +1545,13 @@ Status: **Not started**
 
 Current milestone:
 
-> **M5 — Visualization foundation and first simulations — Complete**
+> **M7 — Eight of ten representative visualizations — Complete (2026-08-24)**
 
 Primary goal:
 
-Provide deterministic model-first simulations, a small accessible shared shell, responsive renderers, scenario and failure controls, reduced-motion behavior, and explicit local-first scenario completion persistence on one simple and one stateful lesson.
+Extend the deterministic model-first simulation boundary to eight representative lessons while preserving the accessible shared shell, responsive renderers, scenario and failure controls, reduced-motion behavior, and explicit local-first scenario completion persistence.
 
-Interactive simulations now ship for Horizontal vs Vertical Scaling and Consistent Hashing. Consistent Hashing forms a complete theory → visualization → quiz → progress slice. Broader visualization coverage, authentication, a backend, and remote synchronization remain deferred to later milestones.
+Interactive simulations now ship for Horizontal Scaling, Tail Latency, CAP, Load Balancing, Consistent Hashing, Transaction Isolation, Cache Stampede, and Backpressure. Consistent Hashing forms a complete theory → visualization → quiz → progress slice. Broader visualization coverage, authentication, a backend, and remote synchronization remain deferred to later milestones.
 
 ---
 
@@ -1561,11 +1561,11 @@ Update this section whenever Codex finishes a meaningful task.
 
 ## Last Updated
 
-`2026-08-18`
+`2026-08-24`
 
 ## Active Milestone
 
-`M5 — Visualization foundation and first simulations — Complete`
+`M7 — Eight of ten representative visualizations — Complete`
 
 ## Currently Working On
 
@@ -1575,11 +1575,12 @@ Update this section whenever Codex finishes a meaningful task.
 - [x] Theory authoring — all 135 lessons across Modules 00–13 complete
 - [x] Local progress domain, persistence, portable backup, and minimal reader controls
 - [x] Typed quiz domain, two representative quiz slices, accessible quiz UI, and local attempt persistence
-- [x] Shared simulation shell, two deterministic interactive lessons, and local scenario completion persistence
+- [x] Shared simulation shell, eight deterministic interactive lessons, and local scenario completion persistence
 
 ## Recently Completed
 
-- Completed M5 with deterministic model/renderer separation and interactive Horizontal Scaling and Consistent Hashing lessons.
+- Completed M7 with deterministic model/renderer separation across eight interactive lessons, adding Transaction Isolation, Cache Stampede, and Backpressure.
+- Registered the three new stable visualization IDs, lesson metadata, lazy renderer mappings, and eight-topic registry/route coverage.
 - Added an accessible shared shell with play, pause, step, reset, speed, presets, metrics, bounded events, failure actions, explicit completion, storage feedback, responsive SVG state, and reduced-motion behavior.
 - Modeled capacity, queueing, rejection, warm-up, scale-up downtime, shared dependencies, failures, recovery, session skew, and hot keys for horizontal scaling without one DOM entity per request.
 - Modeled modulo hashing, one-token rings, virtual nodes, replicas, membership remapping, copy/verify migration, cutover, node failure, hot keys, and aggregated 10,000-key scenarios with fixed deterministic placement.
@@ -1620,10 +1621,10 @@ None known.
 
 ## Next Recommended Tasks
 
-1. Add Tail Latency as the next simulation, reusing the proven shell while introducing time-series/chart behavior only where the lesson requires it.
-2. Follow with CAP or Load Balancing to validate architecture-graph conventions against another real engine.
-3. Add more structured quizzes only in response to focused lesson work; do not bulk-convert all remaining seeds.
-4. Use persisted incorrect concept tags when a later review-mode milestone defines prioritization and scheduling.
+1. Add Retry + Jitter to show synchronized retry amplification and how bounded randomness spreads recovery load.
+2. Add Token Bucket to make refill, burst allowance, sustained admission, and rejection behavior observable.
+3. Add structured quizzes only with focused lesson work; do not bulk-convert the remaining seeds.
+4. Use persisted incorrect concept tags when review mode defines prioritization and scheduling.
 5. Consider search alongside a focused reader improvement now that the complete corpus and local progress model exist.
 
 ---

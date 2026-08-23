@@ -1,6 +1,6 @@
 # Module 03 — Traffic Distribution and Service Architecture
 
-**Status:** Theory complete. All eight indexed lessons have been authored and reviewed for the theory definition of done; visualizations and structured quizzes remain future work.
+**Status:** Theory complete. All eight indexed lessons have been authored and reviewed for the theory definition of done; Load-Balancing Algorithms now includes an interactive simulation, while broader visualizations and structured quizzes remain incremental work.
 
 ## Purpose
 

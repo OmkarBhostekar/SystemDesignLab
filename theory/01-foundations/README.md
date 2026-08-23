@@ -1,6 +1,6 @@
 # Module 01 — Foundations
 
-**Status:** Theory complete. Horizontal vs Vertical Scaling now includes an interactive simulation; other visualizations and structured quizzes remain incremental work, and every lesson retains its visualization specification and quiz seeds.
+**Status:** Theory complete. Horizontal vs Vertical Scaling, Percentiles / Tail Latency, and CAP now include interactive simulations; other visualizations and structured quizzes remain incremental work, and every lesson retains its visualization specification and quiz seeds.
 
 ## Purpose
 

@@ -1,6 +1,6 @@
 # Module 04 — Data and Databases
 
-**Status:** Theory complete — all 14 intended lessons are authored and indexed. Consistent Hashing now includes an interactive simulation and structured quiz; other interactive experiences remain incremental application work, and every lesson includes a behavior-oriented visualization specification and reasoning quiz seeds.
+**Status:** Theory complete — all 14 intended lessons are authored and indexed. Transaction Isolation and Consistent Hashing include interactive simulations; Consistent Hashing also has a structured quiz. Other interactive experiences remain incremental application work.
 
 ## Purpose
 
@@ -47,7 +47,7 @@ This module spans the full curriculum depth range:
 
 ## Authoring boundary
 
-The module ordering is a dependency-aware learning path. The authored lessons make anomalies, index/compaction behavior, replica lag, rebalancing, quorum overlap, pool saturation, and concurrency races observable in prose and visualization specifications; Consistent Hashing also makes placement, remapping, migration, and hot-key behavior interactive. They state assumptions, distinguish local from distributed guarantees, and link to direct authoritative documentation or original research. No database technology is presented as universally correct.
+The module ordering is a dependency-aware learning path. The authored lessons make anomalies, index/compaction behavior, replica lag, rebalancing, quorum overlap, pool saturation, and concurrency races observable in prose and visualization specifications. Transaction Isolation makes concurrent schedules and anomalies interactive; Consistent Hashing makes placement, remapping, migration, and hot-key behavior interactive. They state assumptions, distinguish local from distributed guarantees, and link to direct authoritative documentation or original research. No database technology is presented as universally correct.
 
 ## Authored contents
 

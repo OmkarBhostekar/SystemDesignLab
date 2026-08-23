@@ -27,7 +27,16 @@ export interface SimulationPreset<TPresetId extends string> {
   description: string;
 }
 
-export const VISUALIZATION_KINDS = ["horizontal-scaling", "consistent-hashing"] as const;
+export const VISUALIZATION_KINDS = [
+  "horizontal-scaling",
+  "consistent-hashing",
+  "tail-latency",
+  "cap",
+  "load-balancing",
+  "transaction-isolation",
+  "cache-stampede",
+  "backpressure",
+] as const;
 
 export type VisualizationKind = (typeof VISUALIZATION_KINDS)[number];
 
