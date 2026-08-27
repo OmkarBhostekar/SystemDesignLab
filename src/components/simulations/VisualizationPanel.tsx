@@ -14,6 +14,36 @@ const ConsistentHashingSimulation = dynamic(
   { ssr: false, loading: SimulationLoadingState },
 );
 
+const TailLatencySimulation = dynamic(
+  () => import("./TailLatencySimulation").then((module) => module.TailLatencySimulation),
+  { ssr: false, loading: SimulationLoadingState },
+);
+
+const CapSimulation = dynamic(
+  () => import("./CapSimulation").then((module) => module.CapSimulation),
+  { ssr: false, loading: SimulationLoadingState },
+);
+
+const LoadBalancingSimulation = dynamic(
+  () => import("./LoadBalancingSimulation").then((module) => module.LoadBalancingSimulation),
+  { ssr: false, loading: SimulationLoadingState },
+);
+
+const TransactionIsolationSimulation = dynamic(
+  () => import("./TransactionIsolationSimulation").then((module) => module.TransactionIsolationSimulation),
+  { ssr: false, loading: SimulationLoadingState },
+);
+
+const CacheStampedeSimulation = dynamic(
+  () => import("./CacheStampedeSimulation").then((module) => module.CacheStampedeSimulation),
+  { ssr: false, loading: SimulationLoadingState },
+);
+
+const BackpressureSimulation = dynamic(
+  () => import("./BackpressureSimulation").then((module) => module.BackpressureSimulation),
+  { ssr: false, loading: SimulationLoadingState },
+);
+
 export function VisualizationPanel({
   visualization,
 }: {
@@ -24,6 +54,24 @@ export function VisualizationPanel({
   }
   if (visualization.kind === "consistent-hashing") {
     return <ConsistentHashingSimulation lessonId={visualization.lessonId} />;
+  }
+  if (visualization.kind === "tail-latency") {
+    return <TailLatencySimulation lessonId={visualization.lessonId} />;
+  }
+  if (visualization.kind === "cap") {
+    return <CapSimulation lessonId={visualization.lessonId} />;
+  }
+  if (visualization.kind === "load-balancing") {
+    return <LoadBalancingSimulation lessonId={visualization.lessonId} />;
+  }
+  if (visualization.kind === "transaction-isolation") {
+    return <TransactionIsolationSimulation lessonId={visualization.lessonId} />;
+  }
+  if (visualization.kind === "cache-stampede") {
+    return <CacheStampedeSimulation lessonId={visualization.lessonId} />;
+  }
+  if (visualization.kind === "backpressure") {
+    return <BackpressureSimulation lessonId={visualization.lessonId} />;
   }
   return (
     <p className="simulation-shell__error" role="alert">

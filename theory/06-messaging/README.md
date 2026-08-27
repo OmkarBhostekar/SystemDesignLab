@@ -1,6 +1,6 @@
 # Module 06 — Asynchronous Systems and Messaging
 
-**Status:** Theory complete for all ten indexed lessons. Interactive simulations remain future work.
+**Status:** Theory complete for all ten indexed lessons. Backpressure now includes an interactive simulation; broader interactive coverage remains incremental work.
 
 ## Purpose
 
@@ -40,4 +40,4 @@ Queue fundamentals, delivery semantics, idempotency, dead-letter handling, and b
 
 ## Theory completion boundary
 
-The ten lessons are authored as Markdown-first theory and include interview lenses, reasoning quiz seeds, relative lesson links, annotated references, and behavior-oriented visualization specifications. They explicitly scope delivery guarantees, model crash points, and treat idempotency, DLQs, and backpressure as operational mechanisms. Future visual work should separate deterministic queue/stream simulation from rendering and preserve the text explanations when interactive features are unavailable.
+The ten lessons are authored as Markdown-first theory and include interview lenses, reasoning quiz seeds, relative lesson links, annotated references, and behavior-oriented visualization specifications. They explicitly scope delivery guarantees, model crash points, and treat idempotency, DLQs, and backpressure as operational mechanisms. Backpressure now makes queue growth and bounded flow control interactive; future visual work should preserve the same deterministic model/rendering separation and text fallback.

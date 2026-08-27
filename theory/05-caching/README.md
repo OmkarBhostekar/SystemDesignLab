@@ -1,6 +1,6 @@
 # Module 05 — Caching
 
-**Status:** Theory complete for all nine indexed lessons. Interactive simulations remain future work.
+**Status:** Theory complete for all nine indexed lessons. Cache Stampede now includes an interactive simulation; broader interactive coverage remains incremental work.
 
 ## Purpose
 
@@ -38,4 +38,4 @@ Most lessons are **Core**. Hot keys are an **Advanced** workload/failure extensi
 
 ## Theory completion boundary
 
-The nine lessons are authored as Markdown-first theory and include interview lenses, reasoning quiz seeds, relative lesson links, annotated references, and behavior-oriented visualization specifications. They do not claim a universal hit ratio, fixed latency number, or automatic correctness. Future work may add simulations for working-set pressure, stampedes, hot keys, invalidation races, and multi-layer freshness; those simulations must agree with the guarantees and failure cases documented here.
+The nine lessons are authored as Markdown-first theory and include interview lenses, reasoning quiz seeds, relative lesson links, annotated references, and behavior-oriented visualization specifications. They do not claim a universal hit ratio, fixed latency number, or automatic correctness. Cache Stampede makes synchronized expiry and mitigation trade-offs interactive; future simulations for other caching behaviors must agree with the guarantees and failure cases documented here.

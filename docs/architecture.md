@@ -68,7 +68,7 @@ interface ProgressRepository {
 }
 ```
 
-The initial adapters are an IndexedDB-backed repository and a deterministic in-memory repository. M4 extends the shared contract with immutable quiz attempts: the caller creates one stable attempt ID per logical submission, identical re-saves are idempotent, conflicting ID reuse fails, and each retry uses a fresh ID. M5 adds immutable simulation completions identified by visualization and scenario. Saving a completion atomically advances the lesson monotonically to `visualization-complete`; only an explicitly completed engine scenario is saved. A future remote-sync adapter should satisfy the same domain behavior rather than forcing a rewrite of learning components. See ADR-003, ADR-004, and ADR-005.
+The initial adapters are an IndexedDB-backed repository and a deterministic in-memory repository. M4 extends the shared contract with immutable quiz attempts: the caller creates one stable attempt ID per logical submission, identical re-saves are idempotent, conflicting ID reuse fails, and each retry uses a fresh ID. M5 adds immutable simulation completions identified by visualization and scenario; M6 and M7 apply that contract across eight representative visualizations. Saving a completion atomically advances the lesson monotonically to `visualization-complete`; only an explicitly completed engine scenario is saved. A future remote-sync adapter should satisfy the same domain behavior rather than forcing a rewrite of learning components. See ADR-003, ADR-004, and ADR-005.
 
 ### Simulations are models first and renderers second
 
@@ -86,7 +86,7 @@ The engine owns rules, transitions, failure injection, and metrics. React Flow, 
 
 ### Abstractions follow evidence
 
-M5 implements the first two simulations as real lessons and extracts only the shared controls they proved useful: play/pause/step/reset, speed, scenario presets, a bounded event timeline, metrics, failure actions, completion state, and storage feedback. It deliberately does not create a generic simulation DSL, large global store, or broad plugin system in anticipation of every future visualization.
+M5 established the shared controls through the first two simulations; M6 and M7 extend the same proven boundary to six additional real lessons. The shared controls are play/pause/step/reset, speed, scenario presets, a bounded event timeline, metrics, failure actions, completion state, and storage feedback. The architecture still deliberately avoids a generic simulation DSL, large global store, or broad plugin system in anticipation of every future visualization.
 
 ## System shape
 
@@ -302,10 +302,10 @@ The `00-03-estimation` and `04-10-consistent-hashing` lessons now complete real 
 
 ### Stage 4 — First simulation experiences
 
-Delivered in M5:
+Delivered in M5 and extended in M6 and M7:
 
 - a shared accessible simulation shell and narrow dynamically loaded client boundary,
-- deterministic model/renderer separation for Horizontal Scaling and Consistent Hashing,
+- deterministic model/renderer separation for Horizontal Scaling, Tail Latency, CAP, Load Balancing, Consistent Hashing, Transaction Isolation, Cache Stampede, and Backpressure,
 - scenario presets, failure injection, metrics, bounded event timelines, and reduced-motion support,
 - explicit per-scenario completion persistence and a complete theory → visualization → quiz → progress slice for Consistent Hashing.
 
