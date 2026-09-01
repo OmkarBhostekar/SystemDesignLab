@@ -16,10 +16,20 @@ describe("visualization registry", () => {
       "backpressure",
       "cache-stampede",
       "cap",
+      "circuit-breaker",
+      "consensus-raft",
       "consistent-hash-ring",
+      "delivery-semantics",
+      "distributed-locks",
       "horizontal-scaling",
       "load-balancing-algorithms",
+      "message-queue-fundamentals",
+      "partitioning-sharding",
+      "read-write-quorums",
+      "replication",
+      "retry-jitter",
       "tail-latency",
+      "token-bucket",
       "transaction-isolation",
     ]);
     expect(getVisualization("horizontal-scaling")?.lessonId).toBe(
@@ -48,6 +58,14 @@ describe("visualization registry", () => {
     expect(getVisualization("backpressure")).toMatchObject({
       lessonId: "06-09-backpressure",
       kind: "backpressure",
+    });
+    expect(getVisualization("retry-jitter")).toMatchObject({
+      lessonId: "08-03-exponential-backoff-and-jitter",
+      kind: "scenario-lab",
+    });
+    expect(getVisualization("distributed-locks")).toMatchObject({
+      lessonId: "07-04-distributed-locks",
+      kind: "scenario-lab",
     });
     expect(getVisualization("missing-visualization")).toBeNull();
   });
