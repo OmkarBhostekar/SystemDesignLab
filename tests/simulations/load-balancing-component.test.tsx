@@ -2,10 +2,11 @@
 
 import "@testing-library/jest-dom/vitest";
 
-import { fireEvent, render, screen, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { LoadBalancingSimulation } from "@/components/simulations/LoadBalancingSimulation";
+import { InMemoryProgressRepository } from "@/repositories/in-memory-progress-repository";
 
 afterEach(() => {
   document.body.innerHTML = "";
@@ -37,5 +38,29 @@ describe("load-balancing simulation component", () => {
     expect(within(table).getByText("Failed")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Recover node" }));
     expect(within(table).getAllByText("Active").length).toBeGreaterThan(0);
+  });
+
+  it("persists completion after the fixed trace and comparison finish", async () => {
+    const repository = new InMemoryProgressRepository();
+    render(
+      <LoadBalancingSimulation
+        lessonId="03-02-load-balancing-algorithms"
+        repository={repository}
+      />,
+    );
+
+    const step = screen.getByRole("button", { name: "Step" });
+    for (let index = 0; index < 10; index += 1) fireEvent.click(step);
+    const checkpoint = screen.getByRole("button", { name: "Mark visualization complete" });
+    await waitFor(() => expect(checkpoint).toBeEnabled());
+    fireEvent.click(checkpoint);
+    await waitFor(() => expect(screen.getByRole("button", { name: "Visualization completed" })).toBeDisabled());
+    expect(await repository.listSimulationCompletions()).toEqual([
+      expect.objectContaining({
+        visualizationId: "load-balancing-algorithms",
+        lessonId: "03-02-load-balancing-algorithms",
+        scenarioId: "mixed-checkout-work",
+      }),
+    ]);
   });
 });
