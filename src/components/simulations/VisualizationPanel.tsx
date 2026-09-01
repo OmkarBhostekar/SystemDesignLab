@@ -2,7 +2,7 @@
 
 import dynamic from "next/dynamic";
 
-import type { VisualizationDefinition } from "@/simulations";
+import { isScenarioLabId, type VisualizationDefinition } from "@/simulations";
 
 const HorizontalScalingSimulation = dynamic(
   () => import("./HorizontalScalingSimulation").then((module) => module.HorizontalScalingSimulation),
@@ -44,6 +44,11 @@ const BackpressureSimulation = dynamic(
   { ssr: false, loading: SimulationLoadingState },
 );
 
+const ScenarioLabSimulation = dynamic(
+  () => import("./ScenarioLabSimulation").then((module) => module.ScenarioLabSimulation),
+  { ssr: false, loading: SimulationLoadingState },
+);
+
 export function VisualizationPanel({
   visualization,
 }: {
@@ -72,6 +77,9 @@ export function VisualizationPanel({
   }
   if (visualization.kind === "backpressure") {
     return <BackpressureSimulation lessonId={visualization.lessonId} />;
+  }
+  if (visualization.kind === "scenario-lab" && isScenarioLabId(visualization.id)) {
+    return <ScenarioLabSimulation labId={visualization.id} lessonId={visualization.lessonId} />;
   }
   return (
     <p className="simulation-shell__error" role="alert">

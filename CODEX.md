@@ -1476,10 +1476,10 @@ Recommended order:
 - [x] Transaction Isolation
 - [x] Cache Stampede
 - [x] Backpressure
-- [ ] Retry + Jitter
-- [ ] Token Bucket
+- [x] Retry + Jitter
+- [x] Token Bucket
 
-Status: **8 of 10 representative topics complete in M7**
+Status: **10 of 10 representative topics complete in M8; M8–M10 add twenty-eight further scenario-lab topics**
 
 ---
 
@@ -1545,13 +1545,13 @@ Status: **Not started**
 
 Current milestone:
 
-> **M7 — Eight of ten representative visualizations — Complete (2026-08-24)**
+> **M10 — Ten more visualizations — Complete (2026-09-01)**
 
 Primary goal:
 
-Extend the deterministic model-first simulation boundary to eight representative lessons while preserving the accessible shared shell, responsive renderers, scenario and failure controls, reduced-motion behavior, and explicit local-first scenario completion persistence.
+Expand deterministic scenario-lab coverage into transport protocols, discovery, transaction durability, database concurrency, cache read paths, message order, deadline propagation, and reliability objectives while preserving the accessible shared shell and local-first completion persistence.
 
-Interactive simulations now ship for Horizontal Scaling, Tail Latency, CAP, Load Balancing, Consistent Hashing, Transaction Isolation, Cache Stampede, and Backpressure. Consistent Hashing forms a complete theory → visualization → quiz → progress slice. Broader visualization coverage, authentication, a backend, and remote synchronization remain deferred to later milestones.
+Interactive simulations now ship for thirty-eight lessons. M10 adds TCP vs UDP, HTTP Evolution, Realtime Transports, Service Discovery, ACID & Transactions, Connection Pools, Cache-Aside, Message Ordering, Timeouts, and SLI/SLO/SLA. The selection deepens foundational protocol and operational reasoning without prematurely implementing design-lab workspaces.
 
 ---
 
@@ -1561,11 +1561,11 @@ Update this section whenever Codex finishes a meaningful task.
 
 ## Last Updated
 
-`2026-08-24`
+`2026-09-01`
 
 ## Active Milestone
 
-`M7 — Eight of ten representative visualizations — Complete`
+`M10 — Ten more visualizations — Complete`
 
 ## Currently Working On
 
@@ -1575,10 +1575,17 @@ Update this section whenever Codex finishes a meaningful task.
 - [x] Theory authoring — all 135 lessons across Modules 00–13 complete
 - [x] Local progress domain, persistence, portable backup, and minimal reader controls
 - [x] Typed quiz domain, two representative quiz slices, accessible quiz UI, and local attempt persistence
-- [x] Shared simulation shell, eight deterministic interactive lessons, and local scenario completion persistence
+- [x] Shared simulation shell, thirty-eight deterministic interactive lessons, and local scenario completion persistence
 
 ## Recently Completed
 
+- Completed M10 with ten registered visualization lessons and twenty authored scenarios covering transports, service discovery, transactions, connection pools, cache-aside, ordering, timeouts, and reliability objectives.
+- Added deterministic packet-loss recovery, HTTP stream blocking, realtime reconnect, lease-based discovery, atomic crash recovery, pool leaks, miss coalescing, per-key ordering, deadline cancellation, and error-budget burn behavior.
+- Completed M9 with ten registered visualization lessons and twenty contrasting authored scenarios across networking, traffic, databases, caching, messaging, and observability.
+- Added deterministic cold/warm request paths, DNS TTL migration, readiness hysteresis and fenced failover, index access paths, B-tree/LSM cost movement, cache invalidation races, hot-key relief, consumer-group rebalance, DLQ redrive, and tracing critical-path/tail-sampling behavior.
+- Completed M8 with ten registered visualization lessons, twenty authored scenarios, deterministic step/reset transitions, responsive node/link state, exact metrics, bounded events, text alternatives, and the existing completion workflow.
+- Finished the original representative visualization list with Retry + Jitter and Token Bucket, then added Circuit Breaker, Read/Write Quorums, Replication, Partitioning & Sharding, Message Queue Fundamentals, Delivery Semantics, Consensus / Raft, and Distributed Locks.
+- Added a shared scenario-lab renderer only after eight real simulations had established the reusable shell, keeping topic content declarative while state transitions remain deterministic and independently tested.
 - Completed M7 with deterministic model/renderer separation across eight interactive lessons, adding Transaction Isolation, Cache Stampede, and Backpressure.
 - Registered the three new stable visualization IDs, lesson metadata, lazy renderer mappings, and eight-topic registry/route coverage.
 - Added an accessible shared shell with play, pause, step, reset, speed, presets, metrics, bounded events, failure actions, explicit completion, storage feedback, responsive SVG state, and reduced-motion behavior.
@@ -1621,11 +1628,10 @@ None known.
 
 ## Next Recommended Tasks
 
-1. Add Retry + Jitter to show synchronized retry amplification and how bounded randomness spreads recovery load.
-2. Add Token Bucket to make refill, burst allowance, sustained admission, and rejection behavior observable.
-3. Add structured quizzes only with focused lesson work; do not bulk-convert the remaining seeds.
-4. Use persisted incorrect concept tags when review mode defines prioritization and scheduling.
-5. Consider search alongside a focused reader improvement now that the complete corpus and local progress model exist.
+1. Add structured quizzes only with focused lesson work; do not bulk-convert the remaining seeds.
+2. Use persisted incorrect concept tags when review mode defines prioritization and scheduling.
+3. Consider search alongside a focused reader improvement now that the complete corpus and local progress model exist.
+4. Choose the next visualization batch from observed learning gaps rather than expanding coverage by module order alone.
 
 ---
 

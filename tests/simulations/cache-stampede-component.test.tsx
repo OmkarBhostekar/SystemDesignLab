@@ -2,10 +2,11 @@
 
 import "@testing-library/jest-dom/vitest";
 
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { CacheStampedeSimulation } from "@/components/simulations/CacheStampedeSimulation";
+import { InMemoryProgressRepository } from "@/repositories/in-memory-progress-repository";
 
 afterEach(() => cleanup());
 
@@ -33,5 +34,32 @@ describe("cache stampede simulation component", () => {
     fireEvent.click(screen.getByText(/^Event timeline/));
     const timeline = screen.getByRole("list", { name: "Simulation event timeline" });
     expect(within(timeline).getAllByRole("listitem").length).toBeLessThanOrEqual(8);
+  });
+
+  it("persists completion after a mitigation is applied and its behavior is observed", async () => {
+    const repository = new InMemoryProgressRepository();
+    render(
+      <CacheStampedeSimulation
+        lessonId="05-07-cache-stampede"
+        repository={repository}
+      />,
+    );
+
+    fireEvent.change(screen.getByRole("combobox", { name: "Mitigation" }), {
+      target: { value: "jitter" },
+    });
+    const step = screen.getByRole("button", { name: "Step" });
+    for (let index = 0; index < 40; index += 1) fireEvent.click(step);
+    const checkpoint = screen.getByRole("button", { name: "Mark visualization complete" });
+    await waitFor(() => expect(checkpoint).toBeEnabled());
+    fireEvent.click(checkpoint);
+    await waitFor(() => expect(screen.getByRole("button", { name: "Visualization completed" })).toBeDisabled());
+    expect(await repository.listSimulationCompletions()).toEqual([
+      expect.objectContaining({
+        visualizationId: "cache-stampede",
+        lessonId: "05-07-cache-stampede",
+        scenarioId: "synchronized-expiry",
+      }),
+    ]);
   });
 });

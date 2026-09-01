@@ -8,4 +8,5 @@ export * from "./LoadBalancingSimulation";
 export * from "./TransactionIsolationSimulation";
 export * from "./CacheStampedeSimulation";
 export * from "./BackpressureSimulation";
+export * from "./ScenarioLabSimulation";
 export * from "./VisualizationPanel";

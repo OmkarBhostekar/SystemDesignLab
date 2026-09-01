@@ -13,13 +13,43 @@ import {
 describe("visualization registry", () => {
   it("resolves registered IDs deterministically", () => {
     expect(listVisualizationIds()).toEqual([
+      "acid-transactions",
       "backpressure",
+      "btree-lsm",
+      "cache-aside",
+      "cache-invalidation",
       "cache-stampede",
       "cap",
+      "circuit-breaker",
+      "connection-pools",
+      "consensus-raft",
       "consistent-hash-ring",
+      "database-indexes",
+      "dead-letter-queues",
+      "delivery-semantics",
+      "distributed-locks",
+      "distributed-tracing",
+      "dns",
+      "health-checks-failover",
       "horizontal-scaling",
+      "hot-keys",
+      "http-evolution",
       "load-balancing-algorithms",
+      "message-ordering",
+      "message-queue-fundamentals",
+      "partitioning-sharding",
+      "partitions-consumer-groups",
+      "read-write-quorums",
+      "realtime-transports",
+      "replication",
+      "request-lifecycle",
+      "retry-jitter",
+      "service-discovery",
+      "sli-slo-sla",
       "tail-latency",
+      "tcp-udp",
+      "timeouts",
+      "token-bucket",
       "transaction-isolation",
     ]);
     expect(getVisualization("horizontal-scaling")?.lessonId).toBe(
@@ -48,6 +78,14 @@ describe("visualization registry", () => {
     expect(getVisualization("backpressure")).toMatchObject({
       lessonId: "06-09-backpressure",
       kind: "backpressure",
+    });
+    expect(getVisualization("retry-jitter")).toMatchObject({
+      lessonId: "08-03-exponential-backoff-and-jitter",
+      kind: "scenario-lab",
+    });
+    expect(getVisualization("distributed-locks")).toMatchObject({
+      lessonId: "07-04-distributed-locks",
+      kind: "scenario-lab",
     });
     expect(getVisualization("missing-visualization")).toBeNull();
   });

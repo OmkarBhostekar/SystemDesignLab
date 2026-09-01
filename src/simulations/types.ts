@@ -36,6 +36,7 @@ export const VISUALIZATION_KINDS = [
   "transaction-isolation",
   "cache-stampede",
   "backpressure",
+  "scenario-lab",
 ] as const;
 
 export type VisualizationKind = (typeof VISUALIZATION_KINDS)[number];

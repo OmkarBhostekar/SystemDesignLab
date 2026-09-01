@@ -10,7 +10,9 @@ import {
   LoadBalancingSimulation,
   TailLatencySimulation,
   TransactionIsolationSimulation,
+  ScenarioLabSimulation,
 } from "@/components/simulations";
+import { SCENARIO_LABS } from "@/simulations";
 import { TheoryOnlyState } from "@/components/lesson";
 import { getVisualization } from "@/content/visualizations";
 
@@ -102,5 +104,17 @@ describe("visualization route integration", () => {
     );
     expect(markup).toContain("Visualization coming later");
     expect(markup).toContain("authored theory remains complete");
+  });
+
+  it("server-renders every registered scenario lab with accessible controls and a text model", () => {
+    for (const lab of SCENARIO_LABS) {
+      const markup = renderToStaticMarkup(
+        <ScenarioLabSimulation labId={lab.id} lessonId="test-lesson" />,
+      );
+      expect(markup).toContain(lab.title);
+      expect(markup).toContain("Mark visualization complete");
+      expect(markup).toContain("Step 1 of 4");
+      for (const node of lab.nodes) expect(markup).toContain(node.label);
+    }
   });
 });

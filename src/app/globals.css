@@ -2298,6 +2298,111 @@ html[data-focus-mode="true"] .reading-frame__breadcrumbs {
   color: var(--text-muted);
 }
 
+.scenario-lab {
+  display: grid;
+  gap: 0.9rem;
+  min-height: 18rem;
+  padding: clamp(0.8rem, 2vw, 1.25rem);
+  border: 1px solid var(--border);
+  background: var(--surface-raised);
+}
+
+.scenario-lab__progress {
+  display: grid;
+  grid-auto-flow: column;
+  gap: 0.35rem;
+}
+
+.scenario-lab__progress-step {
+  height: 0.25rem;
+  background: var(--border);
+}
+
+.scenario-lab__progress-step--reached {
+  background: var(--accent);
+}
+
+.scenario-lab__phase {
+  margin: 0;
+  color: var(--text-strong);
+  font-family: var(--font-mono);
+  font-size: 0.82rem;
+  font-weight: 700;
+}
+
+.scenario-lab__flow {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 0.45rem;
+  align-items: center;
+}
+
+.scenario-lab__flow-item {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+}
+
+.scenario-lab__node {
+  display: grid;
+  gap: 0.25rem;
+  width: 100%;
+  min-height: 8rem;
+  align-content: center;
+  padding: 0.75rem;
+  border: 2px solid var(--border);
+  background: var(--surface);
+  text-align: center;
+}
+
+.scenario-lab__node--active,
+.scenario-lab__node--success { border-color: var(--success); }
+.scenario-lab__node--warning { border-color: var(--warning); }
+.scenario-lab__node--failure { border-color: var(--danger); }
+
+.scenario-lab__node strong {
+  color: var(--text-strong);
+  font-size: 0.86rem;
+}
+
+.scenario-lab__node small,
+.scenario-lab__kind {
+  color: var(--text-muted);
+  font-size: 0.68rem;
+  line-height: 1.35;
+}
+
+.scenario-lab__kind {
+  font-family: var(--font-mono);
+  text-transform: uppercase;
+}
+
+.scenario-lab__link {
+  display: grid;
+  flex: 0 0 2.4rem;
+  gap: 0.1rem;
+  color: var(--text-muted);
+  text-align: center;
+}
+
+.scenario-lab__link span { font-size: 0.58rem; line-height: 1.1; }
+.scenario-lab__link b { font-size: 1.1rem; }
+.scenario-lab__link--success,
+.scenario-lab__link--active { color: var(--success); }
+.scenario-lab__link--warning { color: var(--warning); }
+.scenario-lab__link--failure { color: var(--danger); }
+
+.scenario-lab__text-alternative {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
 .simulation-shell__completion {
   justify-content: space-between;
   border-top: 1px solid var(--border);
@@ -2525,6 +2630,22 @@ html[data-focus-mode="true"] .reading-frame__breadcrumbs {
     border-top: 3px solid var(--accent);
     border-left: 0;
   }
+
+  .scenario-lab__flow {
+    grid-template-columns: 1fr;
+  }
+
+  .scenario-lab__flow-item {
+    display: grid;
+  }
+
+  .scenario-lab__link {
+    min-height: 2.2rem;
+    transform: rotate(90deg);
+    justify-content: center;
+  }
+
+  .scenario-lab__node { min-height: auto; }
 }
 
 @media (max-width: 32rem) {

@@ -17,3 +17,4 @@ export {
 export * from "./transaction-isolation";
 export * from "./cache-stampede";
 export * from "./backpressure";
+export * from "./scenario-lab";
