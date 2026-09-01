@@ -133,6 +133,66 @@ const lockNodes = [
   node("worker-b", "Worker B", "May acquire after the old lease expires.", "client"),
   node("resource", "Protected store", "Rejects stale fencing tokens.", "store"),
 ] as const;
+const requestLifecycleNodes = [
+  node("client", "Client", "Creates one request under an end-to-end deadline.", "client"),
+  node("edge", "DNS + edge", "Resolves, connects, terminates TLS, and routes.", "coordinator"),
+  node("service", "Application", "Queues and executes business logic.", "service"),
+  node("data", "Data store", "Returns the state needed for the response.", "store"),
+] as const;
+const dnsNodes = [
+  node("stub", "Stub resolver", "Starts from browser and OS caches.", "client"),
+  node("recursive", "Recursive resolver", "Walks referrals and caches answers.", "coordinator"),
+  node("authority", "Authoritative DNS", "Owns the zone and record TTL.", "service"),
+  node("endpoint", "Service endpoint", "Receives traffic for the returned address.", "service"),
+] as const;
+const healthNodes = [
+  node("prober", "Health checker", "Samples readiness on a bounded cadence.", "coordinator"),
+  node("router", "Traffic router", "Uses the accepted healthy membership view.", "service"),
+  node("primary", "Primary instance", "May be slow, failed, or isolated.", "service"),
+  node("standby", "Standby instance", "Takes traffic only after safe promotion.", "service"),
+] as const;
+const indexNodes = [
+  node("query", "Query", "Filters and orders rows for one access pattern.", "client"),
+  node("planner", "Query planner", "Chooses a scan or an index path.", "coordinator"),
+  node("index", "Index", "Maps ordered keys to row locations.", "store"),
+  node("table", "Table pages", "Hold complete rows and write amplification.", "store"),
+] as const;
+const storageTreeNodes = [
+  node("writes", "Writes", "Arrive with mixed read/write pressure.", "client"),
+  node("memory", "Memory buffer", "Absorbs updates before durable organization.", "store"),
+  node("levels", "Tree / levels", "B-tree pages or immutable sorted runs.", "store"),
+  node("disk", "Disk I/O", "Exposes random writes, compaction, and reads.", "store"),
+] as const;
+const invalidationNodes = [
+  node("writer", "Writer", "Changes the authoritative value.", "client"),
+  node("database", "Database", "Commits versioned source-of-truth state.", "store"),
+  node("cache", "Cache", "May hold an older version under a TTL.", "store"),
+  node("reader", "Reader", "Observes fresh or stale data through the cache.", "client"),
+] as const;
+const hotKeyNodes = [
+  node("traffic", "Traffic", "A celebrity key dominates otherwise balanced load.", "client"),
+  node("router", "Key router", "Hashes requests to owners and replicas.", "coordinator"),
+  node("hot-owner", "Hot owner", "Receives the concentrated key workload.", "store"),
+  node("capacity", "Relief path", "Replicas, request coalescing, or sharded key state.", "service"),
+] as const;
+const consumerGroupNodes = [
+  node("topic", "Partitioned topic", "Keeps ordered logs per partition.", "queue"),
+  node("coordinator", "Group coordinator", "Assigns each partition to one member.", "coordinator"),
+  node("consumer-a", "Consumer A", "Processes its current assignment.", "service"),
+  node("consumer-b", "Consumer B", "Joins, leaves, or receives reassigned work.", "service"),
+] as const;
+const dlqNodes = [
+  node("source", "Source queue", "Delivers work with a bounded retry policy.", "queue"),
+  node("worker", "Consumer", "Classifies transient and permanent failures.", "service"),
+  node("dlq", "Dead-letter queue", "Quarantines exhausted poison messages.", "queue"),
+  node("operator", "Recovery workflow", "Inspects, fixes, and safely redrives.", "coordinator"),
+] as const;
+const tracingNodes = [
+  node("gateway", "Gateway span", "Starts or propagates trace context.", "service"),
+  node("orders", "Orders span", "Records application work and child calls.", "service"),
+  node("payments", "Payments span", "May dominate the critical path.", "service"),
+  node("collector", "Trace backend", "Samples, joins, and queries spans.", "store"),
+] as const;
 
 export const SCENARIO_LABS: readonly ScenarioLabDefinition[] = [
   {
@@ -312,6 +372,186 @@ export const SCENARIO_LABS: readonly ScenarioLabDefinition[] = [
         ["A pauses and expires", "The resource remembers token 41 even when A is not running.", "failure warning neutral active", "expire", ["none", "41", "0"], "warning"],
         ["B gets token 42", "B writes successfully with the newer fencing token.", "failure active success success", "grant 42", ["B", "42", "0"], "success"],
         ["A is fenced", "The resource compares tokens and rejects A's stale token 41.", "warning success success success", "reject 41", ["B", "42", "1"], "success"],
+      ]),
+    ],
+  },
+  {
+    id: "request-lifecycle", title: "Where did the request budget go?",
+    description: "Trace resolution, connection, queueing, application work, and data access under one deadline.", nodes: requestLifecycleNodes,
+    presets: [
+      preset("cold-path", "Cold connection path", "No reusable connection or cached resolution is available.", requestLifecycleNodes, ["Elapsed", "Budget left", "Network trips"], [
+        ["Resolve destination", "The client misses local DNS caches and spends part of the shared deadline resolving the service.", "active active neutral neutral", "DNS 42ms", ["42ms", "458ms", "2"], "warning"],
+        ["Connect and secure", "TCP and TLS handshakes add sequential round trips before application work begins.", "active warning neutral neutral", "connect 88ms", ["130ms", "370ms", "5"], "warning"],
+        ["Queue and query", "The request waits behind active work, then the application calls the database.", "active success warning active", "query", ["382ms", "118ms", "6"], "warning"],
+        ["Response completes", "Serialization and return transit fit inside the original end-to-end deadline.", "success success success success", "respond", ["456ms", "44ms", "7"], "success"],
+      ]),
+      preset("warm-path", "Warm pooled path", "Cached DNS and a reused connection expose server time directly.", requestLifecycleNodes, ["Elapsed", "Budget left", "Network trips"], [
+        ["Reuse route state", "Cached resolution and an established HTTP/2 connection remove setup round trips.", "active success neutral neutral", "reuse", ["4ms", "496ms", "0"], "success"],
+        ["Edge routes", "The edge authenticates and forwards the request without a new connection handshake.", "active success active neutral", "route", ["18ms", "482ms", "1"], "success"],
+        ["Application queries", "Most latency now belongs to queueing and the data dependency rather than setup.", "active success active active", "query", ["126ms", "374ms", "2"], "success"],
+        ["Response returns", "Connection reuse lowers total latency without changing business work.", "success success success success", "respond", ["148ms", "352ms", "3"], "success"],
+      ]),
+    ],
+  },
+  {
+    id: "dns", title: "Which DNS answer is still cached?",
+    description: "Follow recursive resolution, TTL caching, endpoint migration, and stale-answer behavior.", nodes: dnsNodes,
+    presets: [
+      preset("recursive-miss", "Recursive cache miss", "A resolver walks the hierarchy and caches the authoritative answer.", dnsNodes, ["Lookups", "Answer TTL", "Endpoint"], [
+        ["Stub cache misses", "Neither the application nor operating system has an unexpired answer.", "active active neutral neutral", "query", ["1", "0s", "unknown"], "warning"],
+        ["Resolver follows referrals", "The recursive resolver discovers the responsible authoritative zone.", "active warning active neutral", "referral", ["3", "0s", "unknown"], "warning"],
+        ["Authority returns A", "The zone returns 203.0.113.10 with a 60-second TTL.", "active active success neutral", "A + TTL", ["4", "60s", "203.0.113.10"], "success"],
+        ["Resolver caches", "Subsequent clients reuse the answer until TTL expiry, reducing authority load.", "success success success active", "connect", ["4", "60s", "203.0.113.10"], "success"],
+      ]),
+      preset("migration", "Endpoint migration", "A TTL bounds but does not instantly remove old answers.", dnsNodes, ["Old-answer users", "TTL left", "Failed connects"], [
+        ["Record changes", "The authority points new queries at the replacement endpoint.", "active warning success active", "new A", ["70%", "35s", "0"], "warning"],
+        ["Caches retain old A", "Resolvers with unexpired TTLs legitimately continue returning the old address.", "active warning active warning", "cached A", ["52%", "20s", "0"], "warning"],
+        ["Old endpoint stops early", "Removing the old endpoint before TTL drains turns valid cached answers into failures.", "failure warning success failure", "connect old", ["31%", "8s", "31"], "failure"],
+        ["TTL drains safely", "Keeping both endpoints healthy through the overlap lets all resolvers converge.", "success success success success", "new A", ["0%", "0s", "31"], "success"],
+      ]),
+    ],
+  },
+  {
+    id: "health-checks-failover", title: "When is an instance safe to receive traffic?",
+    description: "Compare readiness hysteresis with a safely fenced failover decision.", nodes: healthNodes,
+    presets: [
+      preset("flapping", "Flapping readiness", "Consecutive thresholds keep one slow probe from churning membership.", healthNodes, ["Probe failures", "Healthy targets", "Route changes"], [
+        ["All targets ready", "The router has an accepted healthy view based on recent successful probes.", "active success success neutral", "route", ["0", "2", "0"], "success"],
+        ["One probe is slow", "A single timeout is recorded but does not immediately eject the primary.", "warning success warning neutral", "probe timeout", ["1", "2", "0"], "warning"],
+        ["Threshold is crossed", "Three consecutive failures remove the primary from new-request routing.", "failure active failure active", "eject", ["3", "1", "1"], "failure"],
+        ["Recovery is stable", "Two successful probes restore readiness without rapid membership flapping.", "success success active active", "restore", ["0", "2", "2"], "success"],
+      ]),
+      preset("safe-failover", "Safe primary failover", "Detection, fencing, promotion, and routing happen in that order.", healthNodes, ["Primary epoch", "Active writers", "Failover time"], [
+        ["Primary is isolated", "Health checks detect loss of reachability but cannot prove the old writer stopped.", "failure warning failure active", "detect", ["12", "1?", "2s"], "failure"],
+        ["Old epoch is fenced", "The coordinator invalidates epoch 12 before enabling a replacement writer.", "active warning failure active", "fence 12", ["13", "0", "3s"], "warning"],
+        ["Standby promotes", "The most current standby becomes primary under epoch 13.", "active active failure success", "promote", ["13", "1", "5s"], "success"],
+        ["Router converges", "Traffic moves only after the promoted writer reports ready for epoch 13.", "success success neutral success", "route", ["13", "1", "7s"], "success"],
+      ]),
+    ],
+  },
+  {
+    id: "database-indexes", title: "When does an index avoid a table scan?",
+    description: "Compare scan cost, composite-key order, covering reads, and write amplification.", nodes: indexNodes,
+    presets: [
+      preset("selective", "Selective lookup", "A matching composite index prunes almost all table pages.", indexNodes, ["Rows examined", "Pages read", "Write indexes"], [
+        ["Filter arrives", "The query asks for one tenant and a recent created-at range.", "active active neutral neutral", "plan", ["1,000,000", "8,200", "2"], "warning"],
+        ["Planner matches prefix", "An index on tenant_id, created_at supports equality then ordered range lookup.", "active success active neutral", "seek", ["240", "5", "2"], "success"],
+        ["Index locates rows", "Leaf entries identify a small candidate set in key order.", "active success success active", "fetch rows", ["240", "18", "2"], "success"],
+        ["Query completes", "The index lowers read work while every future write must maintain the extra structure.", "success success success success", "return", ["240", "18", "2"], "success"],
+      ]),
+      preset("wrong-order", "Wrong composite order", "An index exists but its leading column cannot prune this predicate.", indexNodes, ["Rows examined", "Pages read", "Plan"], [
+        ["Index is present", "The table has an index on status, tenant_id, but the query filters only tenant_id.", "active active active neutral", "consider", ["1,000,000", "8,200", "pending"], "warning"],
+        ["Leading key is missing", "The planner cannot efficiently seek past every possible status value.", "active warning warning neutral", "reject index", ["1,000,000", "8,200", "scan"], "failure"],
+        ["Table scan runs", "Every table page is examined even though a similarly named index exists.", "active warning neutral failure", "scan", ["1,000,000", "8,200", "scan"], "failure"],
+        ["Access pattern fixes design", "Reordering to tenant_id, status matches the actual query prefix.", "success success success active", "new seek", ["1,400", "32", "index"], "success"],
+      ]),
+    ],
+  },
+  {
+    id: "btree-lsm", title: "Where does storage-engine work move?",
+    description: "Contrast in-place B-tree maintenance with buffered LSM writes, read amplification, and compaction.", nodes: storageTreeNodes,
+    presets: [
+      preset("btree", "B-tree update", "A point update descends and rewrites bounded tree pages.", storageTreeNodes, ["Write latency", "Read runs", "Background I/O"], [
+        ["Update arrives", "The engine locates the target key through the root and internal pages.", "active active active neutral", "descend", ["1ms", "1", "0 MB/s"], "success"],
+        ["Leaf page changes", "The mutable leaf is updated; a full page may be written for a small record.", "active active warning active", "page write", ["4ms", "1", "2 MB/s"], "warning"],
+        ["Split propagates", "A full leaf splits and updates parent separator keys.", "active warning warning active", "split", ["12ms", "1", "8 MB/s"], "warning"],
+        ["Reads stay direct", "Point reads follow one ordered tree despite occasional write spikes.", "neutral success success success", "seek", ["4ms p50", "1", "1 MB/s"], "success"],
+      ]),
+      preset("lsm", "LSM flush and compaction", "Fast buffered writes create later read and compaction work.", storageTreeNodes, ["Write latency", "Read runs", "Compaction I/O"], [
+        ["Append to memory", "The write enters a WAL and sorted memtable without an in-place disk update.", "active success neutral active", "WAL + mem", ["0.8ms", "1", "0 MB/s"], "success"],
+        ["Memtable flushes", "An immutable sorted run is written sequentially to level zero.", "active warning active active", "flush", ["1.2ms", "4", "18 MB/s"], "warning"],
+        ["Read checks runs", "Bloom filters help, but a miss may consult several overlapping files.", "active neutral warning active", "lookup", ["1.2ms", "4", "18 MB/s"], "warning"],
+        ["Compaction merges", "Background merging restores read shape while consuming write bandwidth.", "neutral success success warning", "compact", ["2.1ms", "2", "64 MB/s"], "success"],
+      ]),
+    ],
+  },
+  {
+    id: "cache-invalidation", title: "Which version can a reader observe?",
+    description: "Step through cache-aside races and version-aware invalidation after a database commit.", nodes: invalidationNodes,
+    presets: [
+      preset("delete-race", "Delete-then-write race", "Invalidating before commit lets an old value repopulate the cache.", invalidationNodes, ["DB version", "Cache version", "Stale reads"], [
+        ["Cache entry is deleted", "The writer removes cached v1 before the database transaction commits v2.", "active neutral warning active", "delete v1", ["v1", "empty", "0"], "warning"],
+        ["Reader misses cache", "A concurrent reader loads still-current database v1.", "active active warning active", "read v1", ["v1", "empty", "0"], "warning"],
+        ["Stale value repopulates", "The reader writes v1 back just before the writer commits v2.", "active success failure active", "set v1", ["v2", "v1", "0"], "failure"],
+        ["Staleness persists", "Future readers receive cached v1 until TTL or another invalidation repairs it.", "neutral success failure failure", "serve v1", ["v2", "v1", "23"], "failure"],
+      ]),
+      preset("commit-invalidate", "Commit then invalidate", "Versioned invalidation prevents older fills from winning.", invalidationNodes, ["DB version", "Cache version", "Stale reads"], [
+        ["Database commits v2", "The source of truth advances before an invalidation event is published.", "active success active active", "commit v2", ["v2", "v1", "0"], "success"],
+        ["Invalidation carries version", "The cache learns that entries older than v2 are no longer eligible.", "active success active active", "invalidate <v2", ["v2", "empty", "0"], "success"],
+        ["Reader reloads", "A miss reads v2 and fills only if its version is not older than the invalidation watermark.", "neutral success active success", "fill v2", ["v2", "v2", "0"], "success"],
+        ["Readers converge", "Subsequent cache hits return the committed version while TTL remains a safety bound.", "neutral success success success", "serve v2", ["v2", "v2", "0"], "success"],
+      ]),
+    ],
+  },
+  {
+    id: "hot-keys", title: "Can one key overload a balanced fleet?",
+    description: "Expose concentrated ownership and compare replication with request coalescing for a hot key.", nodes: hotKeyNodes,
+    presets: [
+      preset("single-owner", "Single hot owner", "Consistent distribution of keys does not distribute traffic within one key.", hotKeyNodes, ["Hot-key QPS", "Owner CPU", "p99"], [
+        ["Baseline is balanced", "Many ordinary keys distribute evenly across storage owners.", "active success success neutral", "hash keys", ["120", "34%", "18ms"], "success"],
+        ["One key trends", "A celebrity profile suddenly attracts most reads but still maps to one owner.", "active active warning neutral", "same key", ["8,000", "91%", "120ms"], "warning"],
+        ["Owner saturates", "More unrelated nodes do not help because every hot-key request has the same owner.", "active success failure neutral", "queue", ["12,000", "100%", "940ms"], "failure"],
+        ["Requests time out", "Retries amplify the same concentrated path and useful throughput falls.", "failure warning failure neutral", "retry", ["19,000", "100%", "timeout"], "failure"],
+      ]),
+      preset("coalesced", "Replicated and coalesced", "Read replicas and one in-flight fill bound origin work.", hotKeyNodes, ["Client QPS", "Origin QPS", "p99"], [
+        ["Hot reads arrive", "The router spreads eligible reads across several replicas.", "active success active active", "replica read", ["12,000", "600", "45ms"], "success"],
+        ["Entry expires", "A cache miss occurs simultaneously across many callers.", "active warning active warning", "miss", ["12,000", "600", "82ms"], "warning"],
+        ["One fill owns refresh", "Request coalescing lets one caller refresh while others await or use bounded stale data.", "active success active success", "single fill", ["12,000", "1", "90ms"], "success"],
+        ["Fresh replicas serve", "The refreshed value fans out without returning the burst to the origin owner.", "success success success success", "serve", ["12,000", "1", "48ms"], "success"],
+      ]),
+    ],
+  },
+  {
+    id: "partitions-consumer-groups", title: "Who owns each partition now?",
+    description: "Observe parallel consumption, partition limits, and a safe rebalance with offset handoff.", nodes: consumerGroupNodes,
+    presets: [
+      preset("parallelism", "Partition-limited parallelism", "Consumer count beyond partition count creates idle members.", consumerGroupNodes, ["Partitions", "Consumers", "Idle members"], [
+        ["Three partitions exist", "Ordering is independent per partition and each has one active group owner.", "active active active active", "assign", ["3", "2", "0"], "success"],
+        ["Two consumers work", "Consumer A owns two partitions while B owns one.", "active success active active", "poll", ["3", "2", "0"], "success"],
+        ["Two members join", "Four consumers compete, but only three partitions can be processed in parallel.", "active warning active active", "rebalance", ["3", "4", "1"], "warning"],
+        ["Assignments settle", "One member remains idle by design; adding consumers cannot exceed partition parallelism.", "success success success success", "resume", ["3", "4", "1"], "success"],
+      ]),
+      preset("rebalance", "Offset-safe rebalance", "Revoke, commit, assign, and resume without concurrent ownership.", consumerGroupNodes, ["Lag", "Duplicate risk", "Paused time"], [
+        ["Consumer B leaves", "The coordinator starts a new group generation and pauses affected ownership.", "active warning active failure", "leave", ["420", "low", "0.2s"], "warning"],
+        ["A revokes partition", "The old owner finishes in-flight work and commits the last safe offset.", "active active warning failure", "revoke + commit", ["510", "medium", "1.1s"], "warning"],
+        ["New assignment begins", "The coordinator assigns the orphaned partition only after revocation completes.", "active success active active", "assign", ["580", "low", "1.8s"], "success"],
+        ["Consumption catches up", "The new owner resumes from the committed offset and drains accumulated lag.", "success success success success", "poll", ["40", "low", "1.8s"], "success"],
+      ]),
+    ],
+  },
+  {
+    id: "dead-letter-queues", title: "When should a message stop retrying?",
+    description: "Separate transient recovery from poison-message quarantine and controlled redrive.", nodes: dlqNodes,
+    presets: [
+      preset("poison", "Poison message", "A permanent schema error consumes its bounded attempts, then leaves the hot path.", dlqNodes, ["Attempts", "Source lag", "DLQ depth"], [
+        ["Message fails validation", "The consumer classifies an unknown required field instead of treating it as a timeout.", "active warning neutral neutral", "attempt 1", ["1/3", "18", "0"], "warning"],
+        ["Bounded retry repeats", "A second delivery confirms the failure is deterministic, not transient.", "active failure neutral neutral", "attempt 2", ["2/3", "31", "0"], "failure"],
+        ["Attempt budget exhausts", "The broker moves the original payload and failure metadata to the DLQ.", "success warning active neutral", "dead-letter", ["3/3", "12", "1"], "warning"],
+        ["Healthy work proceeds", "Quarantine prevents one poison message from blocking the source partition indefinitely.", "success success active active", "continue", ["3/3", "0", "1"], "success"],
+      ]),
+      preset("redrive", "Controlled redrive", "An operator fixes the cause and replays through an idempotent path.", dlqNodes, ["DLQ depth", "Redriven", "Repeated effects"], [
+        ["Failure is inspected", "Payload, error class, code version, and first/last failure times identify a schema mismatch.", "neutral neutral active active", "inspect", ["25", "0", "0"], "success"],
+        ["Consumer is corrected", "A compatible parser deploys before any message is copied back.", "neutral success active active", "deploy", ["25", "0", "0"], "success"],
+        ["Canary redrive", "One idempotency-keyed message verifies the fix and downstream side effect.", "active active warning active", "redrive 1", ["24", "1", "0"], "warning"],
+        ["Batch redrive completes", "Rate-limited replay drains the DLQ without recreating the original incident.", "success success success success", "redrive 24", ["0", "25", "0"], "success"],
+      ]),
+    ],
+  },
+  {
+    id: "distributed-tracing", title: "Which span controls user latency?",
+    description: "Propagate trace context, reconstruct the critical path, and expose tail-sampling trade-offs.", nodes: tracingNodes,
+    presets: [
+      preset("critical-path", "Slow payment dependency", "Nested spans reveal where the end-to-end request waits.", tracingNodes, ["Trace duration", "Payment span", "Missing spans"], [
+        ["Gateway starts trace", "A trace ID and root span capture the inbound request budget and sampling context.", "active neutral neutral active", "traceparent", ["8ms", "0ms", "0"], "success"],
+        ["Orders calls payments", "The orders span records a child dependency call instead of one opaque server duration.", "active active active active", "child span", ["62ms", "38ms", "0"], "success"],
+        ["Payment stalls", "The payment child dominates the critical path while unrelated work completes earlier.", "active warning failure active", "wait", ["842ms", "790ms", "0"], "failure"],
+        ["Trace joins", "The backend aligns parent/child timestamps and makes the 790ms dependency wait explicit.", "success success warning success", "export", ["860ms", "790ms", "0"], "success"],
+      ]),
+      preset("tail-sampling", "Tail-based error sampling", "The collector retains a rare failed trace after observing its outcome.", tracingNodes, ["Incoming traces", "Stored traces", "Error traces kept"], [
+        ["Requests begin unsampled", "Spans are buffered briefly because the final latency and status are not known yet.", "active active active warning", "buffer", ["10,000", "0", "0%"], "warning"],
+        ["Most traces succeed", "Fast successful traces become candidates for aggressive sampling.", "active success success warning", "classify", ["10,000", "0", "0%"], "success"],
+        ["Rare error completes", "One trace ends with a payment error and becomes high-value diagnostic evidence.", "active warning failure active", "error", ["10,000", "0", "100% pending"], "warning"],
+        ["Policy retains the tail", "The backend keeps all errors plus a small success sample within storage budget.", "success success warning success", "store", ["10,000", "120", "100%"], "success"],
       ]),
     ],
   },

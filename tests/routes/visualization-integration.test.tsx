@@ -106,7 +106,7 @@ describe("visualization route integration", () => {
     expect(markup).toContain("authored theory remains complete");
   });
 
-  it("server-renders every M8 scenario lab with accessible controls and a text model", () => {
+  it("server-renders every registered scenario lab with accessible controls and a text model", () => {
     for (const lab of SCENARIO_LABS) {
       const markup = renderToStaticMarkup(
         <ScenarioLabSimulation labId={lab.id} lessonId="test-lesson" />,
