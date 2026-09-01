@@ -193,6 +193,66 @@ const tracingNodes = [
   node("payments", "Payments span", "May dominate the critical path.", "service"),
   node("collector", "Trace backend", "Samples, joins, and queries spans.", "store"),
 ] as const;
+const transportNodes = [
+  node("sender", "Sender", "Produces ordered bytes or independent datagrams.", "client"),
+  node("network", "Lossy network", "May delay, drop, duplicate, or reorder packets.", "service"),
+  node("transport", "Transport", "Applies TCP recovery or UDP application policy.", "coordinator"),
+  node("receiver", "Receiver", "Observes delivered data and latency.", "service"),
+] as const;
+const httpNodes = [
+  node("browser", "Client", "Issues several dependent resource requests.", "client"),
+  node("connection", "Connection", "Carries HTTP/1.1, HTTP/2, or HTTP/3 streams.", "coordinator"),
+  node("origin", "Origin", "Processes multiplexed application requests.", "service"),
+  node("response", "Responses", "Complete independently or behind blocking.", "store"),
+] as const;
+const realtimeNodes = [
+  node("client", "Interactive client", "Needs fresh server events and may send commands.", "client"),
+  node("edge", "Connection edge", "Terminates polling, SSE, or WebSocket sessions.", "service"),
+  node("broker", "Event broker", "Fans updates to subscribed connection owners.", "queue"),
+  node("producer", "State producer", "Publishes ordered versions of changing state.", "service"),
+] as const;
+const discoveryNodes = [
+  node("instance", "Service instance", "Registers and renews a bounded lease.", "service"),
+  node("registry", "Discovery registry", "Maintains delayed membership state.", "coordinator"),
+  node("client", "Calling service", "Resolves and balances over eligible endpoints.", "client"),
+  node("target", "Selected endpoint", "Receives traffic only while considered ready.", "service"),
+] as const;
+const acidNodes = [
+  node("transaction", "Transaction", "Groups related reads and writes.", "client"),
+  node("engine", "Database engine", "Validates constraints and controls concurrency.", "coordinator"),
+  node("log", "Durable log", "Records commit intent before acknowledgment.", "store"),
+  node("rows", "Data pages", "Expose either the committed state or no partial state.", "store"),
+] as const;
+const poolNodes = [
+  node("requests", "Requests", "Compete for a bounded database concurrency budget.", "client"),
+  node("pool", "Connection pool", "Queues, leases, times out, and returns connections.", "coordinator"),
+  node("database", "Database", "Spends memory and workers per active session.", "store"),
+  node("outcome", "Call outcome", "Completes, waits, or fails before saturation spreads.", "service"),
+] as const;
+const cacheAsideNodes = [
+  node("reader", "Reader", "Looks up a key through cache-aside logic.", "client"),
+  node("cache", "Cache", "Stores bounded-TTL copies, not authority.", "store"),
+  node("database", "Database", "Owns the authoritative value and read capacity.", "store"),
+  node("response", "Response", "Returns a cache hit or freshly loaded version.", "service"),
+] as const;
+const orderingNodes = [
+  node("producers", "Producers", "Emit related events with identities and sequence data.", "client"),
+  node("partitions", "Partitions", "Preserve order only within one durable lane.", "queue"),
+  node("consumer", "Consumer", "Applies events under an explicit ordering rule.", "service"),
+  node("state", "Materialized state", "Rejects stale versions or exposes reordering damage.", "store"),
+] as const;
+const timeoutNodes = [
+  node("caller", "Caller", "Owns the original end-to-end deadline.", "client"),
+  node("service-a", "Service A", "Consumes budget and calls another dependency.", "service"),
+  node("service-b", "Service B", "May continue work after the caller stops waiting.", "service"),
+  node("resource", "Scarce resource", "Threads and connections remain occupied until cancellation.", "store"),
+] as const;
+const sloNodes = [
+  node("events", "User events", "Provide valid and invalid measurement candidates.", "client"),
+  node("sli", "SLI pipeline", "Computes a precisely scoped good/valid ratio.", "coordinator"),
+  node("slo", "SLO window", "Sets the target and tracks remaining error budget.", "store"),
+  node("decision", "Release decision", "Uses burn rate rather than one noisy incident count.", "service"),
+] as const;
 
 export const SCENARIO_LABS: readonly ScenarioLabDefinition[] = [
   {
@@ -552,6 +612,186 @@ export const SCENARIO_LABS: readonly ScenarioLabDefinition[] = [
         ["Most traces succeed", "Fast successful traces become candidates for aggressive sampling.", "active success success warning", "classify", ["10,000", "0", "0%"], "success"],
         ["Rare error completes", "One trace ends with a payment error and becomes high-value diagnostic evidence.", "active warning failure active", "error", ["10,000", "0", "100% pending"], "warning"],
         ["Policy retains the tail", "The backend keeps all errors plus a small success sample within storage budget.", "success success warning success", "store", ["10,000", "120", "100%"], "success"],
+      ]),
+    ],
+  },
+  {
+    id: "tcp-udp", title: "What happens when one packet is lost?",
+    description: "Compare TCP's ordered recovery with application-defined UDP loss and sequencing behavior.", nodes: transportNodes,
+    presets: [
+      preset("tcp-loss", "TCP ordered stream", "One lost segment delays later bytes until retransmission fills the gap.", transportNodes, ["Delivered", "Recovery delay", "Out of order"], [
+        ["Segments enter network", "The sender numbers stream bytes and keeps unacknowledged data for recovery.", "active active active neutral", "segments 1–4", ["0/4", "0ms", "0"], "success"],
+        ["Segment 2 is lost", "Segments 3 and 4 arrive, but the receiver cannot expose later stream bytes before the gap.", "active failure warning warning", "loss 2", ["1/4", "0ms", "2 buffered"], "failure"],
+        ["Loss is detected", "Acknowledgment evidence triggers retransmission while congestion control reduces sending pressure.", "active warning active warning", "retransmit 2", ["1/4", "80ms", "2 buffered"], "warning"],
+        ["Ordered stream resumes", "The missing bytes arrive and buffered data becomes deliverable in order.", "success success success success", "deliver 1–4", ["4/4", "80ms", "0"], "success"],
+      ]),
+      preset("udp-realtime", "UDP realtime updates", "The application prefers fresh state over retransmitting an obsolete update.", transportNodes, ["Delivered", "Dropped", "Fresh version"], [
+        ["Datagrams are sent", "Each update carries an independent sequence number and can arrive without a connection stream.", "active active active neutral", "v41–v44", ["0/4", "0", "v40"], "success"],
+        ["v42 is lost", "The transport does not retransmit; v43 can still arrive without head-of-line blocking.", "active warning active active", "loss v42", ["2/4", "1", "v43"], "warning"],
+        ["Late v41 appears", "The receiver compares sequence numbers and discards the obsolete out-of-order update.", "neutral active success warning", "discard v41", ["2/4", "2", "v43"], "warning"],
+        ["Newest state wins", "v44 arrives promptly; application semantics tolerate the missing intermediate update.", "success success success success", "apply v44", ["3/4", "2", "v44"], "success"],
+      ]),
+    ],
+  },
+  {
+    id: "http-evolution", title: "Which request blocks the others?",
+    description: "Contrast HTTP/1.1 connection queues, HTTP/2 stream multiplexing, and HTTP/3 loss isolation.", nodes: httpNodes,
+    presets: [
+      preset("http1", "HTTP/1.1 connection", "Pipelined work remains ordered on one connection, so a slow response blocks later ones.", httpNodes, ["Active streams", "Blocked responses", "Page complete"], [
+        ["Three requests queue", "HTML, CSS, and an image share one persistent connection in request order.", "active active active neutral", "GET ×3", ["1", "2", "0ms"], "success"],
+        ["First response is slow", "Later origin work may finish, but ordered response delivery keeps it behind the first request.", "active warning active warning", "wait HTML", ["1", "2", "0ms"], "warning"],
+        ["HTML completes", "The connection can finally deliver CSS and image responses in sequence.", "active active success active", "drain", ["1", "0", "420ms"], "warning"],
+        ["Page finishes", "Multiple connections can reduce this blocking but add setup and competition costs.", "success success success success", "complete", ["0", "0", "470ms"], "success"],
+      ]),
+      preset("http3", "HTTP/3 streams", "Independent QUIC streams keep packet loss in one response from blocking the others.", httpNodes, ["Active streams", "Blocked streams", "Page complete"], [
+        ["Three streams open", "One secure QUIC connection carries three independently ordered request streams.", "active success active neutral", "streams 1/3/5", ["3", "0", "0ms"], "success"],
+        ["Image packet is lost", "Only the image stream waits for retransmission; HTML and CSS continue.", "active warning active active", "loss stream 5", ["3", "1", "0ms"], "warning"],
+        ["Critical resources finish", "HTML and CSS render while the image stream recovers separately.", "active success success active", "deliver 1/3", ["1", "1", "165ms"], "success"],
+        ["Image completes", "Loss isolation shortens the critical path without removing congestion or retransmission cost.", "success success success success", "deliver 5", ["0", "0", "240ms"], "success"],
+      ]),
+    ],
+  },
+  {
+    id: "realtime-transports", title: "How does the next update reach the client?",
+    description: "Compare repeated polling with a persistent WebSocket subscription under connection churn.", nodes: realtimeNodes,
+    presets: [
+      preset("polling", "Short polling", "Clients repeatedly ask even when state has not changed.", realtimeNodes, ["Open connections", "Empty responses", "Update delay"], [
+        ["Clients poll", "Each client opens or reuses an HTTP request on a fixed five-second cadence.", "active active neutral active", "GET state", ["500", "0", "0s"], "success"],
+        ["No state changed", "The edge returns 500 empty responses that still consume request and authentication work.", "active warning neutral neutral", "304/empty", ["500", "500", "0s"], "warning"],
+        ["Producer publishes", "A state change just after the poll waits until the next client interval.", "active active active success", "v18", ["0", "500", "4.8s"], "warning"],
+        ["Next poll observes", "All clients eventually converge, with delay bounded by the polling interval.", "success success success success", "GET v18", ["500", "500", "4.8s"], "success"],
+      ]),
+      preset("websocket", "WebSocket subscription", "Persistent bidirectional sessions receive pushed updates through their owning edges.", realtimeNodes, ["Open sessions", "Published messages", "Update delay"], [
+        ["Sessions subscribe", "Connection owners register topic interest and maintain heartbeat/liveness state.", "active success active neutral", "subscribe", ["500", "0", "0ms"], "success"],
+        ["Producer publishes v18", "The broker routes one logical event to edges with matching subscribers.", "active active success success", "publish v18", ["500", "1", "18ms"], "success"],
+        ["One edge disconnects", "Affected clients detect lost sessions and reconnect with their last observed version.", "warning failure active active", "reconnect", ["420", "1", "90ms"], "warning"],
+        ["Catch-up completes", "Reconnected clients receive missed state then resume the live stream without polling every client.", "success success success success", "resume v18", ["500", "2", "140ms"], "success"],
+      ]),
+    ],
+  },
+  {
+    id: "service-discovery", title: "Which endpoint list should callers trust?",
+    description: "Follow registration leases, stale membership, readiness, and client-side endpoint refresh.", nodes: discoveryNodes,
+    presets: [
+      preset("lease-expiry", "Crashed instance lease", "A registry removes an endpoint only after its bounded lease expires.", discoveryNodes, ["Registered", "Eligible", "Failed calls"], [
+        ["Three instances renew", "The registry has recent leases and readiness metadata for all endpoints.", "active success active active", "resolve 3", ["3", "3", "0"], "success"],
+        ["Instance C crashes", "Its process stops serving and cannot renew, but the registry view is not instantly omniscient.", "failure warning active failure", "call C", ["3", "3", "1"], "failure"],
+        ["Lease expires", "The registry removes C after the explicit failure-detection window.", "neutral success active failure", "remove C", ["2", "2", "1"], "warning"],
+        ["Clients refresh", "Callers replace cached endpoint sets and stop routing new work to C.", "neutral success success neutral", "resolve 2", ["2", "2", "1"], "success"],
+      ]),
+      preset("not-ready", "Registered but not ready", "Registration and traffic eligibility remain separate states.", discoveryNodes, ["Registered", "Eligible", "Premature calls"], [
+        ["Instance starts", "A new process registers early so operators can observe its lifecycle.", "active active active neutral", "register", ["4", "3", "0"], "success"],
+        ["Warm-up continues", "The registry retains the endpoint but excludes it from ready queries.", "active success active neutral", "ready=false", ["4", "3", "0"], "success"],
+        ["Dependencies become ready", "The instance finishes cache warm-up and verifies its critical dependency path.", "success success active active", "ready=true", ["4", "4", "0"], "success"],
+        ["Traffic ramps", "Callers discover the endpoint and gradually include it without sending requests during warm-up.", "success success success success", "resolve 4", ["4", "4", "0"], "success"],
+      ]),
+    ],
+  },
+  {
+    id: "acid-transactions", title: "When does a transaction become visible and durable?",
+    description: "Compare an atomic commit with a crash before durable commit acknowledgment.", nodes: acidNodes,
+    presets: [
+      preset("transfer", "Atomic transfer", "A debit and credit cross one constraint-checked commit boundary.", acidNodes, ["Account A", "Account B", "Total"], [
+        ["Transaction begins", "The engine reads A=100 and B=50 under its isolation rules.", "active active neutral active", "read", ["100", "50", "150"], "success"],
+        ["Writes are staged", "A debit to 70 and credit to 80 remain uncommitted and invisible to other transactions.", "active active neutral warning", "stage", ["100 visible", "50 visible", "150"], "warning"],
+        ["Constraints pass", "The engine verifies nonnegative balance and records the commit in its durable log.", "active success success active", "WAL commit", ["70 pending", "80 pending", "150"], "success"],
+        ["Commit becomes visible", "Both row versions become visible together and preserve the invariant.", "success success success success", "publish", ["70", "80", "150"], "success"],
+      ]),
+      preset("crash", "Crash before commit record", "Uncommitted page changes are removed during recovery.", acidNodes, ["Commit record", "Visible rows", "Recovered total"], [
+        ["Updates are prepared", "The transaction has changed in-memory pages but has not durably committed.", "active active neutral warning", "stage", ["no", "old", "150"], "warning"],
+        ["Database crashes", "No success response is safe because the commit boundary was not recorded.", "failure failure warning warning", "crash", ["no", "old", "unknown"], "failure"],
+        ["Recovery scans log", "The engine replays committed work and rolls back or ignores this incomplete transaction.", "neutral active active warning", "recover", ["no", "old", "150"], "warning"],
+        ["Old state survives", "Atomicity prevents a visible debit without its matching credit; the client may retry idempotently.", "success success success success", "resume", ["no", "A=100, B=50", "150"], "success"],
+      ]),
+    ],
+  },
+  {
+    id: "connection-pools", title: "How many database sessions should the app admit?",
+    description: "Observe bounded pool queueing, leaks, acquisition timeouts, and database saturation.", nodes: poolNodes,
+    presets: [
+      preset("bounded", "Bounded healthy pool", "A small queue absorbs a burst while active sessions stay within database capacity.", poolNodes, ["Active", "Waiting", "Acquire p99"], [
+        ["Steady requests", "Eight connections serve normal traffic below the database's safe concurrency limit.", "active success success active", "lease", ["8/12", "0", "4ms"], "success"],
+        ["Burst arrives", "Six more requests wait in the pool instead of opening unbounded database sessions.", "active warning success warning", "queue", ["12/12", "2", "38ms"], "warning"],
+        ["Connections return", "Completed transactions promptly return leases and wake bounded waiters.", "active success success active", "release", ["10/12", "0", "42ms"], "success"],
+        ["Burst drains", "The pool protects database workers while callers observe explicit acquisition latency.", "success success success success", "complete", ["8/12", "0", "42ms"], "success"],
+      ]),
+      preset("leak", "Connection leak", "Borrowed sessions never return, turning pool capacity into a permanent queue.", poolNodes, ["Active", "Waiting", "Timed out"], [
+        ["One lease leaks", "An error path skips release, leaving an idle database session marked in use.", "active warning active warning", "leak 1", ["9/12", "0", "0"], "warning"],
+        ["Leaks accumulate", "Three unavailable leases reduce effective capacity while request rate stays constant.", "active failure active warning", "leak 3", ["12/12", "7", "0"], "failure"],
+        ["Acquire deadline expires", "Callers fail before starting database work instead of waiting forever.", "failure failure active active", "timeout", ["12/12", "7", "18"], "failure"],
+        ["Leak is repaired", "Finally blocks and pool telemetry restore all connections and drain bounded waiters.", "success success success success", "release all", ["8/12", "0", "18"], "success"],
+      ]),
+    ],
+  },
+  {
+    id: "cache-aside", title: "Who loads the cache after a miss?",
+    description: "Compare ordinary cache-aside reads with a concurrent-miss stampede protected by coalescing.", nodes: cacheAsideNodes,
+    presets: [
+      preset("miss-fill", "Single miss and fill", "One reader loads authority and populates a bounded-TTL copy.", cacheAsideNodes, ["Cache hits", "DB reads", "Returned version"], [
+        ["Reader checks cache", "The application looks up product:42 before touching the database.", "active active neutral neutral", "GET", ["0", "0", "none"], "success"],
+        ["Cache misses", "Absence is not an error; the reader falls through to the authoritative store.", "active warning active neutral", "miss", ["0", "1", "none"], "warning"],
+        ["Database returns v7", "The application receives the authoritative value and writes a TTL-bounded cache entry.", "active active success active", "SET v7", ["0", "1", "v7"], "success"],
+        ["Next reader hits", "Subsequent reads avoid database work until invalidation, eviction, or expiry.", "success success success success", "hit v7", ["1", "1", "v7"], "success"],
+      ]),
+      preset("coalesced-miss", "Concurrent miss coalescing", "One in-flight loader protects the database when a popular entry expires.", cacheAsideNodes, ["Waiting readers", "DB reads", "Responses"], [
+        ["Entry expires", "One hundred readers observe the same missing hot key nearly simultaneously.", "active failure neutral neutral", "100 misses", ["100", "0", "0"], "failure"],
+        ["One loader wins", "A per-key single-flight owner queries the database while other readers wait or use bounded stale data.", "active warning active neutral", "load once", ["99", "1", "0"], "warning"],
+        ["Fresh value fills", "The owner writes v8 and releases every waiter with the same result.", "active success success active", "SET v8", ["0", "1", "100"], "success"],
+        ["Hot path stabilizes", "Further readers hit v8 without multiplying origin work.", "success success success success", "hit v8", ["0", "1", "120"], "success"],
+      ]),
+    ],
+  },
+  {
+    id: "message-ordering", title: "Which order does the consumer apply?",
+    description: "Compare cross-partition arrival disorder with per-key partitioning and version checks.", nodes: orderingNodes,
+    presets: [
+      preset("cross-partition", "Related events split", "Two producers route one entity's updates to independent ordering lanes.", orderingNodes, ["Published", "Applied version", "Order violations"], [
+        ["v10 and v11 publish", "Independent producers emit two updates for the same order without a shared sequence owner.", "active active neutral neutral", "publish", ["2", "v9", "0"], "warning"],
+        ["v11 arrives first", "Different partitions provide no relative ordering guarantee to the consumer.", "active warning active warning", "deliver v11", ["2", "v11", "0"], "warning"],
+        ["v10 arrives late", "A naive consumer applies the stale event after v11 and moves state backward.", "neutral warning failure failure", "apply v10", ["2", "v10", "1"], "failure"],
+        ["Damage is visible", "The final materialized state contradicts the producer's intended version sequence.", "neutral neutral warning failure", "read v10", ["2", "v10", "1"], "failure"],
+      ]),
+      preset("per-key", "Per-key ordered partition", "Stable partitioning plus a version guard preserves entity order.", orderingNodes, ["Published", "Applied version", "Rejected stale"], [
+        ["Events carry key and version", "Both updates use order-42 as the partition key and monotonic versions 10 and 11.", "active active neutral neutral", "key=42", ["2", "v9", "0"], "success"],
+        ["One partition appends", "The broker records v10 before v11 in the entity's single durable lane.", "active success active neutral", "append", ["2", "v9", "0"], "success"],
+        ["Consumer applies in order", "The materializer advances v9 → v10 → v11 and records its offset transactionally.", "neutral success success active", "apply", ["2", "v11", "0"], "success"],
+        ["Duplicate v10 is rejected", "A replayed older version cannot overwrite state even though delivery may repeat.", "neutral success success success", "reject v10", ["3", "v11", "1"], "success"],
+      ]),
+    ],
+  },
+  {
+    id: "timeouts", title: "Does the deadline stop downstream work?",
+    description: "Compare independent hop timeouts with one propagated deadline and cancellation signal.", nodes: timeoutNodes,
+    presets: [
+      preset("independent", "Independent hop timeouts", "Each service starts a fresh timeout and allows work beyond the caller's patience.", timeoutNodes, ["Caller elapsed", "Work after timeout", "Resources held"], [
+        ["Caller sets 500ms", "The request begins with a user-visible timeout, but no absolute deadline is propagated.", "active active neutral neutral", "call", ["0ms", "0ms", "1"], "success"],
+        ["Service A spends 420ms", "A then gives B a new 500ms timeout even though the caller has only 80ms left.", "active warning active active", "call B", ["420ms", "0ms", "2"], "warning"],
+        ["Caller times out", "At 500ms the client leaves, while A and B continue consuming threads and connections.", "failure warning active failure", "client cancel lost", ["500ms", "340ms", "2"], "failure"],
+        ["Orphaned work finishes", "The dependency completes too late to help, wasting scarce capacity during overload.", "neutral warning warning failure", "late result", ["500ms", "340ms", "0"], "failure"],
+      ]),
+      preset("propagated", "Propagated deadline", "Every hop subtracts spent time and cancels work when budget is exhausted.", timeoutNodes, ["Budget left", "Cancelled work", "Resources held"], [
+        ["Caller sends deadline", "An absolute 500ms deadline travels with the request instead of restarting per hop.", "active success neutral neutral", "deadline t+500", ["500ms", "0", "1"], "success"],
+        ["A reserves return budget", "After 420ms, A passes only 50ms to B and keeps 30ms to marshal a response.", "active success active active", "budget 50ms", ["80ms", "0", "2"], "warning"],
+        ["B cannot finish", "The 50ms child budget expires and cancellation releases the downstream resource promptly.", "active success warning success", "cancel B", ["30ms", "1", "1"], "warning"],
+        ["A degrades in time", "A returns a bounded fallback before the original caller deadline with no orphaned work.", "success success neutral success", "fallback", ["12ms", "1", "0"], "success"],
+      ]),
+    ],
+  },
+  {
+    id: "sli-slo-sla", title: "How fast is the error budget burning?",
+    description: "Define a scoped availability SLI, evaluate an SLO window, and distinguish the external SLA.", nodes: sloNodes,
+    presets: [
+      preset("healthy-window", "Healthy 99.9% SLO", "A precise good-event definition leaves budget for ordinary failure.", sloNodes, ["Valid events", "Good events", "Budget remaining"], [
+        ["Events are classified", "Valid user requests exclude health probes and caller-cancelled operations by policy.", "active active neutral neutral", "classify", ["1,000,000", "0", "100%"], "success"],
+        ["Good events are counted", "Responses under 300ms without server errors satisfy the availability-latency SLI.", "active success active neutral", "measure", ["1,000,000", "999,500", "50%"], "success"],
+        ["SLO is evaluated", "A 99.9% target permits 1,000 bad events; 500 have been consumed this window.", "neutral success success active", "compare", ["1,000,000", "999,500", "50%"], "success"],
+        ["Release continues", "Low burn rate leaves room for change while monitoring remains active.", "neutral success success success", "ship", ["1,000,000", "999,500", "50%"], "success"],
+      ]),
+      preset("fast-burn", "Fast error-budget burn", "Multi-window burn rate catches a severe incident before the monthly average looks bad.", sloNodes, ["30m burn rate", "Budget consumed", "SLA breached"], [
+        ["Error rate spikes", "A regional dependency creates 4% bad events against a 0.1% SLO allowance.", "active warning active neutral", "measure", ["40×", "4%", "no"], "failure"],
+        ["Short window alerts", "The 30-minute burn rate indicates the monthly budget would vanish rapidly if sustained.", "active failure warning active", "alert", ["40×", "18%", "no"], "failure"],
+        ["Release is halted", "The team spends reliability budget on mitigation rather than adding more change risk.", "neutral success warning warning", "freeze", ["12×", "31%", "no"], "warning"],
+        ["Service recovers", "The internal SLO drove action before the looser contractual SLA penalty threshold was crossed.", "neutral success success success", "recover", ["0.5×", "33%", "no"], "success"],
       ]),
     ],
   },

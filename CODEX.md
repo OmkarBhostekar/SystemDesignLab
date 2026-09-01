@@ -1479,7 +1479,7 @@ Recommended order:
 - [x] Retry + Jitter
 - [x] Token Bucket
 
-Status: **10 of 10 representative topics complete in M8; M8 and M9 add eighteen further scenario-lab topics**
+Status: **10 of 10 representative topics complete in M8; M8–M10 add twenty-eight further scenario-lab topics**
 
 ---
 
@@ -1545,13 +1545,13 @@ Status: **Not started**
 
 Current milestone:
 
-> **M9 — Ten more visualizations — Complete (2026-09-01)**
+> **M10 — Ten more visualizations — Complete (2026-09-01)**
 
 Primary goal:
 
-Expand deterministic scenario-lab coverage into networking, traffic control, storage-engine behavior, cache correctness, messaging operations, and observability while preserving the accessible shared shell and local-first completion persistence.
+Expand deterministic scenario-lab coverage into transport protocols, discovery, transaction durability, database concurrency, cache read paths, message order, deadline propagation, and reliability objectives while preserving the accessible shared shell and local-first completion persistence.
 
-Interactive simulations now ship for twenty-eight lessons. M9 adds Request Lifecycle, DNS, Health Checks & Failover, Database Indexes, B-tree vs LSM, Cache Invalidation, Hot Keys, Partitions & Consumer Groups, Dead-Letter Queues, and Distributed Tracing. The selection fills major untouched curriculum families without prematurely implementing design-lab workspaces.
+Interactive simulations now ship for thirty-eight lessons. M10 adds TCP vs UDP, HTTP Evolution, Realtime Transports, Service Discovery, ACID & Transactions, Connection Pools, Cache-Aside, Message Ordering, Timeouts, and SLI/SLO/SLA. The selection deepens foundational protocol and operational reasoning without prematurely implementing design-lab workspaces.
 
 ---
 
@@ -1565,7 +1565,7 @@ Update this section whenever Codex finishes a meaningful task.
 
 ## Active Milestone
 
-`M9 — Ten more visualizations — Complete`
+`M10 — Ten more visualizations — Complete`
 
 ## Currently Working On
 
@@ -1575,10 +1575,12 @@ Update this section whenever Codex finishes a meaningful task.
 - [x] Theory authoring — all 135 lessons across Modules 00–13 complete
 - [x] Local progress domain, persistence, portable backup, and minimal reader controls
 - [x] Typed quiz domain, two representative quiz slices, accessible quiz UI, and local attempt persistence
-- [x] Shared simulation shell, twenty-eight deterministic interactive lessons, and local scenario completion persistence
+- [x] Shared simulation shell, thirty-eight deterministic interactive lessons, and local scenario completion persistence
 
 ## Recently Completed
 
+- Completed M10 with ten registered visualization lessons and twenty authored scenarios covering transports, service discovery, transactions, connection pools, cache-aside, ordering, timeouts, and reliability objectives.
+- Added deterministic packet-loss recovery, HTTP stream blocking, realtime reconnect, lease-based discovery, atomic crash recovery, pool leaks, miss coalescing, per-key ordering, deadline cancellation, and error-budget burn behavior.
 - Completed M9 with ten registered visualization lessons and twenty contrasting authored scenarios across networking, traffic, databases, caching, messaging, and observability.
 - Added deterministic cold/warm request paths, DNS TTL migration, readiness hysteresis and fenced failover, index access paths, B-tree/LSM cost movement, cache invalidation races, hot-key relief, consumer-group rebalance, DLQ redrive, and tracing critical-path/tail-sampling behavior.
 - Completed M8 with ten registered visualization lessons, twenty authored scenarios, deterministic step/reset transitions, responsive node/link state, exact metrics, bounded events, text alternatives, and the existing completion workflow.

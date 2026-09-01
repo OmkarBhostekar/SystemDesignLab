@@ -21,6 +21,16 @@ export const SCENARIO_LAB_IDS = [
   "partitions-consumer-groups",
   "dead-letter-queues",
   "distributed-tracing",
+  "tcp-udp",
+  "http-evolution",
+  "realtime-transports",
+  "service-discovery",
+  "acid-transactions",
+  "connection-pools",
+  "cache-aside",
+  "message-ordering",
+  "timeouts",
+  "sli-slo-sla",
 ] as const;
 
 export type ScenarioLabId = (typeof SCENARIO_LAB_IDS)[number];

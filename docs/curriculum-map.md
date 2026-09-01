@@ -1,8 +1,8 @@
 # System Design Curriculum Map
 
-**Status:** complete canonical dependency map for 135 indexed lessons across Modules 00–13; M9 completed 2026-09-01 with 28 visualization topics integrated
+**Status:** complete canonical dependency map for 135 indexed lessons across Modules 00–13; M10 completed 2026-09-01 with 38 visualization topics integrated
 
-This document is the dependency-oriented index for the theory curriculum described by [`docs/PRD.md`](./PRD.md) and organized according to [`CODEX.md`](../CODEX.md). It defines module order, lesson IDs, depth, prerequisites, and downstream connections. All 135 canonical theory lessons across Modules 00–13 now have indexed `.mdx` sources, including 20 Markdown-first design labs. Progress, two structured quizzes, and twenty-eight interactive visualizations are implemented as separate registered experiences; broader coverage and the design-lab workspace remain later milestones.
+This document is the dependency-oriented index for the theory curriculum described by [`docs/PRD.md`](./PRD.md) and organized according to [`CODEX.md`](../CODEX.md). It defines module order, lesson IDs, depth, prerequisites, and downstream connections. All 135 canonical theory lessons across Modules 00–13 now have indexed `.mdx` sources, including 20 Markdown-first design labs. Progress, two structured quizzes, and thirty-eight interactive visualizations are implemented as separate registered experiences; broader coverage and the design-lab workspace remain later milestones.
 
 ## How to read this map
 
@@ -170,5 +170,5 @@ At the current theory-authoring stage:
 - all 14 module directories and READMEs describe completed theory contents;
 - Modules 00–13 contain 135 indexed `.mdx` lessons with interview lenses, quiz seeds, cross-links, annotated authoritative references, and future visualization specifications;
 - Module 13 contributes 20 theory/reference labs; their interactive workspace remains future work;
-- twenty-eight interactive visualizations and two structured quizzes are registered today; broader interactive coverage remains incremental and is not implied by theory completion;
+- thirty-eight interactive visualizations and two structured quizzes are registered today; broader interactive coverage remains incremental and is not implied by theory completion;
 - each completed module has passed the theory definition of done in `CODEX.md` and deterministic schema, relationship, cycle, path, and local-link validation.
